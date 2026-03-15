@@ -1399,8 +1399,7 @@ Windows Registry Editor Version 5.00
 [HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize]
 "AppsUseLightTheme"=dword:00000000
 
-[HKEY_CURRENT_USER\Control Panel\Colors]
-"Background"="0 0 0"
+
 
 ; always hide most used list in start menu
 [HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\Explorer]
