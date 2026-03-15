@@ -37,6 +37,7 @@ iwr https://winsetup.m05.dev -useb | iex
 - Edge folder removal now only targets Edge/EdgeUpdate/EdgeCore subfolders (preserves WebView2)
 - Taskbar alignment set to centered
 - ColorPrevalence set to 0 (fixes unreadable text on Windows 10)
+- Removed black desktop background color setting (was causing invisible sidebar text on Windows 10)
 - Brave, ShareX and Obsidian moved from direct download to winget
 
 ### Added
