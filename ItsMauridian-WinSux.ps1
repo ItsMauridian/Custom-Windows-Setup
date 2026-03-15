@@ -1,7 +1,7 @@
 # ==============================================================================
 # WinSux - Forked & Modified by Mauridian (ItsMauridian)
 # Repo: https://github.com/ItsMauridian/Custom-Windows-Setup
-# Run: iwr https://winsetup.m05.dev -useb | iex
+# Run: iwr https://github.com/ItsMauridian/Custom-Windows-Setup/raw/refs/heads/main/ItsMauridian-WinSux.ps1 -useb | iex
 #
 # Original script by FR33THY: https://github.com/FR33THYFR33THY/WinSux-Windows-Optimization-Guide
 #
@@ -2483,7 +2483,9 @@ Remove-Item -Recurse -Force "$env:USERPROFILE\AppData\Roaming\Microsoft\Internet
 
 # hide desktop.ini files
 Get-ChildItem -Path "C:\" -Filter "desktop.ini" -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
-    $_.Attributes = $_.Attributes -bor [System.IO.FileAttributes]::Hidden -bor [System.IO.FileAttributes]::System
+    try {
+        $_.Attributes = $_.Attributes -bor [System.IO.FileAttributes]::Hidden -bor [System.IO.FileAttributes]::System
+    } catch { }
 }
 
 # disable explorer automatic folder type discovery
@@ -4313,7 +4315,7 @@ Get-AppxPackage -allusers *MicrosoftWindows.Client.WebExperience* | Remove-AppxP
 
 # remove copilot
 Get-AppxPackage -AllUsers *Copilot* | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
-Get-AppxPackage -AllUsers *Microsoft.MicrosoftOfficeHub* | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+try { Get-AppxPackage -AllUsers *Microsoft.MicrosoftOfficeHub* | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue } catch { }
 $Appx = (Get-AppxPackage MicrosoftWindows.Client.CoreAI -ErrorAction SilentlyContinue).PackageFullName
 if ($Appx) {
 $Sid = (Get-LocalUser $Env:UserName).Sid.Value
