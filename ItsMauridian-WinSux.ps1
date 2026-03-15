@@ -431,12 +431,6 @@ $StepTwoPs1 = @'
 
         # SCRIPT SILENT
         $progresspreference = 'silentlycontinue'
-
-        # SCRIPT ERROR LOGGING
-        $Script:LogErrors = [System.Collections.Generic.List[string]]::new()
-        $null = Register-EngineEvent -SourceIdentifier PowerShell.OnError -Action {
-            $Script:LogErrors.Add("[$(Get-Date -Format 'HH:mm:ss')] $($Event.SourceArgs[0].Exception.Message) | At: $($Event.SourceArgs[0].InvocationInfo.PositionMessage -replace '\n.*','')")
-        } -ErrorAction SilentlyContinue
 		
         # FUNCTION FASTER DOWNLOADS
         function Get-FileFromWeb {
@@ -2242,9 +2236,9 @@ $manualServices = @(
 "PrintNotify","PushToInstall","QWAVE","RasAuto","RasMan","RetailDemo","RmSvc",
 "RpcLocator","SCPolicySvc","SCardSvr","SDRSVC","SEMgrSvc","SNMPTRAP","SNMPTrap",
 "SSDPSRV","ScDeviceEnum","SensorDataService","SensorService","SensrSvc","SessionEnv",
-"SharedAccess","SmsRouter","SstpSvc","StiSvc","StorSvc","TapiSrv","TermService",
+"SharedAccess","SmsRouter","SstpSvc","StiSvc","TapiSrv","TermService",
 "TieringEngineService","TokenBroker","TroubleshootingSvc","TrustedInstaller","UmRdpService",
-"VSS","VaultSvc","W32Time","WEPHOSTSVC","WFDSConMgrSvc","WMPNetworkSvc","WManSvc",
+"VSS","VaultSvc","WEPHOSTSVC","WFDSConMgrSvc","WMPNetworkSvc","WManSvc",
 "WPDBusEnum","WSAIFabricSvc","WalletService","WarpJITSvc","WbioSrvc","WdiServiceHost",
 "WdiSystemHost","WebClient","Wecsvc","WerSvc","WiaRpc","WinRM","WpcMonSvc","WpnService",
 "XblAuthManager","XblGameSave","XboxGipSvc","XboxNetApiSvc","autotimesvc","bthserv",
@@ -3032,16 +3026,11 @@ New-Item -Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp" 
 # install winget if not present
 if (!(Get-Command winget -ErrorAction SilentlyContinue)) {
     Write-Host "winget not found, installing...`n" -ForegroundColor Yellow
-    # install VCLibs dependency first (required for winget on Windows 10)
-    Add-AppxPackage -Path "https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx" -ErrorAction SilentlyContinue
-    # install winget
-    $wingetUrl = "https://github.com/microsoft/winget-cli/releases/latest/download/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle"
-    Get-FileFromWeb -URL $wingetUrl -File "$env:SystemRoot\Temp\winget.msixbundle"
-    Add-AppxPackage -Path "$env:SystemRoot\Temp\winget.msixbundle" -ErrorAction SilentlyContinue
+    # use asheroto's winget-install script — handles VCLibs, UIXaml, and all dependencies automatically
+    $wingetInstallScript = "$env:SystemRoot\Temp\winget-install.ps1"
+    Get-FileFromWeb -URL "https://github.com/asheroto/winget-install/releases/latest/download/winget-install.ps1" -File $wingetInstallScript
+    & $wingetInstallScript -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 5
-    # refresh PATH so winget is available in current session
-    $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
-    $env:PATH += ";$env:LOCALAPPDATA\Microsoft\WindowsApps"
 }
 
 # install apps via winget
@@ -4392,10 +4381,16 @@ $logPath = "$env:USERPROFILE\Desktop\WinSux-Setup-Log.txt"
 $logContent = @()
 $logContent += "WinSux Setup Log - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
 $logContent += "=" * 60
-if ($Script:LogErrors -and $Script:LogErrors.Count -gt 0) {
+if ($Error.Count -gt 0) {
     $logContent += "The following errors occurred during setup:"
     $logContent += ""
-    foreach ($err in $Script:LogErrors) { $logContent += $err }
+    foreach ($err in $Error) {
+        $logContent += "[ERROR] $($err.Exception.Message)"
+        if ($err.InvocationInfo.PositionMessage) {
+            $logContent += "        At: $($err.InvocationInfo.PositionMessage -replace '\n.*','')"
+        }
+        $logContent += ""
+    }
 } else {
     $logContent += "No errors detected during setup."
 }
