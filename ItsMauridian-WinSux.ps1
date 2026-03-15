@@ -2231,7 +2231,7 @@ Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control" -Name "SvcHostSp
 
 # set services to manual
 $manualServices = @(
-"ALG","AppMgmt","AppReadiness","Appinfo","AssignedAccessManagerSvc","AxInstSV","BDESVC",
+"ALG","AppMgmt","AppReadiness","Appinfo","AxInstSV","BDESVC",
 "BTAGService","CDPSvc","COMSysApp","CertPropSvc","CscService","DevQueryBroker",
 "DeviceAssociationService","DeviceInstall","DisplayEnhancementService","EFS","EapHost",
 "FDResPub","FrameServer","FrameServerMonitor","GraphicsPerfSvc","HvHost","IKEEXT",
@@ -3032,13 +3032,22 @@ New-Item -Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp" 
 # install winget if not present
 if (!(Get-Command winget -ErrorAction SilentlyContinue)) {
     Write-Host "winget not found, installing...`n" -ForegroundColor Yellow
+    # install VCLibs dependency first (required for winget on Windows 10)
+    Add-AppxPackage -Path "https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx" -ErrorAction SilentlyContinue
+    # install winget
     $wingetUrl = "https://github.com/microsoft/winget-cli/releases/latest/download/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle"
     Get-FileFromWeb -URL $wingetUrl -File "$env:SystemRoot\Temp\winget.msixbundle"
     Add-AppxPackage -Path "$env:SystemRoot\Temp\winget.msixbundle" -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 5
+    # refresh PATH so winget is available in current session
+    $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
+    $env:PATH += ";$env:LOCALAPPDATA\Microsoft\WindowsApps"
 }
 
 # install apps via winget
+# ensure winget is in PATH
+$env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
+$env:PATH += ";$env:LOCALAPPDATA\Microsoft\WindowsApps"
 $apps = @(
     "Sysinternals.Autoruns",
     "Brave.Brave",
