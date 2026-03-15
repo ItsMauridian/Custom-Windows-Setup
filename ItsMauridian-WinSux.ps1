@@ -78,12 +78,6 @@
         # SCRIPT SILENT
         $progresspreference = 'silentlycontinue'
 
-        # SCRIPT ERROR LOGGING
-        $Script:LogErrors = [System.Collections.Generic.List[string]]::new()
-        $null = Register-EngineEvent -SourceIdentifier PowerShell.OnError -Action {
-            $Script:LogErrors.Add("[$(Get-Date -Format 'HH:mm:ss')] $($Event.SourceArgs[0].Exception.Message) | At: $($Event.SourceArgs[0].InvocationInfo.PositionMessage -replace '\n.*','')")
-        } -ErrorAction SilentlyContinue
-
         Write-Host "WINDOWS ACTIVATION`n"
 
 # run microsoft activation scripts
@@ -437,6 +431,12 @@ $StepTwoPs1 = @'
 
         # SCRIPT SILENT
         $progresspreference = 'silentlycontinue'
+
+        # SCRIPT ERROR LOGGING
+        $Script:LogErrors = [System.Collections.Generic.List[string]]::new()
+        $null = Register-EngineEvent -SourceIdentifier PowerShell.OnError -Action {
+            $Script:LogErrors.Add("[$(Get-Date -Format 'HH:mm:ss')] $($Event.SourceArgs[0].Exception.Message) | At: $($Event.SourceArgs[0].InvocationInfo.PositionMessage -replace '\n.*','')")
+        } -ErrorAction SilentlyContinue
 		
         # FUNCTION FASTER DOWNLOADS
         function Get-FileFromWeb {
@@ -4378,6 +4378,20 @@ cmd /c "reg delete `"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRes
 
         Write-Host "RESTARTING`n" -ForegroundColor Red
 
+# write log file to desktop
+$logPath = "$env:USERPROFILE\Desktop\WinSux-Setup-Log.txt"
+$logContent = @()
+$logContent += "WinSux Setup Log - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+$logContent += "=" * 60
+if ($Script:LogErrors -and $Script:LogErrors.Count -gt 0) {
+    $logContent += "The following errors occurred during setup:"
+    $logContent += ""
+    foreach ($err in $Script:LogErrors) { $logContent += $err }
+} else {
+    $logContent += "No errors detected during setup."
+}
+$logContent | Out-File -FilePath $logPath -Encoding UTF8 -Force
+
 # restart
 Start-Sleep -Seconds 5
 shutdown -r -t 00
@@ -4397,20 +4411,6 @@ cmd /c "reg add `"HKCU\Console\%%Startup`" /v `"DelegationTerminal`" /t REG_SZ /
 
 # turn on safe boot
 cmd /c "bcdedit /set {current} safeboot minimal >nul 2>&1"
-
-# write log file to desktop
-$logPath = "$env:USERPROFILE\Desktop\WinSux-Setup-Log.txt"
-$logContent = @()
-$logContent += "WinSux Setup Log - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-$logContent += "=" * 60
-if ($Script:LogErrors -and $Script:LogErrors.Count -gt 0) {
-    $logContent += "The following errors occurred during setup:"
-    $logContent += ""
-    foreach ($err in $Script:LogErrors) { $logContent += $err }
-} else {
-    $logContent += "No errors detected during setup."
-}
-$logContent | Out-File -FilePath $logPath -Encoding UTF8 -Force
 
         Write-Host "RESTARTING`n" -ForegroundColor Red
 
