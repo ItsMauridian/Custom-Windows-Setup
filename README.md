@@ -4,7 +4,7 @@ A personal fork of [FR33THY's WinSux](https://github.com/FR33THYFR33THY/WinSux-W
 ## Run
 Paste this into an elevated Administrator PowerShell window:
 ```
-iwr https://github.com/ItsMauridian/Custom-Windows-Setup/raw/refs/heads/main/ItsMauridian-WinSux.ps1 -useb | iex
+iwr https://winsetup.m05.dev -useb | iex
 ```
 
 ## What it does

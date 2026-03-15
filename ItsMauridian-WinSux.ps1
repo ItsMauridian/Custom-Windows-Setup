@@ -1,7 +1,7 @@
 # ==============================================================================
 # WinSux - Forked & Modified by Mauridian (ItsMauridian)
 # Repo: https://github.com/ItsMauridian/Custom-Windows-Setup
-# Run: iwr https://github.com/ItsMauridian/Custom-Windows-Setup/raw/refs/heads/main/ItsMauridian-WinSux.ps1 -useb | iex
+# Run: iwr https://winsetup.m05.dev -useb | iex
 #
 # Original script by FR33THY: https://github.com/FR33THYFR33THY/WinSux-Windows-Optimization-Guide
 #
