@@ -3101,12 +3101,54 @@ $apps = @(
     "WinSCP.WinSCP",
     "Zoom.Zoom",
     "ShareX.ShareX",
-    "Obsidian.Obsidian"
+    "Obsidian.Obsidian",
+    "Proton.ProtonMail"
 )
 foreach ($app in $apps) {
     Start-Process -Wait $wingetExe -ArgumentList "install --id `"$app`" --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --no-upgrade" -WindowStyle Hidden
 }
 }
+
+# pin apps to taskbar
+# clear existing pins first (already done earlier, but ensure clean state)
+$shell = New-Object -ComObject Shell.Application
+function Pin-ToTaskbar($path) {
+    if (Test-Path $path) {
+        $folder = $shell.Namespace((Split-Path $path))
+        $item = $folder.ParseName((Split-Path $path -Leaf))
+        $verbs = $item.Verbs()
+        $pinVerb = $verbs | Where-Object { $_.Name -match "Pin to taskbar|Aan taakbalk vastmaken" }
+        if ($pinVerb) { $pinVerb.DoIt() }
+    }
+}
+
+# explorer — always present
+Pin-ToTaskbar "$env:SystemRoot\explorer.exe"
+
+# new outlook
+$outlookPath = "$env:LOCALAPPDATA\Microsoft\WindowsApps\outlook.exe"
+if (Test-Path $outlookPath) { Pin-ToTaskbar $outlookPath }
+
+# proton mail
+$protonPath = @(
+    "$env:LOCALAPPDATA\Programs\Proton Mail\Proton Mail.exe",
+    "$env:ProgramFiles\Proton Mail\Proton Mail.exe"
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
+if ($protonPath) { Pin-ToTaskbar $protonPath }
+
+# obsidian
+$obsidianPath = @(
+    "$env:LOCALAPPDATA\Programs\Obsidian\Obsidian.exe",
+    "$env:ProgramFiles\Obsidian\Obsidian.exe"
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
+if ($obsidianPath) { Pin-ToTaskbar $obsidianPath }
+
+# brave
+$bravePath = @(
+    "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe",
+    "$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe"
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
+if ($bravePath) { Pin-ToTaskbar $bravePath }
 
 # brave debloat - disable rewards, wallet, vpn, ai chat, stats ping
 cmd /c "reg add `"HKLM\SOFTWARE\Policies\BraveSoftware\Brave`" /v `"BraveRewardsDisabled`" /t REG_DWORD /d `"1`" /f >nul 2>&1"
