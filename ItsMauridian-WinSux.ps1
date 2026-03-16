@@ -3052,17 +3052,7 @@ New-Item -Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp" 
 
         Write-Host "INSTALLING APPS`n"
 
-# install winget if not present
-if (!(Get-Command winget -ErrorAction SilentlyContinue)) {
-    Write-Host "winget not found, installing...`n" -ForegroundColor Yellow
-    # use asheroto's winget-install script — handles VCLibs, UIXaml, and all dependencies automatically
-    $wingetInstallScript = "$env:SystemRoot\Temp\winget-install.ps1"
-    Get-FileFromWeb -URL "https://github.com/asheroto/winget-install/releases/latest/download/winget-install.ps1" -File $wingetInstallScript
-    Start-Process -Wait "powershell.exe" -ArgumentList "-ExecutionPolicy Bypass -File `"$wingetInstallScript`" -Force" -WindowStyle Hidden
-    Start-Sleep -Seconds 10
-}
-
-# resolve winget path — find the exe directly in case PATH isn't updated yet
+# resolve winget path — check direct locations first since PATH may not be set in RunOnce context
 $wingetExe = Get-Command winget -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
 if (!$wingetExe) {
     $wingetExe = Get-Item "$env:LOCALAPPDATA\Microsoft\WindowsApps\winget.exe" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
@@ -3070,6 +3060,22 @@ if (!$wingetExe) {
 if (!$wingetExe) {
     $wingetExe = Get-ChildItem "C:\Program Files\WindowsApps" -Filter "winget.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
 }
+
+# install winget if genuinely not present
+if (!$wingetExe) {
+    Write-Host "winget not found, installing...`n" -ForegroundColor Yellow
+    # use asheroto's winget-install script — handles VCLibs, UIXaml, and all dependencies automatically
+    $wingetInstallScript = "$env:SystemRoot\Temp\winget-install.ps1"
+    Get-FileFromWeb -URL "https://github.com/asheroto/winget-install/releases/latest/download/winget-install.ps1" -File $wingetInstallScript
+    Start-Process -Wait "powershell.exe" -ArgumentList "-ExecutionPolicy Bypass -File `"$wingetInstallScript`" -Force" -WindowStyle Hidden
+    Start-Sleep -Seconds 10
+    # resolve again after install
+    $wingetExe = Get-Command winget -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+    if (!$wingetExe) {
+        $wingetExe = Get-Item "$env:LOCALAPPDATA\Microsoft\WindowsApps\winget.exe" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+    }
+}
+
 if (!$wingetExe) {
     Write-Host "winget could not be found after install attempt, skipping app installs`n" -ForegroundColor Red
 }
@@ -3109,46 +3115,102 @@ foreach ($app in $apps) {
 }
 }
 
-# pin apps to taskbar
-# clear existing pins first (already done earlier, but ensure clean state)
-$shell = New-Object -ComObject Shell.Application
-function Pin-ToTaskbar($path) {
-    if (Test-Path $path) {
-        $folder = $shell.Namespace((Split-Path $path))
-        $item = $folder.ParseName((Split-Path $path -Leaf))
-        $verbs = $item.Verbs()
-        $pinVerb = $verbs | Where-Object { $_.Name -match "Pin to taskbar|Aan taakbalk vastmaken" }
-        if ($pinVerb) { $pinVerb.DoIt() }
-    }
-}
+# pin apps to taskbar — version-aware approach
+# windows 10: shortcut folder method
+# windows 11: LayoutModification.xml method (only reliable method on Win11)
 
-# explorer — always present
-Pin-ToTaskbar "$env:SystemRoot\explorer.exe"
+$winVer = [System.Environment]::OSVersion.Version.Major
+$winBuild = [System.Environment]::OSVersion.Version.Build
+$isWin11 = ($winVer -eq 10 -and $winBuild -ge 22000)
 
-# new outlook
+# resolve app paths
+$explorerPath = "$env:SystemRoot\explorer.exe"
+
 $outlookPath = "$env:LOCALAPPDATA\Microsoft\WindowsApps\outlook.exe"
-if (Test-Path $outlookPath) { Pin-ToTaskbar $outlookPath }
 
-# proton mail
 $protonPath = @(
     "$env:LOCALAPPDATA\Programs\Proton Mail\Proton Mail.exe",
     "$env:ProgramFiles\Proton Mail\Proton Mail.exe"
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-if ($protonPath) { Pin-ToTaskbar $protonPath }
 
-# obsidian
 $obsidianPath = @(
     "$env:LOCALAPPDATA\Programs\Obsidian\Obsidian.exe",
     "$env:ProgramFiles\Obsidian\Obsidian.exe"
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-if ($obsidianPath) { Pin-ToTaskbar $obsidianPath }
 
-# brave
 $bravePath = @(
     "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe",
     "$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe"
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-if ($bravePath) { Pin-ToTaskbar $bravePath }
+
+if ($isWin11) {
+    # Windows 11: create shortcuts in Start Menu then apply via LayoutModification.xml
+    $startMenuPrograms = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs"
+    $wsh = New-Object -ComObject WScript.Shell
+
+    function New-StartMenuShortcut($name, $target) {
+        if (Test-Path $target) {
+            $lnk = $wsh.CreateShortcut("$startMenuPrograms\$name.lnk")
+            $lnk.TargetPath = $target
+            $lnk.IconLocation = $target
+            $lnk.Save()
+            return "$startMenuPrograms\$name.lnk"
+        }
+        return $null
+    }
+
+    $pinList = @()
+    $lnk = New-StartMenuShortcut "File Explorer" $explorerPath; if ($lnk) { $pinList += $lnk }
+    $lnk = New-StartMenuShortcut "Outlook" $outlookPath; if ($lnk) { $pinList += $lnk }
+    if ($protonPath) { $lnk = New-StartMenuShortcut "Proton Mail" $protonPath; if ($lnk) { $pinList += $lnk } }
+    if ($obsidianPath) { $lnk = New-StartMenuShortcut "Obsidian" $obsidianPath; if ($lnk) { $pinList += $lnk } }
+    if ($bravePath) { $lnk = New-StartMenuShortcut "Brave" $bravePath; if ($lnk) { $pinList += $lnk } }
+
+    $pinEntries = ($pinList | ForEach-Object { "      <taskbar:DesktopApp DesktopApplicationLinkPath=`"$_`"/>" }) -join "`n"
+
+    $xmlContent = @"
+<?xml version="1.0" encoding="utf-8"?>
+<LayoutModificationTemplate xmlns:defaultlayout="http://schemas.microsoft.com/Start/2014/FullDefaultLayout"
+  xmlns:start="http://schemas.microsoft.com/Start/2014/StartLayout"
+  xmlns:taskbar="http://schemas.microsoft.com/Start/2014/TaskbarLayout"
+  xmlns="http://schemas.microsoft.com/Start/2014/LayoutModification"
+  Version="1">
+  <CustomTaskbarLayoutCollection PinListPlacement="Replace">
+    <defaultlayout:TaskbarLayout>
+      <taskbar:TaskbarPinList>
+$pinEntries
+      </taskbar:TaskbarPinList>
+    </defaultlayout:TaskbarLayout>
+  </CustomTaskbarLayoutCollection>
+</LayoutModificationTemplate>
+"@
+    $xmlPath = "$env:LOCALAPPDATA\Microsoft\Windows\Shell\LayoutModification.xml"
+    $xmlContent | Out-File -FilePath $xmlPath -Encoding UTF8 -NoNewline -Force
+    Remove-Item "$env:LOCALAPPDATA\Microsoft\Windows\Shell\DefaultLayouts" -Recurse -Force -ErrorAction SilentlyContinue
+    Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 8
+    Remove-Item $xmlPath -Force -ErrorAction SilentlyContinue
+
+} else {
+    # Windows 10: create shortcuts directly in User Pinned\TaskBar folder
+    $taskbarPinFolder = "$env:APPDATA\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"
+    New-Item -Path $taskbarPinFolder -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
+    $wsh = New-Object -ComObject WScript.Shell
+
+    function New-TaskbarShortcut($name, $target) {
+        if (Test-Path $target) {
+            $lnk = $wsh.CreateShortcut("$taskbarPinFolder\$name.lnk")
+            $lnk.TargetPath = $target
+            $lnk.Save()
+        }
+    }
+
+    New-TaskbarShortcut "File Explorer" $explorerPath
+    New-TaskbarShortcut "Outlook" $outlookPath
+    if ($protonPath) { New-TaskbarShortcut "Proton Mail" $protonPath }
+    if ($obsidianPath) { New-TaskbarShortcut "Obsidian" $obsidianPath }
+    if ($bravePath) { New-TaskbarShortcut "Brave" $bravePath }
+}
 
 # brave debloat - disable rewards, wallet, vpn, ai chat, stats ping
 cmd /c "reg add `"HKLM\SOFTWARE\Policies\BraveSoftware\Brave`" /v `"BraveRewardsDisabled`" /t REG_DWORD /d `"1`" /f >nul 2>&1"
