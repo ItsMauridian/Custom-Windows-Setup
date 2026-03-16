@@ -2730,7 +2730,7 @@ $layoutJson = @'
     { "packagedAppId": "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel" }
   ]
 }
-'@
+`'@
 Set-Content -Path "$shellFolder\LayoutModification.json" -Value $layoutJson -Encoding UTF8 -Force
 
 # create start menu & startup shortcuts
