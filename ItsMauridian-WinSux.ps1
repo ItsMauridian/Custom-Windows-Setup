@@ -2044,10 +2044,23 @@ E0,F6,C5,D5,0E,CA,50,00,00
 "HubMode"=dword:00000001
 
 ; remove home
-[-HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{f874310e-b6b7-47dc-bc84-b9e6b38f5903}]
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{f874310e-b6b7-47dc-bc84-b9e6b38f5903}]
+@="CLSID_MSGraphHomeFolder"
+"HiddenByDefault"=dword:00000001
+[-HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{f874310e-b6b7-47dc-bc84-b9e6b38f5903}]
+[HKEY_CURRENT_USER\Software\Classes\CLSID\{f874310e-b6b7-47dc-bc84-b9e6b38f5903}]
+@="CLSID_MSGraphHomeFolder"
+"System.IsPinnedToNameSpaceTree"=dword:00000000
 
 ; remove gallery
 [HKEY_CURRENT_USER\Software\Classes\CLSID\{e88865ea-0e1c-4e20-9aa6-edcd0212c87c}]
+@="{e88865ea-0e1c-4e20-9aa6-edcd0212c87c}"
+"System.IsPinnedToNameSpaceTree"=dword:00000000
+
+; remove onedrive from sidebar
+[HKEY_CURRENT_USER\Software\Classes\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}]
+"System.IsPinnedToNameSpaceTree"=dword:00000000
+[HKEY_CURRENT_USER\Software\Classes\Wow6432Node\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}]
 "System.IsPinnedToNameSpaceTree"=dword:00000000
 
 ; restore the classic context menu
@@ -2145,6 +2158,22 @@ $path = "$env:SystemRoot\Temp\WindowsSettings.reg"
 
 # import reg file
 Start-Process -Wait "regedit.exe" -ArgumentList "/S `"$env:SystemRoot\Temp\WindowsSettings.reg`"" -WindowStyle Hidden
+
+# remove Home and Gallery from navigation pane — cover both NameSpace and NameSpace_41040327 (varies by Win11 build)
+$namespaces = @(
+    "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{f874310e-b6b7-47dc-bc84-b9e6b38f5903}",
+    "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace_41040327\{f874310e-b6b7-47dc-bc84-b9e6b38f5903}",
+    "HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{f874310e-b6b7-47dc-bc84-b9e6b38f5903}",
+    "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{e88865ea-0e1c-4e20-9aa6-edcd0212c87c}",
+    "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace_41040327\{e88865ea-0e1c-4e20-9aa6-edcd0212c87c}",
+    "HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{e88865ea-0e1c-4e20-9aa6-edcd0212c87c}"
+)
+foreach ($ns in $namespaces) {
+    cmd /c "reg delete `"$ns`" /f >nul 2>&1"
+}
+# also set IsPinnedToNameSpaceTree=0 in HKCU for both (covers per-user override)
+cmd /c "reg add `"HKCU\Software\Classes\CLSID\{f874310e-b6b7-47dc-bc84-b9e6b38f5903}`" /v `"System.IsPinnedToNameSpaceTree`" /t REG_DWORD /d 0 /f >nul 2>&1"
+cmd /c "reg add `"HKCU\Software\Classes\CLSID\{e88865ea-0e1c-4e20-9aa6-edcd0212c87c}`" /v `"System.IsPinnedToNameSpaceTree`" /t REG_DWORD /d 0 /f >nul 2>&1"
 
 # fix 2 for turn off privacy & security app permissions
 # stop cam service and remove the database
@@ -3029,8 +3058,8 @@ if (!(Get-Command winget -ErrorAction SilentlyContinue)) {
     # use asheroto's winget-install script — handles VCLibs, UIXaml, and all dependencies automatically
     $wingetInstallScript = "$env:SystemRoot\Temp\winget-install.ps1"
     Get-FileFromWeb -URL "https://github.com/asheroto/winget-install/releases/latest/download/winget-install.ps1" -File $wingetInstallScript
-    & $wingetInstallScript -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 5
+    Start-Process -Wait "powershell.exe" -ArgumentList "-ExecutionPolicy Bypass -File `"$wingetInstallScript`" -Force" -WindowStyle Hidden
+    Start-Sleep -Seconds 10
 }
 
 # install apps via winget
@@ -4286,7 +4315,14 @@ Remove-Item "$env:SystemDrive\Windows\SetTimerResolutionService.cs" -ErrorAction
 
 # remove old service if exists
 if (Get-Service -Name "Set Timer Resolution Service" -ErrorAction SilentlyContinue) {
+    Stop-Service -Name "Set Timer Resolution Service" -Force -ErrorAction SilentlyContinue | Out-Null
     sc.exe delete "Set Timer Resolution Service" | Out-Null
+    # wait for SCM to fully release the service before recreating
+    $timeout = 30
+    while ((Get-Service -Name "Set Timer Resolution Service" -ErrorAction SilentlyContinue) -and $timeout -gt 0) {
+        Start-Sleep -Seconds 1
+        $timeout--
+    }
     Start-Sleep -Seconds 2
 }
 

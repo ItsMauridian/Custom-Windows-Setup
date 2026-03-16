@@ -13,6 +13,7 @@ iwr https://winsetup.m05.dev -useb | iex
 - Applies privacy, performance, and usability tweaks
 - Removes bloatware, OneDrive, Microsoft Edge, Copilot, Xbox components
 - Configures Windows settings to personal preference
+- Generates a setup log on the desktop after completion listing any errors
 
 ## Changes from original
 
@@ -39,12 +40,18 @@ iwr https://winsetup.m05.dev -useb | iex
 - ColorPrevalence set to 0 (fixes unreadable text on Windows 10)
 - Removed black desktop background color setting (was causing invisible sidebar text on Windows 10)
 - Brave, ShareX and Obsidian moved from direct download to winget
+- `W32Time` removed from manual services list (prevents broken time sync on Windows 11)
+- `StorSvc` removed from manual services list (was Automatic by default on Windows 11, demoting it broke Store app installs)
+- `AssignedAccessManagerSvc` removed from manual services list (duplicate — already in disabled services list)
+- Timer Resolution service: now stops the service before deleting it, and waits for SCM to fully release before recreating
 
 ### Added
 **Activation & Setup**
 - Windows activation via MAS (get.activated.win) runs at the very start
 - Warning prompt before Store settings page opens
 - wsreset -i to reinstall Microsoft Store if missing
+- Winget auto-install via asheroto/winget-install if not present (handles VCLibs and all dependencies automatically)
+- Setup log generated on the desktop after script completes, listing any errors that occurred
 
 **Privacy & Telemetry**
 - Comprehensive telemetry block: DiagTrack, wermgr, AdvertisingInfo, Input TIPC, OnlineSpeechPrivacy, SvcHostSplitThresholdInKB, PowerShell and .NET CLI telemetry
@@ -52,7 +59,7 @@ iwr https://winsetup.m05.dev -useb | iex
 - Copilot deep removal: appx packages, IsCopilotAvailable, AllowCopilotRuntime, CoreAI package
 - Xbox & Gaming Components appx removal
 - Widgets appx removal
-- OneDrive: leftover folder removal, startup removal, reinstall prevention
+- OneDrive: leftover folder removal, startup removal, reinstall prevention, sidebar namespace entry removed
 
 **Performance**
 - NetworkThrottlingIndex and SystemResponsiveness tweaks
@@ -84,11 +91,21 @@ iwr https://winsetup.m05.dev -useb | iex
 - Windows Hello only sign-in removed (allows security key PIN prompt)
 - Passkey and passkey enumeration access restored
 
+**Explorer Sidebar**
+- Home removed from navigation pane (Windows 11)
+- Gallery removed from navigation pane (Windows 11)
+- OneDrive removed from navigation pane
+
 **App Installs (via winget)**
 Autoruns, Brave, Discord, EA App, EarTrumpet, Epic Games Launcher, HWiNFO, iTunes, MSEdgeRedirect, Obsidian, PowerToys, PuTTY, ShareX, Slack, Steam, Sublime Text, TagScanner, Telegram, Windows Terminal, Ubisoft Connect, VLC, UniGetUI, WinRAR, WinSCP, Zoom
 
 **Brave**
 - Debloat registry keys applied after install: Rewards, Wallet, VPN, AI Chat and Stats Ping all disabled
+- BraveUpdate scheduled tasks removed
+
+## Notes
+- The setup log on the desktop will contain some expected "errors" that are harmless: missing processes that weren't running (OneDrive, Widgets), registry keys that don't exist on your specific Windows version, and files in use during temp folder cleanup. Anything related to winget or Timer Resolution is worth checking.
+- Power scheme errors in the log are normal when running on a VM — the power plan GUIDs differ from physical hardware.
 
 ## Other Scripts
 The `/Graphics` folder contains standalone tools for GPU driver management:
