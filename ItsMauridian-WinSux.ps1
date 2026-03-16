@@ -2571,7 +2571,12 @@ $MultilineComment = @'
     <LayoutOptions StartTileGroupCellWidth="6" />
     <DefaultLayoutOverride>
         <StartLayoutCollection>
-            <defaultlayout:StartLayout GroupCellWidth="6" />
+            <defaultlayout:StartLayout GroupCellWidth="6">
+                <start:Group Name="">
+                    <start:DesktopApplicationTile Size="2x2" Column="0" Row="0" DesktopApplicationID="Microsoft.Windows.Explorer" />
+                    <start:Tile Size="2x2" Column="2" Row="0" AppUserModelID="windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel" />
+                </start:Group>
+            </defaultlayout:StartLayout>
         </StartLayoutCollection>
     </DefaultLayoutOverride>
 </LayoutModificationTemplate>
@@ -2713,6 +2718,20 @@ certutil.exe -decode "$env:SystemRoot\Temp\start2.txt" "$env:SystemRoot\Temp\sta
 
 # install start2bin
 Copy-Item "$env:SystemRoot\Temp\start2.bin" -Destination "$env:USERPROFILE\AppData\Local\Packages\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\LocalState" -Force -ErrorAction SilentlyContinue | Out-Null
+
+# windows 11 start menu — write LayoutModification.json with Explorer + Settings only
+# this is the supported non-MDM method; user can still customize after first login
+$shellFolder = "$env:LOCALAPPDATA\Microsoft\Windows\Shell"
+New-Item -Path $shellFolder -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
+$layoutJson = @'
+{
+  "pinnedList": [
+    { "desktopAppId": "Microsoft.Windows.Explorer" },
+    { "packagedAppId": "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel" }
+  ]
+}
+'@
+Set-Content -Path "$shellFolder\LayoutModification.json" -Value $layoutJson -Encoding UTF8 -Force
 
 # create start menu & startup shortcuts
 $WshShell = New-Object -comObject WScript.Shell
@@ -3052,36 +3071,44 @@ New-Item -Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp" 
 
         Write-Host "INSTALLING APPS`n"
 
-# resolve winget path — check direct locations first since PATH may not be set in RunOnce context
-$wingetExe = Get-Command winget -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
-if (!$wingetExe) {
-    $wingetExe = Get-Item "$env:LOCALAPPDATA\Microsoft\WindowsApps\winget.exe" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
-}
-if (!$wingetExe) {
-    $wingetExe = Get-ChildItem "C:\Program Files\WindowsApps" -Filter "winget.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+# register winget for current user session (required on first login per Microsoft docs)
+Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 5
+
+# check if winget works via cmd (resolves AppX aliases that PowerShell cannot)
+$wingetWorks = $false
+$attempts = 0
+while (!$wingetWorks -and $attempts -lt 3) {
+    $wingetCheck = cmd /c "winget --version" 2>&1
+    if ($LASTEXITCODE -eq 0 -or ($wingetCheck -match "v\d+\.\d+")) { $wingetWorks = $true }
+    if (!$wingetWorks) { Start-Sleep -Seconds 10 }
+    $attempts++
 }
 
 # install winget if genuinely not present
-if (!$wingetExe) {
-    Write-Host "winget not found, installing...`n" -ForegroundColor Yellow
-    # use asheroto's winget-install script — handles VCLibs, UIXaml, and all dependencies automatically
-    $wingetInstallScript = "$env:SystemRoot\Temp\winget-install.ps1"
-    Get-FileFromWeb -URL "https://github.com/asheroto/winget-install/releases/latest/download/winget-install.ps1" -File $wingetInstallScript
-    Start-Process -Wait "powershell.exe" -ArgumentList "-ExecutionPolicy Bypass -File `"$wingetInstallScript`" -Force" -WindowStyle Hidden
+if (!$wingetWorks) {
+    Write-Host "winget not found, installing via Chocolatey...`n" -ForegroundColor Yellow
+    Set-ExecutionPolicy Bypass -Scope Process -Force
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+    Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+    Start-Sleep -Seconds 5
+    choco install winget -y
     Start-Sleep -Seconds 10
-    # resolve again after install
-    $wingetExe = Get-Command winget -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
-    if (!$wingetExe) {
-        $wingetExe = Get-Item "$env:LOCALAPPDATA\Microsoft\WindowsApps\winget.exe" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+    # remove chocolatey after
+    if (Test-Path "$env:ProgramData\chocolatey\choco.exe") {
+        & "$env:ProgramData\chocolatey\choco.exe" uninstall chocolatey -y -ErrorAction SilentlyContinue
     }
+    Remove-Item "$env:ProgramData\chocolatey" -Recurse -Force -ErrorAction SilentlyContinue
+    $wingetCheck = cmd /c "winget --version" 2>&1
+    if ($LASTEXITCODE -eq 0 -or ($wingetCheck -match "v\d+\.\d+")) { $wingetWorks = $true }
 }
 
-if (!$wingetExe) {
+if (!$wingetWorks) {
     Write-Host "winget could not be found after install attempt, skipping app installs`n" -ForegroundColor Red
 }
 
 # install apps via winget
-if ($wingetExe) {
+if ($wingetWorks) {
 $apps = @(
     "Sysinternals.Autoruns",
     "Brave.Brave",
@@ -3111,105 +3138,75 @@ $apps = @(
     "Proton.ProtonMail"
 )
 foreach ($app in $apps) {
-    Start-Process -Wait $wingetExe -ArgumentList "install --id `"$app`" --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --no-upgrade" -WindowStyle Hidden
+    cmd /c "winget install --id `"$app`" --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --no-upgrade"
 }
 }
 
-# pin apps to taskbar — version-aware approach
-# windows 10: shortcut folder method
-# windows 11: LayoutModification.xml method (only reliable method on Win11)
+# clean up taskbar — remove all pins, clear stale layout XMLs, remove duplicate shortcuts
+# works on both Windows 10 and Windows 11
 
-$winVer = [System.Environment]::OSVersion.Version.Major
-$winBuild = [System.Environment]::OSVersion.Version.Build
-$isWin11 = ($winVer -eq 10 -and $winBuild -ge 22000)
-
-# resolve app paths
-$explorerPath = "$env:SystemRoot\explorer.exe"
-
-$outlookPath = "$env:LOCALAPPDATA\Microsoft\WindowsApps\outlook.exe"
-
-$protonPath = @(
-    "$env:LOCALAPPDATA\Programs\Proton Mail\Proton Mail.exe",
-    "$env:ProgramFiles\Proton Mail\Proton Mail.exe"
-) | Where-Object { Test-Path $_ } | Select-Object -First 1
-
-$obsidianPath = @(
-    "$env:LOCALAPPDATA\Programs\Obsidian\Obsidian.exe",
-    "$env:ProgramFiles\Obsidian\Obsidian.exe"
-) | Where-Object { Test-Path $_ } | Select-Object -First 1
-
-$bravePath = @(
-    "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe",
-    "$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe"
-) | Where-Object { Test-Path $_ } | Select-Object -First 1
-
-if ($isWin11) {
-    # Windows 11: create shortcuts in Start Menu then apply via LayoutModification.xml
-    $startMenuPrograms = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs"
-    $wsh = New-Object -ComObject WScript.Shell
-
-    function New-StartMenuShortcut($name, $target) {
-        if (Test-Path $target) {
-            $lnk = $wsh.CreateShortcut("$startMenuPrograms\$name.lnk")
-            $lnk.TargetPath = $target
-            $lnk.IconLocation = $target
-            $lnk.Save()
-            return "$startMenuPrograms\$name.lnk"
-        }
-        return $null
+# remove all pinned shortcut files
+$taskBarFolder = "$env:APPDATA\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"
+if (Test-Path $taskBarFolder) {
+    Get-ChildItem $taskBarFolder -Filter "*.lnk" -ErrorAction SilentlyContinue | ForEach-Object {
+        Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
     }
+}
 
-    $pinList = @()
-    $lnk = New-StartMenuShortcut "File Explorer" $explorerPath; if ($lnk) { $pinList += $lnk }
-    $lnk = New-StartMenuShortcut "Outlook" $outlookPath; if ($lnk) { $pinList += $lnk }
-    if ($protonPath) { $lnk = New-StartMenuShortcut "Proton Mail" $protonPath; if ($lnk) { $pinList += $lnk } }
-    if ($obsidianPath) { $lnk = New-StartMenuShortcut "Obsidian" $obsidianPath; if ($lnk) { $pinList += $lnk } }
-    if ($bravePath) { $lnk = New-StartMenuShortcut "Brave" $bravePath; if ($lnk) { $pinList += $lnk } }
+# clear auto-pinned items
+$implicitFolder = "$env:APPDATA\Microsoft\Internet Explorer\Quick Launch\User Pinned\ImplicitAppShortcuts"
+if (Test-Path $implicitFolder) {
+    Remove-Item "$implicitFolder\*" -Recurse -Force -ErrorAction SilentlyContinue
+}
 
-    $pinEntries = ($pinList | ForEach-Object { "      <taskbar:DesktopApp DesktopApplicationLinkPath=`"$_`"/>" }) -join "`n"
+# remove stale LayoutModification.xml files (user + Default profile + temp)
+Remove-Item "$env:LOCALAPPDATA\Microsoft\Windows\Shell\LayoutModification.xml" -Force -ErrorAction SilentlyContinue
+Remove-Item "$env:SystemDrive\Users\Default\AppData\Local\Microsoft\Windows\Shell\LayoutModification.xml" -Force -ErrorAction SilentlyContinue
+Remove-Item "$env:SystemRoot\Temp\WinSuxTaskbar.xml" -Force -ErrorAction SilentlyContinue
 
-    $xmlContent = @"
-<?xml version="1.0" encoding="utf-8"?>
-<LayoutModificationTemplate xmlns:defaultlayout="http://schemas.microsoft.com/Start/2014/FullDefaultLayout"
-  xmlns:start="http://schemas.microsoft.com/Start/2014/StartLayout"
-  xmlns:taskbar="http://schemas.microsoft.com/Start/2014/TaskbarLayout"
-  xmlns="http://schemas.microsoft.com/Start/2014/LayoutModification"
-  Version="1">
-  <CustomTaskbarLayoutCollection PinListPlacement="Replace">
-    <defaultlayout:TaskbarLayout>
-      <taskbar:TaskbarPinList>
-$pinEntries
-      </taskbar:TaskbarPinList>
-    </defaultlayout:TaskbarLayout>
-  </CustomTaskbarLayoutCollection>
-</LayoutModificationTemplate>
-"@
-    $xmlPath = "$env:LOCALAPPDATA\Microsoft\Windows\Shell\LayoutModification.xml"
-    $xmlContent | Out-File -FilePath $xmlPath -Encoding UTF8 -NoNewline -Force
-    Remove-Item "$env:LOCALAPPDATA\Microsoft\Windows\Shell\DefaultLayouts" -Recurse -Force -ErrorAction SilentlyContinue
-    Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 8
-    Remove-Item $xmlPath -Force -ErrorAction SilentlyContinue
+# wipe Taskband registry to clear stale "(2)" / "(3)" entries
+Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+Remove-Item -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband" -Recurse -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 1
+Start-Process explorer
+Start-Sleep -Seconds 4
 
-} else {
-    # Windows 10: create shortcuts directly in User Pinned\TaskBar folder
-    $taskbarPinFolder = "$env:APPDATA\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"
-    New-Item -Path $taskbarPinFolder -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
-    $wsh = New-Object -ComObject WScript.Shell
+# remove duplicate shortcuts across Start Menu and Desktop locations
+$dupeLocations = @(
+    @{ Path = "$env:ALLUSERSPROFILE\Microsoft\Windows\Start Menu\Programs"; Priority = 1 },
+    @{ Path = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs";         Priority = 2 },
+    @{ Path = "$env:PUBLIC\Desktop";                                        Priority = 3 },
+    @{ Path = "$env:USERPROFILE\Desktop";                                   Priority = 4 }
+)
 
-    function New-TaskbarShortcut($name, $target) {
-        if (Test-Path $target) {
-            $lnk = $wsh.CreateShortcut("$taskbarPinFolder\$name.lnk")
-            $lnk.TargetPath = $target
-            $lnk.Save()
-        }
+$dupeWsh = New-Object -ComObject WScript.Shell
+$dupeAllShortcuts = @()
+
+foreach ($dupeLoc in $dupeLocations) {
+    if (-not (Test-Path $dupeLoc.Path)) { continue }
+    Get-ChildItem -Path $dupeLoc.Path -Filter "*.lnk" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+        try {
+            $dupeShortcut = $dupeWsh.CreateShortcut($_.FullName)
+            $dupeTarget = $dupeShortcut.TargetPath
+            if ($dupeTarget) {
+                $dupeTarget = [System.Environment]::ExpandEnvironmentVariables($dupeTarget).ToLower().TrimEnd('\')
+            }
+            $dupeAllShortcuts += [PSCustomObject]@{
+                FullPath  = $_.FullName
+                Target    = $dupeTarget
+                Priority  = $dupeLoc.Priority
+                SubFolder = $_.DirectoryName.Replace($dupeLoc.Path, "").TrimStart('\')
+            }
+        } catch { }
     }
+}
 
-    New-TaskbarShortcut "File Explorer" $explorerPath
-    New-TaskbarShortcut "Outlook" $outlookPath
-    if ($protonPath) { New-TaskbarShortcut "Proton Mail" $protonPath }
-    if ($obsidianPath) { New-TaskbarShortcut "Obsidian" $obsidianPath }
-    if ($bravePath) { New-TaskbarShortcut "Brave" $bravePath }
+$dupeGrouped = $dupeAllShortcuts | Where-Object { $_.Target -and $_.Target -ne "" } | Group-Object -Property Target
+$dupeGrouped | Where-Object { $_.Count -gt 1 } | ForEach-Object {
+    $_.Group | Sort-Object Priority, { $_.SubFolder.Length } | Select-Object -Skip 1 | ForEach-Object {
+        Remove-Item $_.FullPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # brave debloat - disable rewards, wallet, vpn, ai chat, stats ping
@@ -3298,7 +3295,7 @@ Start-Process "$env:SystemRoot\Temp\NvidiaDriver\setup.exe" -ArgumentList "-s -n
 
 # install nvidia control panel
 try {
-if ($wingetExe) { Start-Process -Wait $wingetExe -ArgumentList "install `"9NF8H0H7WMLT`" --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --no-upgrade" -WindowStyle Hidden }
+if ($wingetWorks) { cmd /c "winget install `"9NF8H0H7WMLT`" --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --no-upgrade" }
 } catch { }
 
 # delete download
