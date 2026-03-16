@@ -3160,9 +3160,9 @@ if (Test-Path $implicitFolder) {
 }
 
 # remove stale LayoutModification.xml files (user + Default profile + temp)
-Remove-Item "$env:LOCALAPPDATA\Microsoft\Windows\Shell\LayoutModification.xml" -Force -ErrorAction SilentlyContinue
-Remove-Item "$env:SystemDrive\Users\Default\AppData\Local\Microsoft\Windows\Shell\LayoutModification.xml" -Force -ErrorAction SilentlyContinue
-Remove-Item "$env:SystemRoot\Temp\WinSuxTaskbar.xml" -Force -ErrorAction SilentlyContinue
+if (Test-Path "$env:LOCALAPPDATA\Microsoft\Windows\Shell\LayoutModification.xml") { Remove-Item "$env:LOCALAPPDATA\Microsoft\Windows\Shell\LayoutModification.xml" -Force }
+if (Test-Path "$env:SystemDrive\Users\Default\AppData\Local\Microsoft\Windows\Shell\LayoutModification.xml") { Remove-Item "$env:SystemDrive\Users\Default\AppData\Local\Microsoft\Windows\Shell\LayoutModification.xml" -Force }
+if (Test-Path "$env:SystemRoot\Temp\WinSuxTaskbar.xml") { Remove-Item "$env:SystemRoot\Temp\WinSuxTaskbar.xml" -Force }
 
 # wipe Taskband registry to clear stale "(2)" / "(3)" entries
 Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
