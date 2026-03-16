@@ -2159,6 +2159,48 @@ $path = "$env:SystemRoot\Temp\WindowsSettings.reg"
 # import reg file
 Start-Process -Wait "regedit.exe" -ArgumentList "/S `"$env:SystemRoot\Temp\WindowsSettings.reg`"" -WindowStyle Hidden
 
+# force-apply visual effects immediately via SystemParametersInfo
+# (regedit writes UserPreferencesMask but Windows caches it in memory — only re-reads at logon
+#  unless we call SystemParametersInfo with SPIF_SENDCHANGE to broadcast the change)
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class WinSuxVisualFx {
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, bool pvParam, uint fWinIni);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, uint pvParam, uint fWinIni);
+
+    private const uint SPIF_SENDCHANGE = 0x02;
+
+    public static void Apply() {
+        // disable menu fade/slide animation
+        SystemParametersInfo(0x1003, 0, false, SPIF_SENDCHANGE);
+        // disable combo box animation (slide open)
+        SystemParametersInfo(0x1005, 0, false, SPIF_SENDCHANGE);
+        // disable smooth-scroll list boxes
+        SystemParametersInfo(0x1007, 0, false, SPIF_SENDCHANGE);
+        // disable selection fade
+        SystemParametersInfo(0x1015, 0, false, SPIF_SENDCHANGE);
+        // disable tooltip animation
+        SystemParametersInfo(0x1017, 0, false, SPIF_SENDCHANGE);
+        // disable tooltip fade
+        SystemParametersInfo(0x1019, 0, false, SPIF_SENDCHANGE);
+        // disable show window contents while dragging
+        SystemParametersInfo(0x0025, 0, false, SPIF_SENDCHANGE);
+        // disable cursor shadow
+        SystemParametersInfo(0x101B, 0, false, SPIF_SENDCHANGE);
+    }
+}
+"@ -ErrorAction SilentlyContinue
+try { [WinSuxVisualFx]::Apply() } catch { }
+
+# win11 accessibility "Animation effects" toggle — not covered by the reg file
+cmd /c "reg add `"HKCU\Control Panel\Desktop`" /v `"UIEffects`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
+
 # remove Home and Gallery from navigation pane — cover both NameSpace and NameSpace_41040327 (varies by Win11 build)
 $namespaces = @(
     "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{f874310e-b6b7-47dc-bc84-b9e6b38f5903}",
@@ -2255,31 +2297,32 @@ Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control" -Name "SvcHostSp
 # set services to manual
 $manualServices = @(
 "ALG","AppMgmt","AppReadiness","Appinfo","AxInstSV","BDESVC",
-"BTAGService","CDPSvc","COMSysApp","CertPropSvc","CscService","DevQueryBroker",
-"DeviceAssociationService","DeviceInstall","DisplayEnhancementService","EFS","EapHost",
+"BTAGService","CDPSvc","COMSysApp","CertPropSvc","CscService","DPS","DevQueryBroker",
+"DeviceAssociationService","DeviceInstall","DisplayEnhancementService","DusmSvc","EFS","EapHost",
 "FDResPub","FrameServer","FrameServerMonitor","GraphicsPerfSvc","HvHost","IKEEXT",
 "InstallService","InventorySvc","IpxlatCfgSvc","KtmRm","LicenseManager","LxpSvc",
 "MSDTC","MSiSCSI","McpManagementService","MicrosoftEdgeElevationService",
 "NaturalAuthentication","NcaSvc","NcbService","NcdAutoSetup","NetSetupSvc","Netman",
 "NlaSvc","PcaSvc","PeerDistSvc","PerfHost","PhoneSvc","PlugPlay","PolicyAgent",
-"PrintNotify","PushToInstall","QWAVE","RasAuto","RasMan","RetailDemo","RmSvc",
+"PrintDeviceConfigurationService","PrintNotify","PrintScanBrokerService","PushToInstall",
+"QWAVE","RasAuto","RasMan","RetailDemo","RmSvc",
 "RpcLocator","SCPolicySvc","SCardSvr","SDRSVC","SEMgrSvc","SNMPTRAP","SNMPTrap",
 "SSDPSRV","ScDeviceEnum","SensorDataService","SensorService","SensrSvc","SessionEnv",
-"SharedAccess","SmsRouter","SstpSvc","StiSvc","TapiSrv","TermService",
-"TieringEngineService","TokenBroker","TroubleshootingSvc","TrustedInstaller","UmRdpService",
+"SharedAccess","SmsRouter","Spooler","SstpSvc","StiSvc","TapiSrv","TermService",
+"TieringEngineService","TokenBroker","TrkWks","TroubleshootingSvc","TrustedInstaller","UmRdpService",
 "VSS","VaultSvc","WEPHOSTSVC","WFDSConMgrSvc","WMPNetworkSvc","WManSvc",
 "WPDBusEnum","WSAIFabricSvc","WalletService","WarpJITSvc","WbioSrvc","WdiServiceHost",
 "WdiSystemHost","WebClient","Wecsvc","WerSvc","WiaRpc","WinRM","WpcMonSvc","WpnService",
-"XblAuthManager","XblGameSave","XboxGipSvc","XboxNetApiSvc","autotimesvc","bthserv",
+"XblAuthManager","XblGameSave","XboxGipSvc","XboxNetApiSvc","ZoomCptService","autotimesvc","bthserv",
 "camsvc","cloudidsvc","dcsvc","defragsvc","diagsvc","dmwappushservice","dot3svc",
-"edgeupdate","edgeupdatem","fdPHost","fhsvc","hidserv","icssvc","lfsvc","lltdsvc",
+"edgeupdate","edgeupdatem","fdPHost","fhsvc","hidserv","icssvc","iphlpsvc","lfsvc","lltdsvc",
 "lmhosts","netprofm","perceptionsimulation","pla","seclogon","smphost","svsvc","swprv",
 "upnphost","vds","vmicguestinterface","vmicheartbeat","vmickvpexchange","vmicrdv",
 "vmicshutdown","vmictimesync","vmicvmsession","vmicvss","wbengine","wcncsvc",
 "webthreatdefsvc","wercplsupport","wisvc","wlidsvc","wlpasvc","wmiApSrv",
 "workfolderssvc","wuauserv"
 )
-$disabledServices = @("AppVClient","AssignedAccessManagerSvc","DialogBlockingService","NetTcpPortSharing","RemoteAccess","RemoteRegistry","UevAgentService","shpamsvc","ssh-agent","tzautoupdate")
+$disabledServices = @("AppVClient","AssignedAccessManagerSvc","DialogBlockingService","MapsBroker","NetTcpPortSharing","RemoteAccess","RemoteRegistry","UevAgentService","WSearch","shpamsvc","ssh-agent","tzautoupdate","whesvc")
 foreach ($svc in $manualServices) {
 Set-Service -Name $svc -StartupType Manual -ErrorAction SilentlyContinue
 }
