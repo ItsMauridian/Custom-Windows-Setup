@@ -3062,10 +3062,20 @@ if (!(Get-Command winget -ErrorAction SilentlyContinue)) {
     Start-Sleep -Seconds 10
 }
 
+# resolve winget path — find the exe directly in case PATH isn't updated yet
+$wingetExe = Get-Command winget -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+if (!$wingetExe) {
+    $wingetExe = Get-Item "$env:LOCALAPPDATA\Microsoft\WindowsApps\winget.exe" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+}
+if (!$wingetExe) {
+    $wingetExe = Get-ChildItem "C:\Program Files\WindowsApps" -Filter "winget.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+}
+if (!$wingetExe) {
+    Write-Host "winget could not be found after install attempt, skipping app installs`n" -ForegroundColor Red
+}
+
 # install apps via winget
-# ensure winget is in PATH
-$env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
-$env:PATH += ";$env:LOCALAPPDATA\Microsoft\WindowsApps"
+if ($wingetExe) {
 $apps = @(
     "Sysinternals.Autoruns",
     "Brave.Brave",
@@ -3094,7 +3104,8 @@ $apps = @(
     "Obsidian.Obsidian"
 )
 foreach ($app in $apps) {
-    Start-Process "winget" -ArgumentList "install --id `"$app`" --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --no-upgrade" -Wait -WindowStyle Hidden
+    Start-Process -Wait $wingetExe -ArgumentList "install --id `"$app`" --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --no-upgrade" -WindowStyle Hidden
+}
 }
 
 # brave debloat - disable rewards, wallet, vpn, ai chat, stats ping
@@ -3183,7 +3194,7 @@ Start-Process "$env:SystemRoot\Temp\NvidiaDriver\setup.exe" -ArgumentList "-s -n
 
 # install nvidia control panel
 try {
-Start-Process "winget" -ArgumentList "install `"9NF8H0H7WMLT`" --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --no-upgrade" -Wait -WindowStyle Hidden
+if ($wingetExe) { Start-Process -Wait $wingetExe -ArgumentList "install `"9NF8H0H7WMLT`" --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --no-upgrade" -WindowStyle Hidden }
 } catch { }
 
 # delete download
@@ -4326,10 +4337,12 @@ if (Get-Service -Name "Set Timer Resolution Service" -ErrorAction SilentlyContin
     Start-Sleep -Seconds 2
 }
 
-# install and start service
-New-Service -Name "Set Timer Resolution Service" -BinaryPathName "$env:SystemDrive\Windows\SetTimerResolutionService.exe" -ErrorAction SilentlyContinue | Out-Null
-Set-Service -Name "Set Timer Resolution Service" -StartupType Auto -ErrorAction SilentlyContinue | Out-Null
-Set-Service -Name "Set Timer Resolution Service" -Status Running -ErrorAction SilentlyContinue | Out-Null
+# install and start service only if exe was successfully compiled
+if (Test-Path "$env:SystemDrive\Windows\SetTimerResolutionService.exe") {
+    New-Service -Name "Set Timer Resolution Service" -BinaryPathName "$env:SystemDrive\Windows\SetTimerResolutionService.exe" -ErrorAction SilentlyContinue | Out-Null
+    Set-Service -Name "Set Timer Resolution Service" -StartupType Auto -ErrorAction SilentlyContinue | Out-Null
+    Set-Service -Name "Set Timer Resolution Service" -Status Running -ErrorAction SilentlyContinue | Out-Null
+}
 
 # enable global timer resolution requests
 cmd /c "reg add `"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\kernel`" /v `"GlobalTimerResolutionRequests`" /t REG_DWORD /d `"1`" /f >nul 2>&1"
