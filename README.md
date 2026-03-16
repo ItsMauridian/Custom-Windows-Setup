@@ -116,3 +116,4 @@ The `/Graphics` folder contains standalone tools for GPU driver management:
 
 ## Credits
 Original script by [FR33THY](https://www.youtube.com/FR33THY)
+Services to Manual list sourced from [Chris Titus Tech's WinUtil](https://github.com/ChrisTitusTech/winutil)
