@@ -928,7 +928,7 @@ Windows Registry Editor Version 5.00
 ; disable slide open combo boxes
 ; disable smooth-scroll list boxes
 [HKEY_CURRENT_USER\Control Panel\Desktop]
-"UserPreferencesMask"=hex(2):90,12,03,80,12,00,00,00
+"UserPreferencesMask"=hex(2):90,12,03,80,10,00,00,00
 
 ; disable animate windows when minimizing and maximizing
 [HKEY_CURRENT_USER\Control Panel\Desktop\WindowMetrics]
@@ -2166,6 +2166,12 @@ Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
 public class WinSuxVisualFx {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct ANIMATIONINFO {
+        public uint cbSize;
+        public int iMinAnimate;
+    }
+
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, bool pvParam, uint fWinIni);
@@ -2174,32 +2180,49 @@ public class WinSuxVisualFx {
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, uint pvParam, uint fWinIni);
 
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, ref ANIMATIONINFO pvParam, uint fWinIni);
+
+    private const uint SPIF_UPDATEINIFILE = 0x01;
     private const uint SPIF_SENDCHANGE = 0x02;
+    private const uint SPIF_FLAGS = SPIF_UPDATEINIFILE | SPIF_SENDCHANGE;
 
     public static void Apply() {
+        var animationInfo = new ANIMATIONINFO();
+        animationInfo.cbSize = (uint)Marshal.SizeOf(typeof(ANIMATIONINFO));
+        animationInfo.iMinAnimate = 0;
+
+        // disable window minimize/maximize animation
+        SystemParametersInfo(0x0049, animationInfo.cbSize, ref animationInfo, SPIF_FLAGS);
+        // disable global UI effects / Win11 animation-effects toggle
+        SystemParametersInfo(0x103F, 0, 0u, SPIF_FLAGS);
+        // disable client-area animation inside windows
+        SystemParametersInfo(0x1043, 0, false, SPIF_FLAGS);
         // disable menu fade/slide animation
-        SystemParametersInfo(0x1003, 0, false, SPIF_SENDCHANGE);
+        SystemParametersInfo(0x1003, 0, false, SPIF_FLAGS);
         // disable combo box animation (slide open)
-        SystemParametersInfo(0x1005, 0, false, SPIF_SENDCHANGE);
+        SystemParametersInfo(0x1005, 0, false, SPIF_FLAGS);
         // disable smooth-scroll list boxes
-        SystemParametersInfo(0x1007, 0, false, SPIF_SENDCHANGE);
+        SystemParametersInfo(0x1007, 0, false, SPIF_FLAGS);
         // disable selection fade
-        SystemParametersInfo(0x1015, 0, false, SPIF_SENDCHANGE);
+        SystemParametersInfo(0x1015, 0, false, SPIF_FLAGS);
         // disable tooltip animation
-        SystemParametersInfo(0x1017, 0, false, SPIF_SENDCHANGE);
+        SystemParametersInfo(0x1017, 0, false, SPIF_FLAGS);
         // disable tooltip fade
-        SystemParametersInfo(0x1019, 0, false, SPIF_SENDCHANGE);
+        SystemParametersInfo(0x1019, 0, false, SPIF_FLAGS);
         // disable show window contents while dragging
-        SystemParametersInfo(0x0025, 0, false, SPIF_SENDCHANGE);
+        SystemParametersInfo(0x0025, 0, false, SPIF_FLAGS);
         // disable cursor shadow
-        SystemParametersInfo(0x101B, 0, false, SPIF_SENDCHANGE);
+        SystemParametersInfo(0x101B, 0, false, SPIF_FLAGS);
     }
 }
 "@ -ErrorAction SilentlyContinue
 try { [WinSuxVisualFx]::Apply() } catch { }
 
-# win11 accessibility "Animation effects" toggle — not covered by the reg file
-cmd /c "reg add `"HKCU\Control Panel\Desktop`" /v `"UIEffects`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
+# animation effects off state used by both Windows 10 and Windows 11
+New-Item -Path 'HKCU:\Control Panel\Desktop' -Force | Out-Null
+New-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'UIEffects' -PropertyType DWord -Value 0 -Force | Out-Null
 
 # remove Home and Gallery from navigation pane — cover both NameSpace and NameSpace_41040327 (varies by Win11 build)
 $namespaces = @(
@@ -3152,22 +3175,26 @@ if (!$wingetWorks) {
 
 # install apps via winget
 if ($wingetWorks) {
+$isWindows11 = [System.Environment]::OSVersion.Version.Build -ge 22000
 $apps = @(
     "Sysinternals.Autoruns",
     "Brave.Brave",
     "Discord.Discord",
+    "Discord.Discord.PTB",
     "ElectronicArts.EADesktop",
     "File-New-Project.EarTrumpet",
     "EpicGames.EpicGamesLauncher",
     "REALiX.HWiNFO",
     "Apple.iTunes",
-    "MSEdgeRedirect.MSEdgeRedirect",
+    "rcmaehl.MSEdgeRedirect",
+    "Microsoft.EdgeWebView2Runtime",
+    "Microsoft.PowerShell",
     "Microsoft.PowerToys",
     "PuTTY.PuTTY",
     "SlackTechnologies.Slack",
     "Valve.Steam",
     "SublimeHQ.SublimeText.4",
-    "BPBioinformatics.TagScanner",
+    "SergeySerkov.TagScanner",
     "Telegram.TelegramDesktop",
     "Microsoft.WindowsTerminal",
     "Ubisoft.Connect",
@@ -3178,8 +3205,17 @@ $apps = @(
     "Zoom.Zoom",
     "ShareX.ShareX",
     "Obsidian.Obsidian",
-    "Proton.ProtonMail"
+    "Proton.ProtonDrive",
+    "Proton.ProtonMail",
+    "Bambulab.BambuStudio",
+    "Elgato.StreamDeck",
+    "Logitech.GHUB",
+    "RevoUninstaller.RevoUninstallerPro",
+    "RockstarGames.Launcher"
 )
+if ($isWindows11) {
+    $apps += "StartIsBack.StartAllBack"
+}
 foreach ($app in $apps) {
     cmd /c "winget install --id `"$app`" --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --no-upgrade"
 }
