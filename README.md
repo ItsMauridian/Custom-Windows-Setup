@@ -85,6 +85,8 @@ iwr https://winsetup.m05.dev -useb | iex
 - ShowHibernateOption=0
 - Background apps GlobalUserDisabled
 - Explorer Automatic Folder Discovery disabled
+- Taskbar cleanup: removes all pins, clears stale layout XMLs, wipes Taskband registry
+- Duplicate shortcut removal: scans Start Menu and Desktop, removes extras keeping one per target
 
 **Security**
 - YubiKey/FIDO2 passkey access restored (removed original blocks)
