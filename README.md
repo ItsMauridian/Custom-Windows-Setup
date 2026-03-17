@@ -11,7 +11,7 @@ The goal is one script that applies the same overall setup philosophy on both Wi
 
 - **Current Win11 VM status:** confirmed working well in the latest test VM.
 - **Current Win11 IoT Enterprise LTSC status on real hardware/base install:** LTSC winget/App Installer recovery is merged, and visual-effects handling is now narrowed further so classic context menus and modern apps keep normal rendering while animations are still turned off.
-- **Animation policy:** disable system-wide animations while preserving font smoothing, icon-label shadows, window drop shadows, the translucent desktop selection rectangle, the user-facing Animation effects toggle behavior, and showing window contents while dragging.
+- **Animation policy:** disable system-wide animations while preserving font smoothing, icon-label shadows, window drop shadows, the translucent desktop selection rectangle, the user-facing Animation effects toggle behavior, showing window contents while dragging, and normal focus rendering in modern apps.
 - **AppX removal noise:** known and intentionally left unchanged for now.
 
 That means the project is currently in a **functionally good state, with LTSC-specific winget/bootstrap handling merged and visual-effects handling narrowed to avoid unrelated UI regressions**.
@@ -163,6 +163,7 @@ The current intended defaults are:
 - Windows Search de-webbed (`DisableSearchBoxSuggestions=1`, `BingSearchEnabled=0`, and cloud/highlights search surfaces already disabled elsewhere in the script)
 - New Outlook preferred by default via `UseNewOutlook=1`
 - The script should **not** force-hide the new/classic Outlook toggle, so classic Outlook remains available if installed
+- The script should **not** force accessibility/high-contrast/keyboard-preference state, because those broader profile-level writes can leak into white focus/border artifacts in modern apps.
 
 ## AppX removal note
 

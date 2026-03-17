@@ -867,14 +867,10 @@ Windows Registry Editor Version 5.00
 "TaskFrequency"=dword:00000004
 "Volumes"=" "
 
-; set appearance options to custom
-[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects]
-"VisualFXSetting"=dword:3
-
 ; animation-related visual effects are applied below with SystemParametersInfo
 ; on Windows 10/11 to avoid bundled registry writes that also affect shadows,
 ; ClearType behavior, classic context-menu rendering, desktop selection visuals,
-; or the user-facing Animation effects toggle.
+; modern app window-frame rendering, or the user-facing Animation effects toggle.
 
 ; disable animate windows when minimizing and maximizing
 [HKEY_CURRENT_USER\Control Panel\Desktop\WindowMetrics]
@@ -1335,10 +1331,9 @@ Windows Registry Editor Version 5.00
 
 
 ; PERSONALIZATION
-; dark theme & disable transparency
+; dark theme & transparency on
 [HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize]
 "AppsUseLightTheme"=dword:00000000
-"ColorPrevalence"=dword:00000000
 "EnableTransparency"=dword:00000001
 "SystemUsesLightTheme"=dword:00000000
 
@@ -2062,9 +2057,8 @@ E0,F6,C5,D5,0E,CA,50,00,00
 [HKEY_LOCAL_MACHINE\System\CurrentControlSet\Control\CrashControl]
 "DisplayParameters"=dword:00000001
 
-; disable multiplane overlay (mpo)
-[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\Dwm]
-"OverlayTestMode"=dword:00000005
+; disable multiplane overlay (mpo) -- Win10 only by post-import OS-aware logic
+; leaving the static reg payload out prevents Win11 DWM border artifacts.
 
 ; modern standby fix - disable network connectivity during s0 sleep
 [HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Power]
@@ -2112,6 +2106,32 @@ $path = "$env:SystemRoot\Temp\WindowsSettings.reg"
 
 # import reg file
 Start-Process -Wait "regedit.exe" -ArgumentList "/S `"$env:SystemRoot\Temp\WindowsSettings.reg`"" -WindowStyle Hidden
+
+# keep MPO disable OS-aware: OverlayTestMode=5 can help on some systems, but on
+# Win11 it can also interfere with DWM/composition and show light frame borders
+# on modern apps. Keep it Win10-only unless explicitly requested otherwise.
+try {
+    $isWin11 = [Environment]::OSVersion.Version.Build -ge 22000
+    if ($isWin11) {
+        Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\Dwm' -Name 'OverlayTestMode' -ErrorAction SilentlyContinue
+    }
+    else {
+        New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\Dwm' -Name 'OverlayTestMode' -PropertyType DWord -Value 5 -Force -ErrorAction SilentlyContinue | Out-Null
+    }
+} catch { }
+
+# keep window-border theming OS-aware: ColorPrevalence=0 is a Win10 readability fix,
+# but on Win11 it can contribute to the light DWM frame outline around modern apps.
+try {
+    $isWin11 = [Environment]::OSVersion.Version.Build -ge 22000
+    if ($isWin11) {
+        Remove-ItemProperty -Path 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name 'ColorPrevalence' -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' -Name 'VisualFXSetting' -ErrorAction SilentlyContinue
+    }
+    else {
+        New-ItemProperty -Path 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name 'ColorPrevalence' -PropertyType DWord -Value 0 -Force -ErrorAction SilentlyContinue | Out-Null
+    }
+} catch { }
 
 # force-apply the specific visual-effect settings we actually want via SystemParametersInfo
 # instead of relying on bundled registry values that also affect unrelated UI visuals.
