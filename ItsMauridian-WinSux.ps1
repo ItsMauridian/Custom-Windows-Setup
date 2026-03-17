@@ -615,57 +615,9 @@ Windows Registry Editor Version 5.00
 
 
 ; EASE OF ACCESS
-; disable narrator
-[HKEY_CURRENT_USER\Software\Microsoft\Narrator\NoRoam]
-"DuckAudio"=dword:00000000
-"WinEnterLaunchEnabled"=dword:00000000
-"ScriptingEnabled"=dword:00000000
-"OnlineServicesEnabled"=dword:00000000
-
-[HKEY_CURRENT_USER\Software\Microsoft\Narrator]
-"NarratorCursorHighlight"=dword:00000000
-"CoupleNarratorCursorKeyboard"=dword:00000000
-
-; disable ease of access settings 
-[HKEY_CURRENT_USER\Software\Microsoft\Ease of Access]
-"selfvoice"=dword:00000000
-"selfscan"=dword:00000000
-
-[HKEY_CURRENT_USER\Control Panel\Accessibility]
-"Sound on Activation"=dword:00000000
-"Warning Sounds"=dword:00000000
-
-[HKEY_CURRENT_USER\Control Panel\Accessibility\HighContrast]
-"Flags"="4194"
-
-[HKEY_CURRENT_USER\Control Panel\Accessibility\Keyboard Response]
-"Flags"="2"
-"AutoRepeatRate"="0"
-"AutoRepeatDelay"="0"
-
-[HKEY_CURRENT_USER\Control Panel\Accessibility\MouseKeys]
-"Flags"="130"
-"MaximumSpeed"="39"
-"TimeToMaximumSpeed"="3000"
-
-[HKEY_CURRENT_USER\Control Panel\Accessibility\StickyKeys]
-"Flags"="2"
-
-[HKEY_CURRENT_USER\Control Panel\Accessibility\ToggleKeys]
-"Flags"="34"
-
-[HKEY_CURRENT_USER\Control Panel\Accessibility\SoundSentry]
-"Flags"="0"
-"FSTextEffect"="0"
-"TextEffect"="0"
-"WindowsEffect"="0"
-
-[HKEY_CURRENT_USER\Control Panel\Accessibility\SlateLaunch]
-"ATapp"=""
-"LaunchAT"=dword:00000000
-
-
-
+; leave accessibility, narrator, sticky keys, keyboard preference, and high contrast state
+; under user control. Avoid forcing global accessibility/theme state here because it can
+; leak into focus rendering in modern apps and produce white outline artifacts.
 
 ; CLOCK AND REGION
 ; disable notify me when the clock changes
@@ -2217,13 +2169,17 @@ public class WinSuxVisualFx {
         // keep font smoothing / ClearType enabled
         SystemParametersInfo(0x004B, 1, 0u, SPIF_FLAGS);
         SystemParametersInfo(0x200B, 0, 2u, SPIF_FLAGS);
+        // do not force keyboard preference/focus cues on
+        SystemParametersInfo(0x0046, 0, 0u, SPIF_FLAGS);
     }
 }
 "@ -ErrorAction SilentlyContinue
 try { [WinSuxVisualFx]::Apply() } catch { }
 
 # keep the broad UI-effects master enabled so non-animation visuals and the
-# user-facing Animation effects toggle keep behaving normally.
+# user-facing Animation effects toggle keep behaving normally. Also leave
+# accessibility/high-contrast state alone; this script should not force global
+# focus/keyboard cue behavior.
 New-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'UIEffects' -PropertyType DWord -Value 1 -Force -ErrorAction SilentlyContinue | Out-Null
 New-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'FontSmoothingType' -PropertyType DWord -Value 2 -Force -ErrorAction SilentlyContinue | Out-Null
 
