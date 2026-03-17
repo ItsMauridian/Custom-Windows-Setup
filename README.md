@@ -10,10 +10,11 @@ The goal is one script that applies the same overall setup philosophy on both Wi
 ## Current status
 
 - **Current Win11 VM status:** confirmed working well in the latest test VM.
-- **Animation policy:** the intended result is the Windows UI toggle **Animation effects = Off**.
+- **Current Win11 IoT Enterprise LTSC status on real hardware/base install:** LTSC winget/App Installer recovery is merged, and visual-effects handling is now narrowed further so classic context menus and modern apps keep normal rendering while animations are still turned off.
+- **Animation policy:** disable system-wide animations while preserving font smoothing, icon-label shadows, window drop shadows, the translucent desktop selection rectangle, the user-facing Animation effects toggle behavior, and showing window contents while dragging.
 - **AppX removal noise:** known and intentionally left unchanged for now.
 
-That means the project is currently in a **functionally good, still partially noisy in the log, but not blocked** state.
+That means the project is currently in a **functionally good state, with LTSC-specific winget/bootstrap handling merged and visual-effects handling narrowed to avoid unrelated UI regressions**.
 
 ## Run
 
@@ -28,7 +29,7 @@ iwr https://winsetup.m05.dev -useb | iex
 The script is intended to:
 
 1. Run MAS activation at the start.
-2. Repair/bootstrap Microsoft Store and `winget` if needed.
+2. Repair/bootstrap Microsoft Store and `winget` if needed, including LTSC-safe App Installer recovery when required.
 3. Install apps via `winget`.
 4. Apply privacy, performance, and usability tweaks.
 5. Remove or disable selected Microsoft/consumer features.
@@ -43,6 +44,8 @@ These are intended to be common across both OS versions:
 
 - MAS activation
 - Store/`winget` bootstrap
+- Windows Search de-webbed
+- New Outlook preferred by default while still leaving user choice available
 - `winget` app installation
 - File Explorer opens to **This PC**
 - Task View button hidden
@@ -81,17 +84,35 @@ These are primarily relevant to Windows 10:
 - `ColorPrevalence=0` readability fix for dark theme
 - Avoid old black-background behavior that caused unreadable shell text
 
+### LTSC / IoT-specific handling
+
+These are especially important on Windows 11 IoT Enterprise LTSC and should stay explicit in the script:
+
+- Preserve the AppX families required for `winget` / App Installer recovery (`Microsoft.DesktopAppInstaller`, `Microsoft.UI.Xaml`, `Microsoft.VCLibs`, `Microsoft.WindowsAppRuntime`)
+- Use the LTSC-safe App Installer / WinGet bootstrap path when `winget` is missing instead of assuming normal Microsoft Store-backed registration behavior
+- Resolve and call the real `winget.exe` path after bootstrap instead of assuming the PATH alias is already valid
+
 ## Animation policy
 
 The intended outcome on **both Windows 10 and Windows 11** is:
 
-- **Settings > Accessibility > Visual effects > Animation effects = Off**
+- system-wide animations disabled
+- font smoothing / ClearType preserved
+- icon-label shadows preserved
+- window drop shadows preserved
+- the translucent desktop selection rectangle preserved
+- **Show window contents while dragging** preserved
+- the user-facing **Animation effects** setting should still remain user-changeable after the script runs
 
 Implementation rule:
 
 - The script should not rely on registry changes alone.
-- It should also apply the corresponding `SystemParametersInfo` animation/UI-effects calls so the change actually sticks on Windows 11.
-- The animation fix should remain scoped to animation state only and must not alter unrelated taskbar or Explorer behavior.
+- It should apply the needed `SystemParametersInfo` calls so the change actually sticks on Windows 11.
+- It should avoid broad bundled writes such as `UserPreferencesMask` changes for this purpose, because those can also affect non-animation visuals.
+- It should not disable the broad UI-effects master to achieve this.
+- It should not turn off `ListviewAlphaSelect` or desktop icon-label shadows, because that creates the dotted white desktop-icon outline and flatter desktop text.
+- It should not use a broad visual-effects change that leaves classic context menus or modern windows with unwanted white borders.
+- The animation fix should remain scoped to animation behavior only and must not alter unrelated taskbar or Explorer behavior.
 - No shell restart should be used for this unless testing proves it is strictly required.
 
 ## App installs via `winget`
@@ -135,6 +156,14 @@ The current desired install set is:
 - `RockstarGames.Launcher`
 - `StartIsBack.StartAllBack` (**Windows 11 only**)
 
+## Search / Outlook defaults
+
+The current intended defaults are:
+
+- Windows Search de-webbed (`DisableSearchBoxSuggestions=1`, `BingSearchEnabled=0`, and cloud/highlights search surfaces already disabled elsewhere in the script)
+- New Outlook preferred by default via `UseNewOutlook=1`
+- The script should **not** force-hide the new/classic Outlook toggle, so classic Outlook remains available if installed
+
 ## AppX removal note
 
 When the log mentions **AppX**, it is talking about Microsoft Store / UWP / inbox package families handled by the Windows app deployment system.
@@ -166,7 +195,7 @@ So the current stance is:
 - `W32Time` is not demoted to Manual
 - `StorSvc` is not demoted to Manual
 - `AssignedAccessManagerSvc` is not redundantly demoted
-- Animation handling is explicit and aimed at both Windows 10 and Windows 11
+- Animation handling is explicit and aimed at both Windows 10 and Windows 11, while preserving non-animation visuals like ClearType, icon-label shadows, the translucent selection rectangle, drop shadows, and DragFullWindows
 
 ### Added / preserved
 

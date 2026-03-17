@@ -919,16 +919,10 @@ Windows Registry Editor Version 5.00
 [HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects]
 "VisualFXSetting"=dword:3
 
-; enable animate controls and elements inside windows (disabled breaks instagram scrolling)
-; disable fade or slide menus into view
-; disable fade or slide tooltips into view
-; disable fade out menu items after clicking
-; disable show shadows under mouse pointer
-; disable show shadows under windows
-; disable slide open combo boxes
-; disable smooth-scroll list boxes
-[HKEY_CURRENT_USER\Control Panel\Desktop]
-"UserPreferencesMask"=hex(2):90,12,03,80,10,00,00,00
+; animation-related visual effects are applied below with SystemParametersInfo
+; on Windows 10/11 to avoid bundled registry writes that also affect shadows,
+; ClearType behavior, classic context-menu rendering, desktop selection visuals,
+; or the user-facing Animation effects toggle.
 
 ; disable animate windows when minimizing and maximizing
 [HKEY_CURRENT_USER\Control Panel\Desktop\WindowMetrics]
@@ -950,21 +944,21 @@ Windows Registry Editor Version 5.00
 [HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced]
 "IconsOnly"=dword:0
 
-; disable show translucent selection rectangle
+; enable show translucent selection rectangle
 [HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced]
-"ListviewAlphaSelect"=dword:0
+"ListviewAlphaSelect"=dword:1
 
-; disable show window contents while dragging
+; enable show window contents while dragging
 [HKEY_CURRENT_USER\Control Panel\Desktop]
-"DragFullWindows"="0"
+"DragFullWindows"="1"
 
 ; enable smooth edges of screen fonts
 [HKEY_CURRENT_USER\Control Panel\Desktop]
 "FontSmoothing"="2"
 
-; disable use drop shadows for icon labels on the desktop
+; enable use drop shadows for icon labels on the desktop
 [HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced]
-"ListviewShadow"=dword:0
+"ListviewShadow"=dword:1
 
 ; adjust for best performance of programs
 [HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\PriorityControl]
@@ -1871,9 +1865,17 @@ E0,F6,C5,D5,0E,CA,50,00,00
 [HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Dsh]
 "IsPrelaunchEnabled"=dword:00000000
 
-; disable web search in start menu 
+; disable web search in start menu / taskbar search
 [HKEY_CURRENT_USER\Software\Policies\Microsoft\Windows\Explorer]
 "DisableSearchBoxSuggestions"=dword:00000001
+
+; disable bing / internet results in windows search
+[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Search]
+"BingSearchEnabled"=dword:00000000
+
+; new outlook default on, but keep the toggle/user choice available
+[HKEY_CURRENT_USER\Software\Microsoft\Office\16.0\Outlook\Preferences]
+"UseNewOutlook"=dword:00000001
 
 ; disable copilot & ai
 [HKEY_CURRENT_USER\Software\Policies\Microsoft\Windows\WindowsCopilot]
@@ -2159,9 +2161,8 @@ $path = "$env:SystemRoot\Temp\WindowsSettings.reg"
 # import reg file
 Start-Process -Wait "regedit.exe" -ArgumentList "/S `"$env:SystemRoot\Temp\WindowsSettings.reg`"" -WindowStyle Hidden
 
-# force-apply visual effects immediately via SystemParametersInfo
-# (regedit writes UserPreferencesMask but Windows caches it in memory — only re-reads at logon
-#  unless we call SystemParametersInfo with SPIF_SENDCHANGE to broadcast the change)
+# force-apply the specific visual-effect settings we actually want via SystemParametersInfo
+# instead of relying on bundled registry values that also affect unrelated UI visuals.
 Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
@@ -2195,8 +2196,6 @@ public class WinSuxVisualFx {
 
         // disable window minimize/maximize animation
         SystemParametersInfo(0x0049, animationInfo.cbSize, ref animationInfo, SPIF_FLAGS);
-        // disable global UI effects / Win11 animation-effects toggle
-        SystemParametersInfo(0x103F, 0, 0u, SPIF_FLAGS);
         // disable client-area animation inside windows
         SystemParametersInfo(0x1043, 0, false, SPIF_FLAGS);
         // disable menu fade/slide animation
@@ -2211,18 +2210,22 @@ public class WinSuxVisualFx {
         SystemParametersInfo(0x1017, 0, false, SPIF_FLAGS);
         // disable tooltip fade
         SystemParametersInfo(0x1019, 0, false, SPIF_FLAGS);
-        // disable show window contents while dragging
-        SystemParametersInfo(0x0025, 0, false, SPIF_FLAGS);
-        // disable cursor shadow
-        SystemParametersInfo(0x101B, 0, false, SPIF_FLAGS);
+        // keep show window contents while dragging enabled
+        SystemParametersInfo(0x0025, 1, false, SPIF_FLAGS);
+        // keep drop shadows under windows enabled
+        SystemParametersInfo(0x1025, 0, true, SPIF_FLAGS);
+        // keep font smoothing / ClearType enabled
+        SystemParametersInfo(0x004B, 1, 0u, SPIF_FLAGS);
+        SystemParametersInfo(0x200B, 0, 2u, SPIF_FLAGS);
     }
 }
 "@ -ErrorAction SilentlyContinue
 try { [WinSuxVisualFx]::Apply() } catch { }
 
-# animation effects off state used by both Windows 10 and Windows 11
-New-Item -Path 'HKCU:\Control Panel\Desktop' -Force | Out-Null
-New-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'UIEffects' -PropertyType DWord -Value 0 -Force | Out-Null
+# keep the broad UI-effects master enabled so non-animation visuals and the
+# user-facing Animation effects toggle keep behaving normally.
+New-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'UIEffects' -PropertyType DWord -Value 1 -Force -ErrorAction SilentlyContinue | Out-Null
+New-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'FontSmoothingType' -PropertyType DWord -Value 2 -Force -ErrorAction SilentlyContinue | Out-Null
 
 # remove Home and Gallery from navigation pane — cover both NameSpace and NameSpace_41040327 (varies by Win11 build)
 $namespaces = @(
@@ -2927,6 +2930,10 @@ $_.Name -notlike '*Microsoft.HEIFImageExtension*' -and
 $_.Name -notlike '*Microsoft.HEVCVideoExtension*' -and
 $_.Name -notlike '*Microsoft.MPEG2VideoExtension*' -and
 $_.Name -notlike '*Microsoft.Paint*' -and
+$_.Name -notlike '*Microsoft.DesktopAppInstaller*' -and
+$_.Name -notlike '*Microsoft.UI.Xaml*' -and
+$_.Name -notlike '*Microsoft.VCLibs*' -and
+$_.Name -notlike '*Microsoft.WindowsAppRuntime*' -and
 $_.Name -notlike '*Microsoft.RawImageExtension*' -and
 # breaks windows server defender
 $_.Name -notlike '*Microsoft.SecHealthUI*' -and
@@ -3137,40 +3144,72 @@ New-Item -Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp" 
 
         Write-Host "INSTALLING APPS`n"
 
-# register winget for current user session (required on first login per Microsoft docs)
-Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 5
+# winget bootstrap helpers
+function Get-WinGetExePath {
+    $candidate = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\winget.exe'
+    if (Test-Path $candidate) { return $candidate }
 
-# check if winget works via cmd (resolves AppX aliases that PowerShell cannot)
-$wingetWorks = $false
-$attempts = 0
-while (!$wingetWorks -and $attempts -lt 3) {
-    $wingetCheck = cmd /c "winget --version" 2>&1
-    if ($LASTEXITCODE -eq 0 -or ($wingetCheck -match "v\d+\.\d+")) { $wingetWorks = $true }
-    if (!$wingetWorks) { Start-Sleep -Seconds 10 }
-    $attempts++
+    $command = Get-Command winget.exe -ErrorAction SilentlyContinue
+    if ($command -and $command.Source) { return $command.Source }
+
+    return $null
 }
 
-# install winget if genuinely not present
-if (!$wingetWorks) {
-    Write-Host "winget not found, installing via Chocolatey...`n" -ForegroundColor Yellow
-    Set-ExecutionPolicy Bypass -Scope Process -Force
-    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-    Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-    Start-Sleep -Seconds 5
-    choco install winget -y
-    Start-Sleep -Seconds 10
-    # remove chocolatey after
-    if (Test-Path "$env:ProgramData\chocolatey\choco.exe") {
-        & "$env:ProgramData\chocolatey\choco.exe" uninstall chocolatey -y -ErrorAction SilentlyContinue
+function Test-WinGet {
+    $exe = Get-WinGetExePath
+    if ($exe) {
+        $wingetCheck = & $exe --version 2>&1
+        if ($LASTEXITCODE -eq 0 -or ($wingetCheck -match 'v?\d+\.\d+')) { return $true }
     }
-    Remove-Item "$env:ProgramData\chocolatey" -Recurse -Force -ErrorAction SilentlyContinue
+
     $wingetCheck = cmd /c "winget --version" 2>&1
-    if ($LASTEXITCODE -eq 0 -or ($wingetCheck -match "v\d+\.\d+")) { $wingetWorks = $true }
+    if ($LASTEXITCODE -eq 0 -or ($wingetCheck -match 'v?\d+\.\d+')) { return $true }
+
+    return $false
 }
 
+# register winget for current user session if App Installer already exists
+$desktopAppInstaller = Get-AppxPackage -AllUsers Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($desktopAppInstaller) {
+    try {
+        Add-AppxPackage -DisableDevelopmentMode -Register "$($desktopAppInstaller.InstallLocation)\AppXManifest.xml" -ErrorAction SilentlyContinue
+    } catch { }
+    Start-Sleep -Seconds 5
+}
+
+$wingetWorks = Test-WinGet
+
+# bootstrap winget on LTSC/IoT when App Installer is missing
 if (!$wingetWorks) {
-    Write-Host "winget could not be found after install attempt, skipping app installs`n" -ForegroundColor Red
+    Write-Host "winget not found, bootstrapping App Installer...`n" -ForegroundColor Yellow
+    try {
+        Set-ExecutionPolicy Bypass -Scope Process -Force
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+        Install-PackageProvider -Name NuGet -Force | Out-Null
+        Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue
+        Install-Module -Name Microsoft.WinGet.Client -Force -Repository PSGallery -Scope AllUsers -ErrorAction SilentlyContinue | Out-Null
+        Import-Module Microsoft.WinGet.Client -ErrorAction SilentlyContinue | Out-Null
+        Repair-WinGetPackageManager -AllUsers -ErrorAction SilentlyContinue | Out-Null
+    } catch { }
+
+    Start-Sleep -Seconds 10
+
+    $desktopAppInstaller = Get-AppxPackage -AllUsers Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($desktopAppInstaller) {
+        try {
+            Add-AppxPackage -DisableDevelopmentMode -Register "$($desktopAppInstaller.InstallLocation)\AppXManifest.xml" -ErrorAction SilentlyContinue
+        } catch { }
+        Start-Sleep -Seconds 5
+    }
+
+    $wingetWorks = Test-WinGet
+}
+
+$wingetExe = Get-WinGetExePath
+if (!$wingetExe -and $wingetWorks) { $wingetExe = 'winget' }
+
+if (!$wingetWorks) {
+    Write-Host "winget could not be found after bootstrap attempt, skipping app installs`n" -ForegroundColor Red
 }
 
 # install apps via winget
@@ -3217,7 +3256,7 @@ if ($isWindows11) {
     $apps += "StartIsBack.StartAllBack"
 }
 foreach ($app in $apps) {
-    cmd /c "winget install --id `"$app`" --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --no-upgrade"
+    & $wingetExe install --id $app --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --no-upgrade
 }
 }
 
@@ -3374,7 +3413,7 @@ Start-Process "$env:SystemRoot\Temp\NvidiaDriver\setup.exe" -ArgumentList "-s -n
 
 # install nvidia control panel
 try {
-if ($wingetWorks) { cmd /c "winget install `"9NF8H0H7WMLT`" --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --no-upgrade" }
+if ($wingetWorks) { & $wingetExe install "9NF8H0H7WMLT" --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --no-upgrade }
 } catch { }
 
 # delete download
