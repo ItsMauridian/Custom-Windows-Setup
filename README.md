@@ -1,121 +1,222 @@
 # Custom Windows Setup
-A personal fork of [FR33THY's WinSux](https://github.com/FR33THYFR33THY/WinSux-Windows-Optimization-Guide) with additional tweaks, app installs, and personalizations for my own Windows setup.
+
+A personal fork of FR33THY's WinSux focused on repeatable post-install setup for:
+
+- **Primary target:** Windows 11 IoT Enterprise LTSC
+- **Secondary targets:** Windows 10 IoT Enterprise LTSC, Windows 10 Pro
+
+The goal is one script that applies the same overall setup philosophy on both Windows 10 and Windows 11, while using **OS-aware branches only where Windows shell behavior actually differs**.
+
+## Current status
+
+- **Current Win11 VM status:** confirmed working well in the latest test VM.
+- **Animation policy:** the intended result is the Windows UI toggle **Animation effects = Off**.
+- **AppX removal noise:** known and intentionally left unchanged for now.
+
+That means the project is currently in a **functionally good, still partially noisy in the log, but not blocked** state.
 
 ## Run
-Paste this into an elevated Administrator PowerShell window:
-```
+
+Open an **elevated Administrator PowerShell** window and run:
+
+```powershell
 iwr https://winsetup.m05.dev -useb | iex
 ```
 
-## What it does
-- Runs Windows activation via MAS at the start
-- Installs and configures apps via winget (Brave, Chrome, ShareX, Obsidian, Steam, Discord, and more)
-- Applies privacy, performance, and usability tweaks
-- Removes bloatware, OneDrive, Microsoft Edge, Copilot, Xbox components
-- Configures Windows settings to personal preference
-- Generates a setup log on the desktop after completion listing any errors
+## Core behavior
 
-## Changes from original
+The script is intended to:
 
-### Removed
-- Black lockscreen and wallpaper enforcement
-- Force left taskbar alignment (set to centered/Windows 11 default)
-- Hide recycle bin from desktop and start menu shortcut
-- Show all taskbar icons (restores the pop-out arrow)
-- 100% DPI scaling override (allows per-monitor scaling e.g. 125%)
-- Pause Windows Updates for 365 days
-- Disable automatic Microsoft Store app updates
-- Prevent driver downloads via Windows Update
-- Remove Scan with Defender from context menu
-- Disable YubiKey/FIDO2 passkey access
-- Force Windows Hello only sign-in
-- Remove security taskbar icon
-- Wipe entire Program Files (x86)\Microsoft folder (preserves WebView2 for apps like Snapchat)
-- Winget being uninstalled after use
-- New Outlook being removed
+1. Run MAS activation at the start.
+2. Repair/bootstrap Microsoft Store and `winget` if needed.
+3. Install apps via `winget`.
+4. Apply privacy, performance, and usability tweaks.
+5. Remove or disable selected Microsoft/consumer features.
+6. Clean up taskbar pins and duplicate shortcuts.
+7. Generate a desktop setup log at the end.
+
+## Version-aware design
+
+### Shared behavior on both Windows 10 and Windows 11
+
+These are intended to be common across both OS versions:
+
+- MAS activation
+- Store/`winget` bootstrap
+- `winget` app installation
+- File Explorer opens to **This PC**
+- Task View button hidden
+- System-wide animations disabled
+- OneDrive uninstall / leftover cleanup / startup removal / reinstall prevention
+- Passkey / FIDO2 / YubiKey support preserved
+- Windows Hello-only sign-in restriction removed
+- Privacy / telemetry reductions
+- Brave debloat
+- Taskbar pin cleanup and duplicate shortcut cleanup
+- Setup log written to the desktop
+
+### Same goal on both OSes, but may require different implementation
+
+These should have the same visible result on both Windows 10 and Windows 11, but the script can branch internally if the OS requires it:
+
+- **Animations off** across the shell and UI
+- **Taskbar cleanup** without reintroducing unwanted shell defaults
+- **Explorer defaults** such as opening to **This PC**
+- **OneDrive removal/cleanup** while respecting version differences in shell integration
+
+### Windows 11-only behavior
+
+These should be gated to Windows 11:
+
+- Install **StartAllBack** (`StartIsBack.StartAllBack`)
+- Remove **Home** from Explorer navigation pane
+- Remove **Gallery** from Explorer navigation pane
+- Apply Windows 11-specific shell handling where shell state differs from Windows 10
+- Apply actual taskbar alignment handling only if that setting exists on that OS
+
+### Windows 10-specific handling
+
+These are primarily relevant to Windows 10:
+
+- `ColorPrevalence=0` readability fix for dark theme
+- Avoid old black-background behavior that caused unreadable shell text
+
+## Animation policy
+
+The intended outcome on **both Windows 10 and Windows 11** is:
+
+- **Settings > Accessibility > Visual effects > Animation effects = Off**
+
+Implementation rule:
+
+- The script should not rely on registry changes alone.
+- It should also apply the corresponding `SystemParametersInfo` animation/UI-effects calls so the change actually sticks on Windows 11.
+- The animation fix should remain scoped to animation state only and must not alter unrelated taskbar or Explorer behavior.
+- No shell restart should be used for this unless testing proves it is strictly required.
+
+## App installs via `winget`
+
+The current desired install set is:
+
+- `Sysinternals.Autoruns`
+- `Brave.Brave`
+- `Discord.Discord`
+- `Discord.Discord.PTB`
+- `ElectronicArts.EADesktop`
+- `File-New-Project.EarTrumpet`
+- `EpicGames.EpicGamesLauncher`
+- `REALiX.HWiNFO`
+- `Apple.iTunes`
+- `rcmaehl.MSEdgeRedirect`
+- `Microsoft.EdgeWebView2Runtime`
+- `Microsoft.PowerShell`
+- `Microsoft.PowerToys`
+- `PuTTY.PuTTY`
+- `SlackTechnologies.Slack`
+- `Valve.Steam`
+- `SublimeHQ.SublimeText.4`
+- `SergeySerkov.TagScanner`
+- `Telegram.TelegramDesktop`
+- `Microsoft.WindowsTerminal`
+- `Ubisoft.Connect`
+- `VideoLAN.VLC`
+- `MartiCliment.UniGetUI`
+- `RARLab.WinRAR`
+- `WinSCP.WinSCP`
+- `Zoom.Zoom`
+- `ShareX.ShareX`
+- `Obsidian.Obsidian`
+- `Proton.ProtonDrive`
+- `Proton.ProtonMail`
+- `Bambulab.BambuStudio`
+- `Elgato.StreamDeck`
+- `Logitech.GHUB`
+- `RevoUninstaller.RevoUninstallerPro`
+- `RockstarGames.Launcher`
+- `StartIsBack.StartAllBack` (**Windows 11 only**)
+
+## AppX removal note
+
+When the log mentions **AppX**, it is talking about Microsoft Store / UWP / inbox package families handled by the Windows app deployment system.
+
+The current Windows 11 logs still show removal attempts against some built-in package families that modern Windows treats as part of the OS. That produces predictable noise, but this project is **not changing that list right now by explicit decision**.
+
+So the current stance is:
+
+- leave AppX removal behavior as-is for now,
+- treat that part of the log as known noise,
+- do not let that distract from functional regressions.
+
+## Major changes from upstream WinSux
+
+### Removed from the inherited behavior
+
+- Black lockscreen / wallpaper enforcement
+- Forced left taskbar alignment as a blanket rule
+- YubiKey / FIDO2 / passkey blocking
+- Windows Hello-only sign-in enforcement
+- Broad deletion of the entire `Program Files (x86)\Microsoft` tree
+- Winget uninstall-after-use behavior
+- New Outlook removal
 
 ### Changed
-- Edge folder removal now only targets Edge/EdgeUpdate/EdgeCore subfolders (preserves WebView2)
-- Taskbar alignment set to centered
-- ColorPrevalence set to 0 (fixes unreadable text on Windows 10)
-- Removed black desktop background color setting (was causing invisible sidebar text on Windows 10)
-- Brave, ShareX and Obsidian moved from direct download to winget
-- `W32Time` removed from manual services list (prevents broken time sync on Windows 11)
-- `StorSvc` removed from manual services list (was Automatic by default on Windows 11, demoting it broke Store app installs)
-- `AssignedAccessManagerSvc` removed from manual services list (duplicate — already in disabled services list)
-- Timer Resolution service: now stops the service before deleting it, and waits for SCM to fully release before recreating
 
-### Added
-**Activation & Setup**
-- Windows activation via MAS (get.activated.win) runs at the very start
-- Warning prompt before Store settings page opens
-- wsreset -i to reinstall Microsoft Store if missing
-- Winget auto-install via asheroto/winget-install if not present (handles VCLibs and all dependencies automatically)
-- Setup log generated on the desktop after script completes, listing any errors that occurred
+- Edge cleanup is narrowed so **WebView2 is preserved**
+- Taskbar work is **cleanup-first**, not forced repinning
+- `W32Time` is not demoted to Manual
+- `StorSvc` is not demoted to Manual
+- `AssignedAccessManagerSvc` is not redundantly demoted
+- Animation handling is explicit and aimed at both Windows 10 and Windows 11
 
-**Privacy & Telemetry**
-- Comprehensive telemetry block: DiagTrack, wermgr, AdvertisingInfo, Input TIPC, OnlineSpeechPrivacy, SvcHostSplitThresholdInKB, PowerShell and .NET CLI telemetry
-- Activity History disabled (EnableActivityFeed, UploadUserActivities)
-- Copilot deep removal: appx packages, IsCopilotAvailable, AllowCopilotRuntime, CoreAI package
-- Xbox & Gaming Components appx removal
-- Widgets appx removal
-- OneDrive: leftover folder removal, startup removal, reinstall prevention, sidebar namespace entry removed
+### Added / preserved
 
-**Performance**
-- NetworkThrottlingIndex and SystemResponsiveness tweaks
-- Nagle's algorithm disabled on all network adapters
-- SysMain (Superfetch) disabled
-- HPET disabled via bcdedit
-- Prefer IPv4 over IPv6 + Disable Teredo (DisabledComponents=0x21)
-- Services set to Manual (~100 services per CTT list)
-- Disable Multiplane Overlay (MPO)
-- Modern Standby fix (EnforceDisconnectedStandby)
+- MAS activation at the start
+- Store reinstall/bootstrap safeguards
+- Desktop setup log
+- Deeper telemetry/privacy reductions
+- OneDrive leftover cleanup and reinstall prevention
+- Passkey/FIDO2 preservation
+- Brave debloat after install
 
-**Network**
-- netsh teredo set state disabled
-- Prefer IPv4 over IPv6
+## Current known log behavior
 
-**Usability**
-- Confirm file delete dialog
-- Enable text suggestions on physical keyboard + multilingual suggestions
-- Show hidden files (without system files like desktop.ini)
-- Num Lock on startup
-- Centered taskbar alignment
-- Verbose logon/logoff messages
-- ShowHibernateOption=0
-- Background apps GlobalUserDisabled
-- Explorer Automatic Folder Discovery disabled
-- Taskbar cleanup: removes all pins, clears stale layout XMLs, wipes Taskband registry
-- Duplicate shortcut removal: scans Start Menu and Desktop, removes extras keeping one per target
+A setup log can contain some entries that are often noise rather than real failure, especially on VMs or on already-clean systems. Typical examples include:
 
-**Security**
-- YubiKey/FIDO2 passkey access restored (removed original blocks)
-- Windows Hello only sign-in removed (allows security key PIN prompt)
-- Passkey and passkey enumeration access restored
+- Missing files or folders that were already absent
+- Missing processes that were not running
+- Missing registry keys on a given Windows edition/build
+- Files temporarily in use during cleanup
+- VM-specific power-plan GUID mismatches
+- AppX removal errors from built-in modern Windows package families
 
-**Explorer Sidebar**
-- Home removed from navigation pane (Windows 11)
-- Gallery removed from navigation pane (Windows 11)
-- OneDrive removed from navigation pane
+These should be treated differently from real script breakage.
 
-**App Installs (via winget)**
-Autoruns, Brave, Discord, EA App, EarTrumpet, Epic Games Launcher, HWiNFO, iTunes, MSEdgeRedirect, Obsidian, PowerToys, PuTTY, ShareX, Slack, Steam, Sublime Text, TagScanner, Telegram, Windows Terminal, Ubisoft Connect, VLC, UniGetUI, WinRAR, WinSCP, Zoom
+## Current priorities
 
-**Brave**
-- Debloat registry keys applied after install: Rewards, Wallet, VPN, AI Chat and Stats Ping all disabled
-- BraveUpdate scheduled tasks removed
+- Keep the script functionally stable.
+- Keep changes minimal-diff by default.
+- Keep AppX removal behavior untouched for now.
+- Do a fuller Windows 10 / Windows 11 branch audit later, only where behavior genuinely differs.
 
-## Notes
-- The setup log on the desktop will contain some expected "errors" that are harmless: missing processes that weren't running (OneDrive, Widgets), registry keys that don't exist on your specific Windows version, and files in use during temp folder cleanup. Anything related to winget or Timer Resolution is worth checking.
-- Power scheme errors in the log are normal when running on a VM — the power plan GUIDs differ from physical hardware.
+## Other scripts
 
-## Other Scripts
-The `/Graphics` folder contains standalone tools for GPU driver management:
-- **ItsMauridian-Allow-PowerShell-Scripts.cmd** — run this first on a fresh Windows install to allow PowerShell scripts to execute
-- **ItsMauridian-DDU-Auto-Uninstall-GPU-Drivers.ps1** — automatically uninstalls GPU drivers via DDU in safe mode
-- **ItsMauridian-DDU-Manual-Uninstall-GPU-Drivers.ps1** — opens DDU manually so you can choose what to uninstall
-- **ItsMauridian-Install-And-Configure-GPU-Driver.ps1** — installs and configures your GPU driver with optimized settings
+The repository also includes standalone GPU-driver helper scripts:
+
+- `ItsMauridian-Allow-PowerShell-Scripts.cmd`
+- `ItsMauridian-DDU-Auto-Uninstall-GPU-Drivers.ps1`
+- `ItsMauridian-DDU-Manual-Uninstall-GPU-Drivers.ps1`
+- `ItsMauridian-Install-And-Configure-GPU-Driver.ps1`
+
+## Project rule for future changes
+
+Changes should be **minimal-diff by default**:
+
+- do not change unrelated code
+- do not restart the shell unless strictly required
+- patch only the block that is actually broken
+- provide full updated files when the main file changes
 
 ## Credits
-Original script by [FR33THY](https://www.youtube.com/FR33THY)
-Services to Manual list sourced from [Chris Titus Tech's WinUtil](https://github.com/ChrisTitusTech/winutil)
+
+- Original script base: FR33THY / WinSux
+- Some service-baseline ideas sourced from Chris Titus Tech WinUtil
