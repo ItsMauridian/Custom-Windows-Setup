@@ -21,7 +21,7 @@ That means the project is currently in a **functionally good state, with LTSC-sp
 Open an **elevated Administrator PowerShell** window and run:
 
 ```powershell
-iwr https://winsetup.m05.dev -useb | iex
+iwr https://winsetup.tsql.gg -useb | iex
 ```
 
 ## Core behavior
