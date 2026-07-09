@@ -59,3 +59,10 @@ This Linux sandbox does not have Windows PowerShell or PowerShell 7 installed, s
 - `Microsoft.Sysinternals.Autoruns` present instead of `Sysinternals.Autoruns`.
 - `Invoke-CwsWinGetInstall` present in StepTwo.
 - NVIDIA Control Panel install uses `--source msstore`.
+
+
+## Hotfix 3 checks
+
+- Brave Origin installer no longer uses `Start-Process -Wait` without timeout.
+- Brave Origin failure is captured in `$failedApps` and does not block the rest of StepTwo.
+- A manual desktop link is created if Brave Origin cannot be installed silently.

@@ -2816,16 +2816,36 @@ function Invoke-CwsWinGetInstall {
 }
 
 # install Brave Origin from the vendor URL, because Brave Origin is not in winget yet
+# The Brave Origin web installer can show an HTTP error dialog and hang. Keep it non-fatal.
 $failedApps = @()
 $braveOriginUrl = "https://laptop-updates.brave.com/latest/origin"
 $braveOriginInstaller = "$env:SystemRoot\Temp\BraveOriginSetup.exe"
+$braveOriginTimeoutSeconds = 300
 try {
     Write-Host "BRAVE ORIGIN`n"
     Get-FileFromWeb -URL $braveOriginUrl -File $braveOriginInstaller
-    $braveOriginProcess = Start-Process -FilePath $braveOriginInstaller -ArgumentList "--install --silent --system-level" -Wait -PassThru -ErrorAction Stop
-    if ($braveOriginProcess.ExitCode -ne 0) { $failedApps += "Brave Origin direct installer (exit $($braveOriginProcess.ExitCode))" }
+
+    if (!(Test-Path $braveOriginInstaller) -or ((Get-Item $braveOriginInstaller).Length -lt 102400)) {
+        throw "Brave Origin installer download looks incomplete"
+    }
+
+    $braveOriginProcess = Start-Process -FilePath $braveOriginInstaller -ArgumentList "--install --silent --system-level" -PassThru -ErrorAction Stop
+    if (-not $braveOriginProcess.WaitForExit($braveOriginTimeoutSeconds * 1000)) {
+        try { $braveOriginProcess.Kill() } catch { }
+        try { taskkill /f /t /im BraveOriginSetup.exe 2>$null | Out-Null } catch { }
+        try { taskkill /f /t /im BraveUpdate.exe 2>$null | Out-Null } catch { }
+        throw "Brave Origin installer timed out after $braveOriginTimeoutSeconds seconds"
+    }
+
+    if ($braveOriginProcess.ExitCode -ne 0) {
+        $failedApps += "Brave Origin direct installer (exit $($braveOriginProcess.ExitCode))"
+    }
 } catch {
     $failedApps += "Brave Origin direct installer ($($_.Exception.Message))"
+    $braveOriginManualPath = Join-Path ([Environment]::GetFolderPath('Desktop')) "Install Brave Origin.url"
+    try {
+        Set-Content -Path $braveOriginManualPath -Value "[InternetShortcut]`r`nURL=https://brave.com/origin/`r`n" -Encoding ASCII -Force
+    } catch { }
 }
 
 # install apps via winget

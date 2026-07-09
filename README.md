@@ -262,6 +262,7 @@ So the current stance is:
 - OneDrive leftover cleanup and reinstall prevention
 - Passkey/FIDO2 preservation
 - Core Windows security defaults preserved by default, including UAC, SmartScreen, PUA protection, Defender scheduled scans, LSA protection, HVCI and the Microsoft vulnerable driver blocklist
+- Brave Origin direct installer via `https://laptop-updates.brave.com/latest/origin` with timeout guard
 - Brave debloat after install
 - WinUtil safe subset refreshed: Brave extra policy keys, Windows AI/Recall disable, detailed BSoD emoticon disable, WPBT preserved
 

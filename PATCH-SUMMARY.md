@@ -77,3 +77,10 @@ Extra hardening pass:
 - Changed Autoruns to `Microsoft.Sysinternals.Autoruns`.
 - Added a central `Invoke-CwsWinGetInstall` helper that uses exact winget IDs and explicit source handling for Microsoft Store packages.
 - Kept empty SHA256 fields non-fatal and NVIDIA DRS import guarded when the folder does not exist.
+
+
+## Hotfix 3 - Brave Origin timeout guard
+
+- Brave Origin still uses the requested vendor URL: `https://laptop-updates.brave.com/latest/origin`.
+- The direct installer is now non-fatal and limited to 300 seconds.
+- If the installer shows an HTTP error dialog or hangs, the process is killed, StepTwo continues, and a desktop shortcut named `Install Brave Origin.url` is created for manual install.
