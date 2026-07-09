@@ -88,10 +88,30 @@ foreach ($command in $windowssecuritysettings) {
 
 # UAC is intentionally preserved.
 
+
+function Get-CwsDduExecutable {
+    $pathFile = "$env:SystemRoot\Temp\DDU.path"
+    if (Test-Path $pathFile) {
+        $savedPath = (Get-Content -Path $pathFile -Raw -ErrorAction SilentlyContinue).Trim()
+        if ($savedPath -and (Test-Path $savedPath)) { return $savedPath }
+    }
+
+    $candidate = Get-ChildItem -Path "$env:SystemRoot\Temp\DDU" -Recurse -File -Filter "Display Driver Uninstaller.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $candidate) {
+        Write-Host "DDU executable was not found under $env:SystemRoot\Temp\DDU." -ForegroundColor Red
+        Write-Host "Safe Mode will be disabled now. Re-run setup after uploading the fixed files." -ForegroundColor Yellow
+        cmd /c "bcdedit /deletevalue {current} safeboot >nul 2>&1"
+        Pause
+        Exit 1
+    }
+    return $candidate.FullName
+}
+
 # remove safe mode boot
 cmd /c "bcdedit /deletevalue {current} safeboot >nul 2>&1"
 
         Write-Host "DDU & RESTARTING`n" -ForegroundColor Red
 
 # uninstall soundblaster realtek intel amd nvidia drivers & restart
-Start-Process "$env:SystemRoot\Temp\DDU\Display Driver Uninstaller.exe" -ArgumentList "-CleanSoundBlaster -CleanRealtek -CleanAllGpus -Restart" -Wait
+$DduExePath = Get-CwsDduExecutable
+Start-Process -FilePath $DduExePath -ArgumentList "-CleanSoundBlaster -CleanRealtek -CleanAllGpus -Restart" -Wait

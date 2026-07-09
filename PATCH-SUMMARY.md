@@ -51,3 +51,5 @@ Extra hardening pass:
 - Changed the main setup registry pass so Windows driver searching is enabled again after setup. DDU can still temporarily block Windows Update during cleanup.
 - Rebuilt the deliverable as one GitHub-ready zip with repository contents at the archive root.
 - Removed duplicate GPU helper copies; GPU helper scripts now live only in `Graphics/` to match the current GitHub layout.
+
+- Fixed DDU 18.1.5.5 extraction path handling: the scripts now search for the real `Display Driver Uninstaller.exe`, create the `Settings` folder if needed, and reuse the detected path in Safe Mode.

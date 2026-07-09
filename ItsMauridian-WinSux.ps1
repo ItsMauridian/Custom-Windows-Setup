@@ -177,6 +177,38 @@ function Disable-CwsBitLockerForSetup {
     } catch { }
 }
 
+function Get-CwsDduExecutable {
+    param([string]$ExtractRoot = "$env:SystemRoot\Temp\DDU")
+
+    $candidate = Get-ChildItem -Path $ExtractRoot -Recurse -File -Filter "Display Driver Uninstaller.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $candidate) {
+        throw "DDU executable not found under $ExtractRoot after extraction."
+    }
+    return $candidate.FullName
+}
+
+function Set-CwsDduConfig {
+    param(
+        [string]$ExtractRoot = "$env:SystemRoot\Temp\DDU",
+        [Parameter(Mandatory)][string]$ConfigXml
+    )
+
+    $dduExePath = Get-CwsDduExecutable -ExtractRoot $ExtractRoot
+    $dduRoot = Split-Path -Path $dduExePath -Parent
+    $settingsDir = Join-Path $dduRoot "Settings"
+    $settingsFile = Join-Path $settingsDir "Settings.xml"
+
+    New-Item -Path $settingsDir -ItemType Directory -Force | Out-Null
+    if (Test-Path $settingsFile) {
+        Set-ItemProperty -Path $settingsFile -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
+    }
+    Set-Content -Path $settingsFile -Value $ConfigXml -Encoding UTF8 -Force
+    Set-ItemProperty -Path $settingsFile -Name IsReadOnly -Value $true -ErrorAction SilentlyContinue
+    Set-Content -Path "$env:SystemRoot\Temp\DDU.path" -Value $dduExePath -Encoding ASCII -Force
+
+    return $dduExePath
+}
+
 function Repair-CwsLegacyUserinit {
     try {
         $winlogonPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
@@ -318,10 +350,9 @@ $DduConfig = @'
 	</Settings>
 </DisplayDriverUninstaller>
 '@
-Set-Content -Path "$env:SystemRoot\Temp\DDU\Settings\Settings.xml" -Value $DduConfig -Force
-
-# set ddu config to read only
-Set-ItemProperty -Path "$env:SystemRoot\Temp\DDU\Settings\Settings.xml" -Name IsReadOnly -Value $true
+# write DDU config next to the real extracted executable.
+# New DDU builds can extract into a versioned subfolder, so do not assume a fixed path.
+$DduExePath = Set-CwsDduConfig -ExtractRoot "$env:SystemRoot\Temp\DDU" -ConfigXml $DduConfig
 
         Write-Host "CHROME`n"
         ## explorer "https://www.google.com/intl/en_us/chrome"

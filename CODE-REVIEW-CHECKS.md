@@ -34,3 +34,5 @@ This Linux sandbox does not have Windows PowerShell or PowerShell 7 installed, s
 - Kept a guarded cleanup path for old builds that may have left `DDU.ps1` or `StepOne.ps1` in `Userinit`.
 - Preserved Chrome and Brave update tasks/services so installed browsers do not become stale.
 - Restored Windows driver searching to enabled after the main setup registry pass. DDU still handles temporary Windows Update blocking during driver cleanup.
+
+- Fixed DDU 18.1.5.5 extraction path handling: the scripts now search for the real `Display Driver Uninstaller.exe`, create the `Settings` folder if needed, and reuse the detected path in Safe Mode.

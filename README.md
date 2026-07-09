@@ -337,3 +337,5 @@ Scripts/Setup/StepTwo.ps1
 
 - Browser update services/tasks are preserved so Chrome and Brave Origin can continue receiving security updates.
 - Windows driver searching is enabled after the main setup registry pass; DDU still temporarily blocks Windows Update during driver cleanup.
+
+- Fixed DDU 18.1.5.5 extraction path handling: the scripts now search for the real `Display Driver Uninstaller.exe`, create the `Settings` folder if needed, and reuse the detected path in Safe Mode.
