@@ -1,4 +1,5 @@
 # SCRIPT RUN AS ADMIN
+# BUILD MARKER: hotfix6 2026-07-10 - StepTwo line 2835 is the foreach closing brace
 If (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]"Administrator")) {
     Write-Host "Run this from an elevated Administrator PowerShell window." -ForegroundColor Red
     Pause

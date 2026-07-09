@@ -344,3 +344,8 @@ Scripts/Setup/StepTwo.ps1
 ### Brave Origin note
 
 Brave Origin unattended install is intentionally skipped. The script creates an `Install Brave Origin.url` desktop shortcut pointing to `https://laptop-updates.brave.com/latest/origin`, because the vendor web installer can fail with `0x80040C01` or hang behind an HTTP error dialog.
+
+
+## Current patch note
+
+The current build marker in `Scripts/Setup/StepTwo.ps1` is `hotfix6 2026-07-10`. Use this to verify that GitHub raw is serving the updated file before resuming StepTwo.

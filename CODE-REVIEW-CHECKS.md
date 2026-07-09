@@ -79,3 +79,10 @@ This Linux sandbox does not have Windows PowerShell or PowerShell 7 installed, s
 - Verified `Scripts/Setup/StepTwo.ps1` no longer contains the stray closing brace after the app install loop.
 - Static brace scan across all `.ps1` files: OK.
 - Static here-string scan across all `.ps1` files: OK.
+
+
+## Hotfix 6
+
+- Added a StepTwo build marker so the GitHub raw file can be verified after upload.
+- Confirmed StepTwo line 2835 is only the foreach closing brace, not an extra stray brace.
+- This hotfix exists because the GitHub raw URL was still serving an older StepTwo file during testing.
