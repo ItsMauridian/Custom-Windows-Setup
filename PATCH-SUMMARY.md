@@ -1,0 +1,53 @@
+# Patch summary
+
+This package updates the Custom Windows Setup repo with:
+
+- Split StepOne and StepTwo into Scripts/Setup files.
+- Early restore point before activation, downloads, DDU and registry changes.
+- Admin check changed to explicit elevated-shell requirement, safe for iwr | iex.
+- Internet check changed from ICMP ping to HTTPS.
+- BitLocker disable for protected volumes before Safe Mode, plus temporary protector disable for reboot safety.
+- 7-Zip 26.02, DDU 18.1.5.5 and NVIDIA Profile Inspector 3.0.2.1 URLs.
+- Optional SHA256 verification helper, DirectX SHA256 pin, and official DDU 18.1.5.5 portable SHA256 pin.
+- StepOne no longer disables UAC, RunAsPPL, HVCI, Microsoft vulnerable driver blocklist or kernel mitigation options by default.
+- WinUtil safe subset additions for Brave, Windows AI/Recall, WPBT, detailed BSoD and service baseline.
+- Winget install failures are collected and surfaced at the top of the desktop log.
+- GitHub Actions parse check for all ps1 files.
+
+Manual follow-up recommended:
+
+- After downloading 7-Zip 26.02 and NVIDIA Profile Inspector 3.0.2.1 on your machine, calculate SHA256 hashes and fill the empty Sha256 fields if you want strict pinning. DDU is already pinned to the official Wagnardsoft portable SHA256.
+- Test DDU 18.1.5.5 on one disposable Windows install before making it your only path.
+- Update winsetup.tsql.gg so the structured files are available in the GitHub repo before using the public one-liner.
+
+Additional app-list update:
+
+- Removed Brave.Brave from winget and added direct Brave Origin installer URL.
+- Removed PuTTY.PuTTY.
+- Expanded the winget app/runtime list to match the user's selected package list, including Balena.Etcher, Element.Element, Microsoft.DirectX, Elgato.StreamDeck, Oracle.JavaRuntimeEnvironment, Logitech.GHUB, ProtonVPN, Tailscale, Termius, Winhance, Windows App Runtime packages and related runtimes.
+Code review fixes in this package:
+
+- Fixed invalid StepTwo here-string terminators created by splitting the old embedded here-string.
+- Fixed the Add-Type C# source block so it parses as normal PowerShell.
+- Changed winget installs to exact ID matching with `-e`.
+- Changed NVIDIA Control Panel install to exact Store ID with `--source msstore`.
+- Fixed the CMD helper to unblock files using `%~dp0` instead of `$PSScriptRoot`.
+- Added `CODE-REVIEW-CHECKS.md`.
+
+Extra hardening pass:
+
+- Replaced the legacy Winlogon Userinit StepOne launch with the current upstream-style Safe Mode RunOnce approach using the `*` prefix.
+- Added guarded cleanup for legacy Userinit entries only when they point to this setup's StepOne file.
+- Preserved SmartScreen, PUA protection, phishing protection, Tamper Protection, Controlled Folder Access, Defender scheduled tasks and Exploit Guard by default.
+- Added Clear-BitLockerAutoUnlock before BitLocker disable attempts so Disable-BitLocker is less likely to be blocked by auto-unlock protectors.
+- Kept WinUtil service refresh narrow: CscService, DiagTrack, MapsBroker and SvcHostSplitThresholdInKB only, with StorSvc, W32Time and SharedAccess left alone.
+
+
+## Extra hardening pass
+
+- Replaced the standalone DDU helper launch method with Safe Mode RunOnce instead of replacing `Winlogon\Userinit`.
+- Left guarded legacy cleanup for older builds that may have written `StepOne.ps1` or `DDU.ps1` into `Userinit`.
+- Preserved Chrome and Brave update mechanisms instead of deleting browser update tasks/services.
+- Changed the main setup registry pass so Windows driver searching is enabled again after setup. DDU can still temporarily block Windows Update during cleanup.
+- Rebuilt the deliverable as one GitHub-ready zip with repository contents at the archive root.
+- Removed duplicate GPU helper copies; GPU helper scripts now live only in `Graphics/` to match the current GitHub layout.
