@@ -10,6 +10,16 @@ $Host.PrivateData.ProgressBackgroundColor = "Black"
 $Host.PrivateData.ProgressForegroundColor = "White"
 Clear-Host
 
+$CwsStepTwoLog = Join-Path $env:SystemRoot "Temp\CWS-StepTwo.log"
+try { Start-Transcript -Path $CwsStepTwoLog -Append -ErrorAction SilentlyContinue | Out-Null } catch { }
+trap {
+    try { $_ | Out-String | Add-Content -Path $CwsStepTwoLog -ErrorAction SilentlyContinue } catch { }
+    Write-Host "StepTwo failed. Details were written to $CwsStepTwoLog" -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    Pause
+    Exit 1
+}
+
         # SCRIPT SILENT
         $progresspreference = 'silentlycontinue'
 
@@ -183,7 +193,7 @@ Windows Registry Editor Version 5.00
 [HKEY_LOCAL_MACHINE\Settings\LocalState\PersistentSettings]
 ; disable personalized experiences
 "PersonalizationEnabled"=hex(5f5e10b):00,0d,56,a1,8a,cd,93,dc,01
-`'@
+'@
 Set-Content -Path "$env:SystemRoot\Temp\WindowsStore.reg" -Value $storesettings -Force
 $settingsdat = "$env:LocalAppData\Packages\Microsoft.WindowsStore_8wekyb3d8bbwe\Settings\settings.dat"
 $regfilewindowsstore = "$env:SystemRoot\Temp\WindowsStore.reg"
@@ -1710,7 +1720,7 @@ E0,F6,C5,D5,0E,CA,50,00,00
 ; black powershell console
 [HKEY_CURRENT_USER\Console\%SystemRoot%_System32_WindowsPowerShell_v1.0_powershell.exe]
 "ScreenColors"=dword:0000000F
-`'@
+'@
 Set-Content -Path "$env:SystemRoot\Temp\WindowsSettings.reg" -Value $regfilewindowssettings -Force
 
 # edit reg file
@@ -1748,7 +1758,7 @@ try {
 
 # force-apply the specific visual-effect settings we actually want via SystemParametersInfo
 # instead of relying on bundled registry values that also affect unrelated UI visuals.
-Add-Type -TypeDefinition @"
+$CwsVisualFxTypeDefinition = @"
 using System;
 using System.Runtime.InteropServices;
 public class WinSuxVisualFx {
@@ -1806,7 +1816,8 @@ public class WinSuxVisualFx {
         SystemParametersInfo(0x0046, 0, 0u, SPIF_FLAGS);
     }
 }
-"@ -ErrorAction SilentlyContinue
+"@
+try { Add-Type -TypeDefinition $CwsVisualFxTypeDefinition -ErrorAction SilentlyContinue } catch { }
 try { [WinSuxVisualFx]::Apply() } catch { }
 
 # keep the broad UI-effects master enabled so non-animation visuals and the
@@ -1982,7 +1993,7 @@ Windows Registry Editor Version 5.00
 "Microsoft.Paint_8wekyb3d8bbwe"=hex(5f5e10b):01,61,ed,11,34,f7,9f,dc,01
 "Microsoft.Windows.Photos_8wekyb3d8bbwe"=hex(5f5e10b):01,61,ed,11,34,f7,9f,dc,01
 "MicrosoftWindows.Client.CBS_cw5n1h2txyewy"=hex(5f5e10b):01,61,ed,11,34,f7,9f,dc,01
-`'@
+'@
 Set-Content -Path "$env:SystemRoot\Temp\AppActions.reg" -Value $appactions -Force
 $settingsdat = "$env:LOCALAPPDATA\Packages\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\Settings\settings.dat"
 $regfileappactions = "$env:SystemRoot\Temp\AppActions.reg"
@@ -2119,7 +2130,7 @@ Windows Registry Editor Version 5.00
 "OpenFile"=hex(5f5e104):01,00,00,00,d1,55,24,57,d1,84,db,01
 "GhostFile"=hex(5f5e10b):00,42,60,f1,5a,d1,84,db,01
 "RewriteEnabled"=hex(5f5e10b):00,12,4a,7f,5f,d1,84,db,01
-`'@
+'@
 Set-Content -Path "$env:SystemRoot\Temp\NotepadSettings.reg" -Value $NotepadSettings -Force
 $SettingsDat = "$env:LocalAppData\Packages\Microsoft.WindowsNotepad_8wekyb3d8bbwe\Settings\settings.dat"
 $RegFileNotepadSettings = "$env:SystemRoot\Temp\NotepadSettings.reg"
@@ -2212,7 +2223,7 @@ $MultilineComment = @'
         </StartLayoutCollection>
     </DefaultLayoutOverride>
 </LayoutModificationTemplate>
-`'@
+'@
 Set-Content -Path "C:\Windows\StartMenuLayout.xml" -Value $MultilineComment -Force -Encoding ASCII
 
 # assign startmenulayout.xml registry
@@ -2362,7 +2373,7 @@ $layoutJson = @'
     { "packagedAppId": "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel" }
   ]
 }
-`'@
+'@
 Set-Content -Path "$shellFolder\LayoutModification.json" -Value $layoutJson -Encoding UTF8 -Force
 
 # create start menu & startup shortcuts
@@ -2963,8 +2974,7 @@ cmd /c "reg add `"HKLM\SOFTWARE\Policies\BraveSoftware\Brave`" /v `"UrlKeyedAnon
 cmd /c "reg add `"HKLM\SOFTWARE\Policies\BraveSoftware\Brave`" /v `"SafeBrowsingExtendedReportingEnabled`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
 cmd /c "reg add `"HKLM\SOFTWARE\Policies\BraveSoftware\Brave`" /v `"MetricsReportingEnabled`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
 
-# remove brave scheduled tasks
-Get-ScheduledTask | Where-Object {$_.Taskname -match 'BraveUpdate'} | Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
+# keep Brave update scheduled tasks intact so the browser can stay current.
 
         # FUNCTION SHOW-MENU
         function Show-Menu {
@@ -3320,7 +3330,7 @@ $nipfile = @'
     </Settings>
   </Profile>
 </ArrayOfProfile>
-`'@
+'@
 Set-Content -Path "$env:SystemRoot\Temp\Inspector.nip" -Value $nipfile -Force
 
 # import nip
@@ -4163,7 +4173,7 @@ namespace WindowsService
         }
     }
 }
-`'@
+'@
 Set-Content -Path "$env:SystemDrive\Windows\SetTimerResolutionService.cs" -Value $csfile -Force
 
 # compile and create service
@@ -4300,6 +4310,9 @@ if ($Error.Count -gt 0) {
     $logContent += "No errors detected during setup."
 }
 $logContent | Out-File -FilePath $logPath -Encoding UTF8 -Force
+
+try { Unregister-ScheduledTask -TaskName "ItsMauridian-Custom-Windows-Setup-StepTwo" -Confirm:$false -ErrorAction SilentlyContinue } catch { }
+try { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null } catch { }
 
 # restart
 Start-Sleep -Seconds 5

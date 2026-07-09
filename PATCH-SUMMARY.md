@@ -53,3 +53,12 @@ Extra hardening pass:
 - Removed duplicate GPU helper copies; GPU helper scripts now live only in `Graphics/` to match the current GitHub layout.
 
 - Fixed DDU 18.1.5.5 extraction path handling: the scripts now search for the real `Display Driver Uninstaller.exe`, create the `Settings` folder if needed, and reuse the detected path in Safe Mode.
+
+
+## Resume fix after DDU
+- Fixed remaining escaped here-string terminators in `Scripts/Setup/StepTwo.ps1` left over from the old monolithic embedded script.
+- Moved the visual-effects Add-Type ErrorAction onto the Add-Type call instead of the here-string closing delimiter.
+- Replaced normal-boot StepTwo resume with a highest-privilege scheduled task at next logon, with HKLM RunOnce only as fallback.
+- Added `C:\Windows\Temp\CWS-StepTwo.log` transcript/error logging so a failed resume no longer disappears silently.
+
+- Follow-up: removed leftover Brave/Chrome update scheduled task deletion lines.

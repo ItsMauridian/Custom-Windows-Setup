@@ -385,6 +385,31 @@ Get-FileFromWeb -URL $CwsDependencies.DirectX.Url -File $CwsDependencies.DirectX
 # install direct x
 Start-Process -Wait "$env:SystemRoot\Temp\DirectX\DXSETUP.exe" -ArgumentList "/silent" -WindowStyle Hidden
 
+
+function Register-CwsStepTwoResumeTask {
+    $taskName = "ItsMauridian-Custom-Windows-Setup-StepTwo"
+    $stepTwoPath = "$env:SystemRoot\Temp\StepTwo.ps1"
+    $argument = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Maximized -File `"$stepTwoPath`""
+
+    try {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+    } catch { }
+
+    try {
+        $principalUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $argument
+        $trigger = New-ScheduledTaskTrigger -AtLogOn -User $principalUser
+        $principal = New-ScheduledTaskPrincipal -UserId $principalUser -LogonType Interactive -RunLevel Highest
+        $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+        return $true
+    } catch {
+        Write-Host "Scheduled Task resume registration failed. Falling back to HKLM RunOnce." -ForegroundColor Yellow
+        try { $_ | Out-String | Add-Content -Path "$env:SystemRoot\Temp\CWS-StepTwo-ResumeTask.log" -ErrorAction SilentlyContinue } catch { }
+        return $false
+    }
+}
+
 # create stepone ps1 file
 
 # create step files from local repo checkout or GitHub raw when running through iwr | iex
@@ -397,8 +422,13 @@ Repair-CwsLegacyUserinit
 # install RunOnce StepOne file to run in Safe Mode. The * prefix makes RunOnce execute in Safe Mode.
 cmd /c "reg add `"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce`" /v `"*!StepOne`" /t REG_SZ /d `"powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Maximized -File `"$env:SystemRoot\Temp\StepOne.ps1`"`" /f >nul 2>&1"
 
-# install RunOnce StepTwo file to run in normal boot after DDU restarts. The ! prefix keeps the entry if execution fails.
-cmd /c "reg add `"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce`" /v `"!StepTwo`" /t REG_SZ /d `"powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Maximized -File `"$env:SystemRoot\Temp\StepTwo.ps1`"`" /f >nul 2>&1"
+# schedule StepTwo to resume elevated after DDU returns to normal Windows.
+# RunOnce is kept only as a fallback because HKCU RunOnce does not reliably resume elevated after reboot.
+cmd /c "reg delete `"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce`" /v `"!StepTwo`" /f >nul 2>&1"
+cmd /c "reg delete `"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce`" /v `"!StepTwo`" /f >nul 2>&1"
+if (-not (Register-CwsStepTwoResumeTask)) {
+    cmd /c "reg add `"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce`" /v `"!StepTwo`" /t REG_SZ /d `"powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Maximized -File `"$env:SystemRoot\Temp\StepTwo.ps1`"`" /f >nul 2>&1"
+}
 
 # disable open terminal by default
 cmd /c "reg add `"HKCU\Console\%%Startup`" /v `"DelegationConsole`" /t REG_SZ /d `"{B23D10C0-E52E-411E-9D5B-C09FDF709C7D}`" /f >nul 2>&1"

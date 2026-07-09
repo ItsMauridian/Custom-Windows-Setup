@@ -201,10 +201,7 @@ cmd /c "sc stop `"$($service.Name)`" >nul 2>&1"
 cmd /c "sc delete `"$($service.Name)`" >nul 2>&1"
 }
 
-# remove chrome scheduled tasks
-Get-ScheduledTask | Where-Object {$_.Taskname -match 'GoogleUpdateTaskMachineCore'} | Unregister-ScheduledTask -Confirm:$false
-Get-ScheduledTask | Where-Object {$_.Taskname -match 'GoogleUpdateTaskMachineUA'} | Unregister-ScheduledTask -Confirm:$false
-Get-ScheduledTask | Where-Object {$_.Taskname -match 'GoogleUpdaterTaskSystem'} | Unregister-ScheduledTask -Confirm:$false
+# keep Chrome update scheduled tasks intact so Chrome can stay current.
 
         # FUNCTION SHOW-MENU
         function show-menu {

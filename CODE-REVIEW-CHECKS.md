@@ -36,3 +36,11 @@ This Linux sandbox does not have Windows PowerShell or PowerShell 7 installed, s
 - Restored Windows driver searching to enabled after the main setup registry pass. DDU still handles temporary Windows Update blocking during driver cleanup.
 
 - Fixed DDU 18.1.5.5 extraction path handling: the scripts now search for the real `Display Driver Uninstaller.exe`, create the `Settings` folder if needed, and reuse the detected path in Safe Mode.
+
+
+## DDU resume follow-up check
+- Rechecked StepTwo split output for leftover monolithic here-string escapes.
+- Replaced HKCU StepTwo RunOnce resume with elevated scheduled task resume.
+- Added visible StepTwo failure logging to `C:\Windows\Temp\CWS-StepTwo.log`.
+
+- Follow-up: removed leftover Brave/Chrome update scheduled task deletion lines.
