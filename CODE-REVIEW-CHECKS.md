@@ -73,3 +73,9 @@ This Linux sandbox does not have Windows PowerShell or PowerShell 7 installed, s
 - No `BraveOriginSetup.exe` process is launched by the script.
 - Warframe remains absent from the active install list.
 
+
+## Hotfix 5 checks
+
+- Verified `Scripts/Setup/StepTwo.ps1` no longer contains the stray closing brace after the app install loop.
+- Static brace scan across all `.ps1` files: OK.
+- Static here-string scan across all `.ps1` files: OK.

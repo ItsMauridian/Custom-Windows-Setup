@@ -2832,7 +2832,6 @@ foreach ($app in $apps) {
     $installExitCode = Invoke-CwsWinGetInstall -Id $app
     if ($installExitCode -ne 0) { $failedApps += "$app (exit $installExitCode)" }
 }
-}
 
 # clean up taskbar - remove all pins, clear stale layout XMLs, remove duplicate shortcuts
 # works on both Windows 10 and Windows 11

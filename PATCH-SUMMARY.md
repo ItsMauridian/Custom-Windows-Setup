@@ -91,3 +91,9 @@ Extra hardening pass:
 - StepTwo now creates `Install Brave Origin.url` on the desktop and continues immediately.
 - This avoids the Brave installer error dialog `0x80040C01` and other HTTP/web-installer hangs.
 
+
+## Hotfix 5
+
+- Removed an extra closing brace in `Scripts/Setup/StepTwo.ps1` after the winget app install loop.
+- This fixes the PowerShell parse error at line 2835: `Unexpected token '}' in expression or statement`.
+- Re-ran the static brace and here-string scan across all PowerShell files.
