@@ -66,3 +66,10 @@ This Linux sandbox does not have Windows PowerShell or PowerShell 7 installed, s
 - Brave Origin installer no longer uses `Start-Process -Wait` without timeout.
 - Brave Origin failure is captured in `$failedApps` and does not block the rest of StepTwo.
 - A manual desktop link is created if Brave Origin cannot be installed silently.
+## Hotfix 4 checks
+
+- Brave Origin no longer starts a web installer from StepTwo.
+- `https://laptop-updates.brave.com/latest/origin` is preserved only as a desktop shortcut target.
+- No `BraveOriginSetup.exe` process is launched by the script.
+- Warframe remains absent from the active install list.
+

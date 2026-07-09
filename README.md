@@ -119,7 +119,7 @@ Implementation rule:
 
 ## App installs via `winget`
 
-Brave is not installed via `winget`. Brave Origin is installed directly from:
+Brave is not installed via `winget`. Brave Origin is intentionally left as a manual installer link because the vendor web installer is not reliable unattended:
 
 ```text
 https://laptop-updates.brave.com/latest/origin
@@ -262,7 +262,7 @@ So the current stance is:
 - OneDrive leftover cleanup and reinstall prevention
 - Passkey/FIDO2 preservation
 - Core Windows security defaults preserved by default, including UAC, SmartScreen, PUA protection, Defender scheduled scans, LSA protection, HVCI and the Microsoft vulnerable driver blocklist
-- Brave Origin direct installer via `https://laptop-updates.brave.com/latest/origin` with timeout guard
+- Brave Origin manual desktop shortcut via `https://laptop-updates.brave.com/latest/origin`
 - Brave debloat after install
 - WinUtil safe subset refreshed: Brave extra policy keys, Windows AI/Recall disable, detailed BSoD emoticon disable, WPBT preserved
 
@@ -335,7 +335,12 @@ Scripts/Setup/StepTwo.ps1
 
 ## Additional safety notes
 
-- Browser update services/tasks are preserved so Chrome and Brave Origin can continue receiving security updates.
+- Browser update services/tasks are preserved so installed browsers can continue receiving security updates.
 - Windows driver searching is enabled after the main setup registry pass; DDU still temporarily blocks Windows Update during driver cleanup.
 
 - Fixed DDU 18.1.5.5 extraction path handling: the scripts now search for the real `Display Driver Uninstaller.exe`, create the `Settings` folder if needed, and reuse the detected path in Safe Mode.
+
+
+### Brave Origin note
+
+Brave Origin unattended install is intentionally skipped. The script creates an `Install Brave Origin.url` desktop shortcut pointing to `https://laptop-updates.brave.com/latest/origin`, because the vendor web installer can fail with `0x80040C01` or hang behind an HTTP error dialog.

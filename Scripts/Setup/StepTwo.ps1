@@ -2815,126 +2815,19 @@ function Invoke-CwsWinGetInstall {
     return $LASTEXITCODE
 }
 
-# install Brave Origin from the vendor URL, because Brave Origin is not in winget yet
-# The Brave Origin web installer can show an HTTP error dialog and hang. Keep it non-fatal.
-$failedApps = @()
+# Brave Origin is intentionally not installed unattended.
+# The vendor web installer currently can fail with 0x80040C01 or show an HTTP error dialog during silent/system-level installation.
+# Keep the script non-blocking and create a manual install shortcut instead.
+Write-Host "BRAVE ORIGIN`n"
 $braveOriginUrl = "https://laptop-updates.brave.com/latest/origin"
-$braveOriginInstaller = "$env:SystemRoot\Temp\BraveOriginSetup.exe"
-$braveOriginTimeoutSeconds = 300
+$braveOriginManualPath = Join-Path ([Environment]::GetFolderPath('Desktop')) "Install Brave Origin.url"
 try {
-    Write-Host "BRAVE ORIGIN`n"
-    Get-FileFromWeb -URL $braveOriginUrl -File $braveOriginInstaller
-
-    if (!(Test-Path $braveOriginInstaller) -or ((Get-Item $braveOriginInstaller).Length -lt 102400)) {
-        throw "Brave Origin installer download looks incomplete"
-    }
-
-    $braveOriginProcess = Start-Process -FilePath $braveOriginInstaller -ArgumentList "--install --silent --system-level" -PassThru -ErrorAction Stop
-    if (-not $braveOriginProcess.WaitForExit($braveOriginTimeoutSeconds * 1000)) {
-        try { $braveOriginProcess.Kill() } catch { }
-        try { taskkill /f /t /im BraveOriginSetup.exe 2>$null | Out-Null } catch { }
-        try { taskkill /f /t /im BraveUpdate.exe 2>$null | Out-Null } catch { }
-        throw "Brave Origin installer timed out after $braveOriginTimeoutSeconds seconds"
-    }
-
-    if ($braveOriginProcess.ExitCode -ne 0) {
-        $failedApps += "Brave Origin direct installer (exit $($braveOriginProcess.ExitCode))"
-    }
+    Set-Content -Path $braveOriginManualPath -Value "[InternetShortcut]`r`nURL=$braveOriginUrl`r`n" -Encoding ASCII -Force
+    $failedApps += "Brave Origin skipped for manual install - desktop shortcut created"
 } catch {
-    $failedApps += "Brave Origin direct installer ($($_.Exception.Message))"
-    $braveOriginManualPath = Join-Path ([Environment]::GetFolderPath('Desktop')) "Install Brave Origin.url"
-    try {
-        Set-Content -Path $braveOriginManualPath -Value "[InternetShortcut]`r`nURL=https://brave.com/origin/`r`n" -Encoding ASCII -Force
-    } catch { }
+    $failedApps += "Brave Origin manual shortcut failed ($($_.Exception.Message))"
 }
 
-# install apps via winget
-if ($wingetWorks) {
-$isWindows11 = [System.Environment]::OSVersion.Version.Build -ge 22000
-$apps = @(
-    "7zip.7zip",
-    "Microsoft.AppInstaller",
-    "Balena.Etcher",
-    "Bambulab.Bambustudio",
-    "Apple.Bonjour",
-    "Anthropic.Claude",
-    "Microsoft.DirectX",
-    "Discord.Discord",
-    "Discord.Discord.PTB",
-    "File-New-Project.EarTrumpet",
-    "Element.Element",
-    "Elgato.StreamDeck",
-    "EpicGames.EpicGamesLauncher",
-    "Futuremark.FuturemarkSystemInfo",
-    "Google.Chrome",
-    "REALiX.HWiNFO",
-    "Oracle.JavaRuntimeEnvironment",
-    "Logitech.GHUB",
-    "Microsoft.DotNet.Framework.DeveloperPack.4.5",
-    "Microsoft.DotNet.Framework.DeveloperPack_4",
-    "Microsoft.DotNet.Native.Runtime",
-    "Microsoft.DotNet.Runtime.3_1",
-    "Microsoft.DotNet.Runtime.5",
-    "Microsoft.DotNet.Runtime.6",
-    "Microsoft.DotNet.Runtime.7",
-    "Microsoft.DotNet.Runtime.8",
-    "Microsoft.Edge",
-    "Microsoft.EdgeWebView2Runtime",
-    "Microsoft.VCRedist.2005.x86",
-    "Microsoft.VCRedist.2005.x64",
-    "Microsoft.VCRedist.2008.x64",
-    "Microsoft.VCRedist.2008.x86",
-    "Microsoft.VCRedist.2010.x64",
-    "Microsoft.VCRedist.2010.x86",
-    "Microsoft.VCRedist.2012.x64",
-    "Microsoft.VCRedist.2012.x86",
-    "Microsoft.VCRedist.2013.x64",
-    "Microsoft.VCRedist.2013.x86",
-    "Microsoft.VCLibs.Desktop.14",
-    "Microsoft.VCLibs.14",
-    "Microsoft.VCRedist.2015+.x64",
-    "Microsoft.VCRedist.2015+.x86",
-    "Microsoft.UI.Xaml.2.8",
-    "rcmaehl.MSEdgeRedirect",
-    "Nvidia.PhysX",
-    "Obsidian.Obsidian",
-    "Microsoft.OpenSSH.Preview",
-    "Perplexity.Perplexity",
-    "Microsoft.PowerShell",
-    "Microsoft.PowerToys",
-    "Proton.ProtonDrive",
-    "Proton.ProtonMail",
-    "Proton.ProtonVPN",
-    "RaspberryPiFoundation.RaspberryPiImager",
-    "RevoUninstaller.RevoUninstallerPro",
-    "RockstarGames.Launcher",
-    "ShareX.ShareX",
-    "SlackTechnologies.Slack",
-    "Valve.Steam",
-    "SublimeHQ.SublimeText.4",
-    "SergeySerkov.TagScanner",
-    "Tailscale.Tailscale",
-    "Telegram.TelegramDesktop",
-    "Termius.Termius",
-    "Ubisoft.Connect",
-    "VideoLAN.VLC",
-    "Microsoft.WindowsApp",
-    "Microsoft.WindowsAppRuntime.1.6",
-    "Microsoft.WindowsAppRuntime.1.7",
-    "Microsoft.WindowsAppRuntime.1.8",
-    "Microsoft.WindowsTerminal",
-    "memstechtips.Winhance",
-    "RARLab.WinRAR",
-    "WinSCP.WinSCP",
-    "Zoom.Zoom",
-    "Devolutions.UniGetUI",
-    "Apple.iTunes",
-    "ElectronicArts.EADesktop",
-    "Microsoft.Sysinternals.Autoruns"
-)
-if ($isWindows11) {
-    $apps += "StartIsBack.StartAllBack"
-}
 foreach ($app in $apps) {
     $installExitCode = Invoke-CwsWinGetInstall -Id $app
     if ($installExitCode -ne 0) { $failedApps += "$app (exit $installExitCode)" }

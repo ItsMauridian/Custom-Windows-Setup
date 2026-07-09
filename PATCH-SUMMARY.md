@@ -84,3 +84,10 @@ Extra hardening pass:
 - Brave Origin still uses the requested vendor URL: `https://laptop-updates.brave.com/latest/origin`.
 - The direct installer is now non-fatal and limited to 300 seconds.
 - If the installer shows an HTTP error dialog or hangs, the process is killed, StepTwo continues, and a desktop shortcut named `Install Brave Origin.url` is created for manual install.
+## Hotfix 4 - Brave Origin manual-only
+
+- Changed Brave Origin from attempted unattended installation to manual-only by default.
+- The vendor URL is still preserved: `https://laptop-updates.brave.com/latest/origin`.
+- StepTwo now creates `Install Brave Origin.url` on the desktop and continues immediately.
+- This avoids the Brave installer error dialog `0x80040C01` and other HTTP/web-installer hangs.
+
