@@ -68,9 +68,11 @@ function Get-FileFromWeb {
         if ($Reader) { $Reader.Close() }
         if ($Response) { $Response.Close() }
     }
-    if (!(Test-FileHashSha256 -Path $File -ExpectedHash $Sha256)) {
-        Remove-Item $File -Force -ErrorAction SilentlyContinue | Out-Null
-        throw "SHA256 mismatch for $File"
+    if (-not [string]::IsNullOrWhiteSpace($Sha256)) {
+        if (!(Test-FileHashSha256 -Path $File -ExpectedHash $Sha256)) {
+            Remove-Item $File -Force -ErrorAction SilentlyContinue | Out-Null
+            throw "SHA256 mismatch for $File"
+        }
     }
 }
 
@@ -311,7 +313,9 @@ reg add "$key" /v "RMHdcpKeyglobZero" /t REG_DWORD /d "1" /f | Out-Null
 
 # unblock drs files
 $path = "C:\ProgramData\NVIDIA Corporation\Drs"
-Get-ChildItem -Path $path -Recurse | Unblock-File
+if (Test-Path $path) {
+    Get-ChildItem -Path $path -Recurse -File -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue
+}
 
 # set physx to gpu
 cmd /c "reg add `"HKLM\System\CurrentControlSet\Services\nvlddmkm\Parameters\Global\NVTweak`" /v `"NvCplPhysxAuto`" /t REG_DWORD /d `"0`" /f >nul 2>&1"

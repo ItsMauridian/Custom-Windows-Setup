@@ -193,7 +193,6 @@ The current desired `winget` install set is:
 - `Termius.Termius`
 - `Ubisoft.Connect`
 - `VideoLAN.VLC`
-- `DigitalExtremes.Warframe`
 - `Microsoft.WindowsApp`
 - `Microsoft.WindowsAppRuntime.1.6`
 - `Microsoft.WindowsAppRuntime.1.7`
@@ -203,10 +202,10 @@ The current desired `winget` install set is:
 - `RARLab.WinRAR`
 - `WinSCP.WinSCP`
 - `Zoom.Zoom`
-- `MartiCliment.UniGetUI`
+- `Devolutions.UniGetUI`
 - `Apple.iTunes`
 - `ElectronicArts.EADesktop`
-- `Sysinternals.Autoruns`
+- `Microsoft.Sysinternals.Autoruns`
 - `StartIsBack.StartAllBack` (**Windows 11 only**)
 
 ## Search / Outlook defaults

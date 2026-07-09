@@ -36,7 +36,7 @@ trap {
         function Test-FileHashSha256 {
         param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$ExpectedHash
+        [string]$ExpectedHash = ""
         )
         if ([string]::IsNullOrWhiteSpace($ExpectedHash)) { return $true }
         if (!(Test-Path $Path)) { return $false }
@@ -75,9 +75,11 @@ trap {
         if ($Reader) { $Reader.Close() }
         if ($Response) { $Response.Close() }
         }
+        if (-not [string]::IsNullOrWhiteSpace($Sha256)) {
         if (!(Test-FileHashSha256 -Path $File -ExpectedHash $Sha256)) {
         Remove-Item $File -Force -ErrorAction SilentlyContinue | Out-Null
         throw "SHA256 mismatch for $File"
+        }
         }
         }
 
@@ -2786,6 +2788,33 @@ if (!$wingetWorks) {
     Write-Host "winget could not be found after bootstrap attempt, skipping app installs`n" -ForegroundColor Red
 }
 
+function Invoke-CwsWinGetInstall {
+    param(
+        [Parameter(Mandatory)][string]$Id,
+        [string]$Source = ""
+    )
+
+    if (-not $wingetExe) { return 1 }
+
+    $arguments = @(
+        "install",
+        "--id", $Id,
+        "-e",
+        "--silent",
+        "--accept-package-agreements",
+        "--accept-source-agreements",
+        "--disable-interactivity",
+        "--no-upgrade"
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($Source)) {
+        $arguments += @("--source", $Source)
+    }
+
+    & $wingetExe @arguments
+    return $LASTEXITCODE
+}
+
 # install Brave Origin from the vendor URL, because Brave Origin is not in winget yet
 $failedApps = @()
 $braveOriginUrl = "https://laptop-updates.brave.com/latest/origin"
@@ -2869,7 +2898,6 @@ $apps = @(
     "Termius.Termius",
     "Ubisoft.Connect",
     "VideoLAN.VLC",
-    "DigitalExtremes.Warframe",
     "Microsoft.WindowsApp",
     "Microsoft.WindowsAppRuntime.1.6",
     "Microsoft.WindowsAppRuntime.1.7",
@@ -2879,17 +2907,17 @@ $apps = @(
     "RARLab.WinRAR",
     "WinSCP.WinSCP",
     "Zoom.Zoom",
-    "MartiCliment.UniGetUI",
+    "Devolutions.UniGetUI",
     "Apple.iTunes",
     "ElectronicArts.EADesktop",
-    "Sysinternals.Autoruns"
+    "Microsoft.Sysinternals.Autoruns"
 )
 if ($isWindows11) {
     $apps += "StartIsBack.StartAllBack"
 }
 foreach ($app in $apps) {
-    & $wingetExe install --id $app --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --no-upgrade
-    if ($LASTEXITCODE -ne 0) { $failedApps += "$app (exit $LASTEXITCODE)" }
+    $installExitCode = Invoke-CwsWinGetInstall -Id $app
+    if ($installExitCode -ne 0) { $failedApps += "$app (exit $installExitCode)" }
 }
 }
 
@@ -3052,7 +3080,10 @@ Start-Process "$env:SystemRoot\Temp\NvidiaDriver\setup.exe" -ArgumentList "-s -n
 
 # install nvidia control panel
 try {
-if ($wingetWorks) { & $wingetExe install "9NF8H0H7WMLT" --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --no-upgrade }
+if ($wingetWorks) {
+    $nvcplExitCode = Invoke-CwsWinGetInstall -Id "9NF8H0H7WMLT" -Source "msstore"
+    if ($nvcplExitCode -ne 0) { $failedApps += "NVIDIA Control Panel 9NF8H0H7WMLT (exit $nvcplExitCode)" }
+}
 } catch { }
 
 # delete download
@@ -3081,7 +3112,9 @@ reg add "$key" /v "RMHdcpKeyglobZero" /t REG_DWORD /d "1" /f | Out-Null
 
 # unblock drs files
 $path = "C:\ProgramData\NVIDIA Corporation\Drs"
-Get-ChildItem -Path $path -Recurse | Unblock-File
+if (Test-Path $path) {
+    Get-ChildItem -Path $path -Recurse -File -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue
+}
 
 # set physx to gpu
 cmd /c "reg add `"HKLM\System\CurrentControlSet\Services\nvlddmkm\Parameters\Global\NVTweak`" /v `"NvCplPhysxAuto`" /t REG_DWORD /d `"0`" /f >nul 2>&1"

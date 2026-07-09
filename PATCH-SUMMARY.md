@@ -62,3 +62,18 @@ Extra hardening pass:
 - Added `C:\Windows\Temp\CWS-StepTwo.log` transcript/error logging so a failed resume no longer disappears silently.
 
 - Follow-up: removed leftover Brave/Chrome update scheduled task deletion lines.
+
+## Hotfix: StepTwo app and NVIDIA handling
+
+- Removed `DigitalExtremes.Warframe` from the winget app list.
+- Made SHA256 verification skip cleanly when no hash is intentionally configured.
+- Guarded the NVIDIA DRS unblock step so missing `C:\ProgramData\NVIDIA Corporation\Drs` does not stop StepTwo.
+
+
+## Hotfix 2
+
+- Kept `DigitalExtremes.Warframe` removed.
+- Changed UniGetUI to `Devolutions.UniGetUI`.
+- Changed Autoruns to `Microsoft.Sysinternals.Autoruns`.
+- Added a central `Invoke-CwsWinGetInstall` helper that uses exact winget IDs and explicit source handling for Microsoft Store packages.
+- Kept empty SHA256 fields non-fatal and NVIDIA DRS import guarded when the folder does not exist.

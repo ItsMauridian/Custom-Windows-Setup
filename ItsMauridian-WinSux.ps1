@@ -130,9 +130,11 @@ function Get-FileFromWeb {
         if ($Reader) { $Reader.Close() }
         if ($Response) { $Response.Close() }
     }
-    if (!(Test-FileHashSha256 -Path $File -ExpectedHash $Sha256)) {
-        Remove-Item $File -Force -ErrorAction SilentlyContinue | Out-Null
-        throw "SHA256 mismatch for $File"
+    if (-not [string]::IsNullOrWhiteSpace($Sha256)) {
+        if (!(Test-FileHashSha256 -Path $File -ExpectedHash $Sha256)) {
+            Remove-Item $File -Force -ErrorAction SilentlyContinue | Out-Null
+            throw "SHA256 mismatch for $File"
+        }
     }
 }
 

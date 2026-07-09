@@ -44,3 +44,18 @@ This Linux sandbox does not have Windows PowerShell or PowerShell 7 installed, s
 - Added visible StepTwo failure logging to `C:\Windows\Temp\CWS-StepTwo.log`.
 
 - Follow-up: removed leftover Brave/Chrome update scheduled task deletion lines.
+
+## Hotfix checks
+
+- `DigitalExtremes.Warframe` removed from active app list.
+- Empty SHA256 values no longer hit mandatory parameter binding.
+- Missing NVIDIA DRS folder is guarded with `Test-Path`.
+
+
+## Hotfix 2 checks
+
+- `DigitalExtremes.Warframe` not present in active install list.
+- `Devolutions.UniGetUI` present instead of `MartiCliment.UniGetUI`.
+- `Microsoft.Sysinternals.Autoruns` present instead of `Sysinternals.Autoruns`.
+- `Invoke-CwsWinGetInstall` present in StepTwo.
+- NVIDIA Control Panel install uses `--source msstore`.
