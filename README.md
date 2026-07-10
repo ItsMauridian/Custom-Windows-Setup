@@ -1,3 +1,7 @@
+# Reliability 12
+
+Reliability 12 fixes the post-DDU StepTwo failure seen in Windows PowerShell 5.1. The resume wrapper no longer invokes StepTwo inside its own `ErrorActionPreference = Stop` scope. It starts StepTwo as a separate Windows PowerShell process, and StepTwo explicitly uses the normal `Continue` preference for best-effort native commands. Recovery also runs `bcdedit.exe` through `Start-Process`, so an absent safeboot value cannot become a false terminating error.
+
 # Custom Windows Setup
 
 A personal fork of FR33THY's WinSux focused on repeatable post-install setup for:
@@ -9,7 +13,7 @@ The goal is one script that applies the same overall setup philosophy on both Wi
 
 ## Current status
 
-- **Current validation status:** the Safe Mode and StepTwo resume flow completed in a Windows 11 VM and on a Windows 11 laptop. The reliability9 pass addresses the errors and confusing silent stages found in both resulting logs and now needs a fresh end-to-end rerun.
+- **Current validation status:** the reliability9 laptop test completed DDU, but StepTwo did not launch after the following reboot. Reliability10 replaces that reboot handoff and still needs a fresh end-to-end Windows test.
 - **LTSC Store recovery:** `wsreset.exe -i` is treated as a best-effort recovery step with a 180-second timeout. StepTwo then verifies Microsoft Store and Desktop App Installer separately before the dedicated WinGet bootstrap.
 - **WinGet handling:** App Installer is registered using the Microsoft-supported family registration command. If missing, the script installs signed App Installer dependencies and resolves the real package-local `winget.exe`.
 - **AppX handling:** only an explicit list of consumer apps is removed. AppX frameworks and protected Windows system packages are preserved.
@@ -322,6 +326,8 @@ Graphics/ItsMauridian-DDU-Manual-Uninstall-GPU-Drivers.ps1
 Graphics/ItsMauridian-Install-And-Configure-GPU-Driver.ps1
 Scripts/Setup/StepOne.ps1
 Scripts/Setup/StepTwo.ps1
+Scripts/Setup/Resume-StepTwo.ps1
+Scripts/Setup/Recover-StepTwo.ps1
 ```
 
 `ItsMauridian-WinSux.ps1` remains the entrypoint. When run from a local clone it copies the local StepOne and StepTwo files. When run through `iwr | iex` it downloads them from the GitHub raw base configured near the top of the script. The GPU helper scripts remain in `Graphics/` to match the repository layout and avoid duplicate copies.
@@ -362,7 +368,7 @@ Brave Origin unattended install is intentionally skipped. The script creates an 
 
 ## Current patch note
 
-The current build marker in `Scripts/Setup/StepTwo.ps1` is `reliability9 2026-07-10`. Use this marker to verify that GitHub raw is serving the current file before testing.
+The current build marker in `Scripts/Setup/StepTwo.ps1` is `reliability12 2026-07-10`. Use this marker to verify that GitHub raw is serving the current file before testing.
 
 ## Technical references
 
@@ -373,3 +379,37 @@ The current build marker in `Scripts/Setup/StepTwo.ps1` is `reliability9 2026-07
 - [Microsoft: Remove-AppxProvisionedPackage](https://learn.microsoft.com/powershell/module/dism/remove-appxprovisionedpackage)
 - [Microsoft: PowerCfg command-line options](https://learn.microsoft.com/windows-hardware/design/device-experiences/powercfg-command-line-options)
 - [Microsoft: SetConsoleMode and Quick Edit](https://learn.microsoft.com/windows/console/setconsolemode)
+- [Microsoft: Run and RunOnce registry keys](https://learn.microsoft.com/windows/win32/setupapi/run-and-runonce-registry-keys)
+- [Microsoft: New-ScheduledTaskTrigger](https://learn.microsoft.com/powershell/module/scheduledtasks/new-scheduledtasktrigger)
+- [Microsoft: New-ScheduledTaskPrincipal](https://learn.microsoft.com/powershell/module/scheduledtasks/new-scheduledtaskprincipal)
+- [Microsoft: Register-ScheduledTask](https://learn.microsoft.com/powershell/module/scheduledtasks/register-scheduledtask)
+
+## DDU resume reliability
+
+The DDU reboot handoff stores `StepOne.ps1`, `StepTwo.ps1` and `Resume-StepTwo.ps1` under:
+
+```text
+C:\ProgramData\ItsMauridian\Custom-Windows-Setup
+```
+
+StepTwo is resumed through three independent mechanisms:
+
+- A highest-privilege Task Scheduler logon task.
+- An HKLM RunOnce immediate fallback.
+- An HKLM Run recovery fallback that remains until StepTwo completes.
+
+The resume wrapper uses a global mutex, so both mechanisms cannot start StepTwo twice. It validates the PowerShell syntax before execution and downloads a fresh StepTwo copy from GitHub when the local copy is missing. Resume diagnostics are written to:
+
+```text
+C:\ProgramData\ItsMauridian\Custom-Windows-Setup\Resume-StepTwo.log
+```
+
+### Recover an installation that stopped after DDU
+
+Do not rerun DDU or the main setup. Upload the current repository files, open Administrator PowerShell, and run:
+
+```powershell
+iwr "https://raw.githubusercontent.com/ItsMauridian/Custom-Windows-Setup/main/Scripts/Setup/Recover-StepTwo.ps1?nocache=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" -UseBasicParsing | iex
+```
+
+The recovery script removes any leftover Safe Mode boot value, downloads fresh reliability12 copies of StepTwo and the resume wrapper, parses both files, and starts StepTwo.

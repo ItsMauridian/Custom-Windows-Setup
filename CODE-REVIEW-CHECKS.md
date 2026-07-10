@@ -1,3 +1,28 @@
+# Reliability 12 validation
+
+Required checks for this build:
+
+- `StepTwo.ps1` has the reliability12 marker and explicitly sets `$ErrorActionPreference = 'Continue'`.
+- `Resume-StepTwo.ps1` starts a separate `powershell.exe` process and does not call `& $stepTwoPath`.
+- `Recover-StepTwo.ps1` does not directly redirect `bcdedit.exe` stderr under a Stop preference.
+- All PowerShell files pass parser validation.
+- The ZIP opens cleanly and contains the repository files at its root.
+
+# Reliability 12 resume and parser checks
+
+- [x] The `$LiteralPath:` interpolation parser bug is removed.
+- [x] StepOne, StepTwo and Resume-StepTwo are parsed before Safe Mode is enabled.
+- [x] Critical reboot handoff files are stored under ProgramData, not only Windows Temp.
+- [x] Scheduled task registration is verified after creation.
+- [x] HKLM RunOnce is registered as an immediate fallback.
+- [x] HKLM Run is registered as a persistent recovery fallback until completion.
+- [x] Resume wrapper blocks execution while Safe Mode is still active.
+- [x] Resume wrapper prevents duplicate execution with a global mutex.
+- [x] Missing StepTwo can be restored from Temp or downloaded from GitHub.
+- [x] Recover-StepTwo downloads and parses fresh files before executing them.
+- [x] StepTwo removes task, RunOnce and Run entries only after writing its completion marker.
+- [x] StepOne forces a reboot if DDU returns without rebooting Windows.
+
 # Reliability8 code review checks
 
 ## Source-based design checks

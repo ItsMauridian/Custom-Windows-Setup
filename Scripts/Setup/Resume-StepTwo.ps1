@@ -1,5 +1,5 @@
 # SCRIPT RUN AS ADMIN
-# BUILD MARKER: reliability11 2026-07-10 - persistent DDU resume wrapper
+# BUILD MARKER: reliability12 2026-07-10 - isolated StepTwo child process
 $ErrorActionPreference = 'Stop'
 $workRoot = Join-Path $env:ProgramData 'ItsMauridian\Custom-Windows-Setup'
 $logPath = Join-Path $workRoot 'Resume-StepTwo.log'
@@ -126,8 +126,15 @@ try {
     }
 
     Set-Content -Path (Join-Path $workRoot 'StepTwo.started') -Value (Get-Date -Format o) -Encoding ASCII -Force
-    Write-CwsResumeLog "Starting StepTwo from $stepTwoPath"
-    & $stepTwoPath
+    Write-CwsResumeLog "Starting StepTwo in an isolated Windows PowerShell process from $stepTwoPath"
+
+    # Do not invoke StepTwo with the call operator. Preference variables such as
+    # ErrorActionPreference flow into child script scopes. The wrapper uses Stop
+    # for its own reliability, while StepTwo contains many best-effort native
+    # commands that must use the normal Windows PowerShell Continue behavior.
+    $stepTwoArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$stepTwoPath`""
+    $stepTwoProcess = Start-Process -FilePath $powerShellPath -ArgumentList $stepTwoArguments -NoNewWindow -Wait -PassThru -ErrorAction Stop
+    Write-CwsResumeLog ("StepTwo process exited with code {0}." -f $stepTwoProcess.ExitCode)
     Write-CwsResumeLog 'StepTwo returned to the resume wrapper.'
     if (Test-Path -LiteralPath $completedMarker) {
         Remove-CwsResumeHandoff

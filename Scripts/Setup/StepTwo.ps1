@@ -1,10 +1,16 @@
 # SCRIPT RUN AS ADMIN
-# BUILD MARKER: reliability9 2026-07-10 - verified Store recovery, guarded AppX, WinGet, GPU, power and logging
+# BUILD MARKER: reliability12 2026-07-10 - isolated StepTwo process and PowerShell 5.1 native-command safety
 If (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]"Administrator")) {
     Write-Host "Run this from an elevated Administrator PowerShell window." -ForegroundColor Red
     Pause
     Exit 1
 }
+# StepTwo is a best-effort configuration script. It deliberately handles optional
+# Windows components itself instead of inheriting a caller-wide Stop preference.
+# This is especially important in Windows PowerShell 5.1, where native stderr
+# redirected with 2>&1 can become an ErrorRecord even when the native command succeeds.
+$ErrorActionPreference = 'Continue'
+
 $Host.UI.RawUI.WindowTitle = $myInvocation.MyCommand.Definition + " (Administrator)"
 $Host.UI.RawUI.BackgroundColor = "Black"
 $Host.PrivateData.ProgressBackgroundColor = "Black"
@@ -71,7 +77,7 @@ function Remove-CwsPathIfPresent {
                 Remove-Item -LiteralPath $LiteralPath -Force -ErrorAction Stop
             }
         } catch {
-            Add-CwsWarning "Could not remove ${LiteralPath}: $($_.Exception.Message)"
+            Add-CwsWarning ("Could not remove {0}: {1}" -f $LiteralPath, $_.Exception.Message)
         }
     }
 }
@@ -79,6 +85,19 @@ function Remove-CwsPathIfPresent {
 function Stop-CwsProcessIfPresent {
     param([Parameter(Mandatory)][string]$Name)
     Get-Process -Name $Name -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+}
+
+function Invoke-CwsRegExe {
+    param([Parameter(Mandatory)][string]$Arguments)
+
+    try {
+        $regProcess = Start-Process -FilePath "$env:SystemRoot\System32\reg.exe" `
+            -ArgumentList $Arguments -WindowStyle Hidden -Wait -PassThru -ErrorAction Stop
+        return [int]$regProcess.ExitCode
+    } catch {
+        Add-CwsWarning ("reg.exe could not be started: {0}" -f $_.Exception.Message)
+        return -1
+    }
 }
 
 function Set-CwsPowerSetting {
@@ -360,14 +379,25 @@ Set-Content -Path "$env:SystemRoot\Temp\WindowsStore.reg" -Value $storesettings 
 $settingsdat = "$env:LocalAppData\Packages\Microsoft.WindowsStore_8wekyb3d8bbwe\Settings\settings.dat"
 $regfilewindowsstore = "$env:SystemRoot\Temp\WindowsStore.reg"
 
-# Load and edit the Store settings hive only when it already exists.
+# Load and edit the Store settings hive only when it already exists. Use
+# Start-Process instead of native stream redirection so Windows PowerShell 5.1
+# cannot turn harmless reg.exe stderr text into a terminating ErrorRecord.
 if (Test-Path -LiteralPath $settingsdat) {
-    reg load "HKLM\Settings" $settingsdat >$null 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        reg import $regfilewindowsstore >$null 2>&1
-        [gc]::Collect()
-        Start-Sleep -Seconds 2
-        reg unload "HKLM\Settings" >$null 2>&1
+    $loadExitCode = Invoke-CwsRegExe -Arguments ("load `"HKLM\Settings`" `"{0}`"" -f $settingsdat)
+    if ($loadExitCode -eq 0) {
+        try {
+            $importExitCode = Invoke-CwsRegExe -Arguments ("import `"{0}`"" -f $regfilewindowsstore)
+            if ($importExitCode -ne 0) {
+                Add-CwsNote "Microsoft Store preference import was skipped because reg.exe returned exit code $importExitCode."
+            }
+        } finally {
+            [gc]::Collect()
+            Start-Sleep -Seconds 2
+            $unloadExitCode = Invoke-CwsRegExe -Arguments 'unload "HKLM\Settings"'
+            if ($unloadExitCode -ne 0) {
+                Add-CwsWarning "The temporary Microsoft Store registry hive could not be unloaded cleanly. reg.exe exit code: $unloadExitCode."
+            }
+        }
     } else {
         Add-CwsNote 'The Microsoft Store settings hive was busy or unavailable, so Store preference edits were skipped.'
     }
@@ -4412,7 +4442,14 @@ if ($fatalErrors.Count -gt 0) {
 
 $logContent | Out-File -FilePath $logPath -Encoding UTF8 -Force
 
+$cwsWorkRoot = Join-Path $env:ProgramData 'ItsMauridian\Custom-Windows-Setup'
+try { Set-Content -Path (Join-Path $cwsWorkRoot 'StepTwo.completed') -Value (Get-Date -Format o) -Encoding ASCII -Force } catch { }
+try { Unregister-ScheduledTask -TaskName 'ItsMauridian-Custom-Windows-Setup-StepTwo' -TaskPath '\ItsMauridian\' -Confirm:$false -ErrorAction SilentlyContinue } catch { }
 try { Unregister-ScheduledTask -TaskName 'ItsMauridian-Custom-Windows-Setup-StepTwo' -Confirm:$false -ErrorAction SilentlyContinue } catch { }
+try { Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' -Name '!ItsMauridian-StepTwo' -ErrorAction SilentlyContinue } catch { }
+try { Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -Name 'ItsMauridian-StepTwoResume' -ErrorAction SilentlyContinue } catch { }
+try { Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' -Name '!StepTwo' -ErrorAction SilentlyContinue } catch { }
+try { Remove-ItemProperty -Path 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' -Name '!StepTwo' -ErrorAction SilentlyContinue } catch { }
 try { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null } catch { }
 
 # restart

@@ -1,5 +1,5 @@
 # SCRIPT RUN AS ADMIN
-# BUILD MARKER: reliability11 2026-07-10 - one-command StepTwo recovery
+# BUILD MARKER: reliability12 2026-07-10 - one-command isolated StepTwo recovery
 $ErrorActionPreference = 'Stop'
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
@@ -20,9 +20,14 @@ $stamp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 
 New-Item -Path $workRoot -ItemType Directory -Force | Out-Null
 
-# Ensure the next restart is a normal Windows boot. It is harmless when no
-# safeboot value is present.
-& "$env:SystemRoot\System32\bcdedit.exe" /deletevalue '{current}' safeboot 2>$null | Out-Null
+# Ensure the next restart is a normal Windows boot. A missing safeboot value is
+# expected and is ignored. Start-Process prevents Windows PowerShell 5.1 from
+# converting native stderr into a terminating ErrorRecord under Stop.
+try {
+    $null = Start-Process -FilePath "$env:SystemRoot\System32\bcdedit.exe" `
+        -ArgumentList @('/deletevalue', '{current}', 'safeboot') `
+        -WindowStyle Hidden -Wait -PassThru -ErrorAction Stop
+} catch { }
 
 $downloads = @(
     @{ Uri = "$rawBase/Scripts/Setup/StepTwo.ps1?nocache=$stamp"; Path = $stepTwoPath },
@@ -47,13 +52,19 @@ foreach ($scriptPath in @($stepTwoPath, $resumePath)) {
     }
 }
 
-if (-not (Select-String -Path $stepTwoPath -Pattern 'BUILD MARKER: reliability11' -Quiet)) {
-    throw 'GitHub is not serving the reliability11 StepTwo.ps1 file yet.'
+if (-not (Select-String -Path $stepTwoPath -Pattern 'BUILD MARKER: reliability12' -Quiet)) {
+    throw 'GitHub is not serving the reliability12 StepTwo.ps1 file yet.'
 }
-if (-not (Select-String -Path $resumePath -Pattern 'BUILD MARKER: reliability11' -Quiet)) {
-    throw 'GitHub is not serving the reliability11 Resume-StepTwo.ps1 file yet.'
+if (-not (Select-String -Path $resumePath -Pattern 'BUILD MARKER: reliability12' -Quiet)) {
+    throw 'GitHub is not serving the reliability12 Resume-StepTwo.ps1 file yet.'
 }
 
 Remove-Item -LiteralPath (Join-Path $workRoot 'StepTwo.completed') -Force -ErrorAction SilentlyContinue
 Write-Host 'Recovery files downloaded and validated. Starting StepTwo now.' -ForegroundColor Green
-& $resumePath
+
+$powerShellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$resumeArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$resumePath`""
+$resumeProcess = Start-Process -FilePath $powerShellPath -ArgumentList $resumeArguments -NoNewWindow -Wait -PassThru -ErrorAction Stop
+if ($resumeProcess.ExitCode -ne 0) {
+    throw "The StepTwo resume process exited with code $($resumeProcess.ExitCode)."
+}
