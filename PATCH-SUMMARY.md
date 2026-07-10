@@ -1,5 +1,14 @@
 # Reliability 12 patch
 
+## Reliability13
+
+- Replaced the old VCLibs/UI.Xaml/App Installer bootstrap sequence with Microsoft's documented `Repair-WinGetPackageManager` flow.
+- Added a bounded fallback that installs signed Windows App Runtime 1.8 before the current App Installer bundle.
+- Treats already-newer VCLibs and UI.Xaml packages as healthy instead of attempting downgrades.
+- Replaced unsafe `Get-ItemPropertyValue` display-scaling reads in StepTwo and the standalone GPU script.
+- WinGet repair has a 10-minute timeout and StepTwo continues safely if repair is unavailable.
+
+
 - Fixed preference-variable leakage from `Resume-StepTwo.ps1` into `StepTwo.ps1`.
 - StepTwo now runs in a separate Windows PowerShell process after DDU.
 - StepTwo explicitly sets `$ErrorActionPreference = 'Continue'`.
@@ -57,7 +66,7 @@ This build is based on the completed Windows 11 VM and laptop test logs from 10 
 ## Build marker
 
 ```text
-# BUILD MARKER: reliability12 2026-07-10 - persistent DDU resume handoff and recovery
+# BUILD MARKER: reliability13 2026-07-10 - persistent DDU resume handoff and recovery
 ```
 
 ## Reliability9 Store verification

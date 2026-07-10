@@ -1,6 +1,6 @@
 # ==============================================================================
 # WinSux - Forked & Modified by Mauridian (ItsMauridian)
-# BUILD MARKER: reliability12 2026-07-10 - persistent DDU resume handoff
+# BUILD MARKER: reliability13 2026-07-10 - persistent DDU resume handoff
 # Repo: https://github.com/ItsMauridian/Custom-Windows-Setup
 # Run: iwr https://winsetup.tsql.gg -useb | iex
 #
@@ -512,11 +512,11 @@ Save-CwsRepoFile -RelativePath "Scripts/Setup/Resume-StepTwo.ps1" -Destination $
 foreach ($scriptPath in @($CwsStepOnePath, $CwsStepTwoPath, $CwsResumePath)) {
     Assert-CwsPowerShellSyntax -Path $scriptPath
 }
-if (-not (Select-String -Path $CwsStepTwoPath -Pattern 'BUILD MARKER: reliability12' -Quiet)) {
-    throw 'The downloaded StepTwo.ps1 is not the reliability12 build.'
+if (-not (Select-String -Path $CwsStepTwoPath -Pattern 'BUILD MARKER: reliability13' -Quiet)) {
+    throw 'The downloaded StepTwo.ps1 is not the reliability13 build.'
 }
-if (-not (Select-String -Path $CwsResumePath -Pattern 'BUILD MARKER: reliability12' -Quiet)) {
-    throw 'The downloaded Resume-StepTwo.ps1 is not the reliability12 build.'
+if (-not (Select-String -Path $CwsResumePath -Pattern 'BUILD MARKER: reliability13' -Quiet)) {
+    throw 'The downloaded Resume-StepTwo.ps1 is not the reliability13 build.'
 }
 Write-Host "DDU continuation scripts validated successfully.`n" -ForegroundColor Green
 

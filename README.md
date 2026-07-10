@@ -1,5 +1,10 @@
 # Reliability 12
 
+## Reliability13 WinGet and GPU recovery
+
+Reliability13 replaces the fragile manual WinGet dependency sequence with Microsoft's documented `Microsoft.WinGet.Client` and `Repair-WinGetPackageManager` route. If that route is unavailable, the script installs the signed Windows App Runtime 1.8 installer before the current App Installer bundle. Display scaling registry values are now checked without `Get-ItemPropertyValue`, so a missing `Scaling` property cannot terminate StepTwo.
+
+
 Reliability 12 fixes the post-DDU StepTwo failure seen in Windows PowerShell 5.1. The resume wrapper no longer invokes StepTwo inside its own `ErrorActionPreference = Stop` scope. It starts StepTwo as a separate Windows PowerShell process, and StepTwo explicitly uses the normal `Continue` preference for best-effort native commands. Recovery also runs `bcdedit.exe` through `Start-Process`, so an absent safeboot value cannot become a false terminating error.
 
 # Custom Windows Setup
@@ -368,7 +373,7 @@ Brave Origin unattended install is intentionally skipped. The script creates an 
 
 ## Current patch note
 
-The current build marker in `Scripts/Setup/StepTwo.ps1` is `reliability12 2026-07-10`. Use this marker to verify that GitHub raw is serving the current file before testing.
+The current build marker in `Scripts/Setup/StepTwo.ps1` is `reliability13 2026-07-10`. Use this marker to verify that GitHub raw is serving the current file before testing.
 
 ## Technical references
 
@@ -412,4 +417,4 @@ Do not rerun DDU or the main setup. Upload the current repository files, open Ad
 iwr "https://raw.githubusercontent.com/ItsMauridian/Custom-Windows-Setup/main/Scripts/Setup/Recover-StepTwo.ps1?nocache=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" -UseBasicParsing | iex
 ```
 
-The recovery script removes any leftover Safe Mode boot value, downloads fresh reliability12 copies of StepTwo and the resume wrapper, parses both files, and starts StepTwo.
+The recovery script removes any leftover Safe Mode boot value, downloads fresh reliability13 copies of StepTwo and the resume wrapper, parses both files, and starts StepTwo.

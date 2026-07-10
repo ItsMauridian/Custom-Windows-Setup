@@ -1,5 +1,5 @@
 # SCRIPT RUN AS ADMIN
-# BUILD MARKER: reliability12 2026-07-10 - isolated StepTwo process and PowerShell 5.1 native-command safety
+# BUILD MARKER: reliability13 2026-07-10 - official WinGet repair, runtime fallback and safe display scaling
 If (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]"Administrator")) {
     Write-Host "Run this from an elevated Administrator PowerShell window." -ForegroundColor Red
     Pause
@@ -2838,11 +2838,13 @@ function Get-WinGetExePath {
 
     foreach ($candidate in ($candidates | Select-Object -Unique)) {
         if (-not (Test-Path -LiteralPath $candidate)) { continue }
-        $versionOutput = & $candidate --version 2>&1
-        $exitCode = $LASTEXITCODE
-        if ($exitCode -eq 0 -and ($versionOutput -match '\d+\.\d+')) {
-            return $candidate
-        }
+        try {
+            $versionOutput = & $candidate --version 2>&1
+            $exitCode = [int]$LASTEXITCODE
+            if ($exitCode -eq 0 -and (($versionOutput | Out-String) -match '\d+\.\d+')) {
+                return $candidate
+            }
+        } catch { }
     }
     return $null
 }
@@ -2857,44 +2859,111 @@ function Register-CwsWinGetForCurrentUser {
     }
 }
 
-function Install-CwsWinGetBootstrap {
+function Repair-CwsWinGetWithOfficialModule {
+    $repairScriptPath = Join-Path $env:SystemRoot 'Temp\CWS-Repair-WinGet.ps1'
+    $repairScript = @'
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+Install-PackageProvider -Name NuGet -Force | Out-Null
+if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+    Register-PSRepository -Default
+}
+Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+Install-Module -Name Microsoft.WinGet.Client -Force -Repository PSGallery -Scope AllUsers -AllowClobber -Confirm:$false
+Import-Module Microsoft.WinGet.Client -Force
+Repair-WinGetPackageManager -AllUsers -Force -Latest
+'@
+
+    try {
+        Set-Content -LiteralPath $repairScriptPath -Value $repairScript -Encoding UTF8 -Force
+        Write-Host 'Trying Microsoft official Repair-WinGetPackageManager method. This can take several minutes...'
+        $repairExit = Invoke-CwsProcessWithTimeout `
+            -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+            -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $repairScriptPath) `
+            -TimeoutSeconds 600
+        if ($repairExit -notin @(0, 3010)) {
+            Add-CwsWarning "Official WinGet repair returned exit code $repairExit. Trying the signed runtime fallback."
+            return $false
+        }
+        Start-Sleep -Seconds 5
+        return [bool](Get-WinGetExePath)
+    } catch {
+        Add-CwsWarning ("Official WinGet repair failed: {0}" -f $_.Exception.Message)
+        return $false
+    } finally {
+        Remove-Item -LiteralPath $repairScriptPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Install-CwsWindowsAppRuntime18 {
     $bootstrapDir = Join-Path $env:SystemRoot 'Temp\CWS-WinGet'
     New-Item -Path $bootstrapDir -ItemType Directory -Force | Out-Null
 
-    $vclibsPath = Join-Path $bootstrapDir 'Microsoft.VCLibs.x64.14.00.Desktop.appx'
-    $uiXamlNuget = Join-Path $bootstrapDir 'Microsoft.UI.Xaml.2.8.7.zip'
-    $uiXamlExtract = Join-Path $bootstrapDir 'Microsoft.UI.Xaml.2.8.7'
+    $architecture = switch ($env:PROCESSOR_ARCHITECTURE.ToUpperInvariant()) {
+        'ARM64' { 'arm64' }
+        'X86'   { 'x86' }
+        default { 'x64' }
+    }
+    $runtimeInstaller = Join-Path $bootstrapDir "WindowsAppRuntimeInstall-$architecture.exe"
+    $runtimeUri = "https://aka.ms/windowsappsdk/1.8/1.8.260529003/windowsappruntimeinstall-$architecture.exe"
+
+    try {
+        Write-Host "Downloading the signed Windows App Runtime 1.8 installer for $architecture..."
+        Invoke-WebRequest -Uri $runtimeUri -UseBasicParsing -OutFile $runtimeInstaller -ErrorAction Stop
+        $runtimeExit = Invoke-CwsProcessWithTimeout -FilePath $runtimeInstaller -TimeoutSeconds 300 -Hidden
+        if ($runtimeExit -notin @(0, 3010)) {
+            Add-CwsWarning "Windows App Runtime 1.8 installer returned exit code $runtimeExit."
+            return $false
+        }
+        Start-Sleep -Seconds 3
+        $runtimePackage = Get-AppxPackage -AllUsers -Name 'Microsoft.WindowsAppRuntime.1.8' -ErrorAction SilentlyContinue |
+            Sort-Object Version -Descending | Select-Object -First 1
+        if (-not $runtimePackage) {
+            Add-CwsWarning 'Windows App Runtime 1.8 was not detected after its installer completed.'
+            return $false
+        }
+        Add-CwsNote "Windows App Runtime 1.8 detected: $($runtimePackage.Version)."
+        return $true
+    } catch {
+        Add-CwsWarning ("Windows App Runtime 1.8 installation failed: {0}" -f $_.Exception.Message)
+        return $false
+    }
+}
+
+function Install-CwsAppInstallerBundle {
+    $bootstrapDir = Join-Path $env:SystemRoot 'Temp\CWS-WinGet'
+    New-Item -Path $bootstrapDir -ItemType Directory -Force | Out-Null
     $appInstallerPath = Join-Path $bootstrapDir 'Microsoft.DesktopAppInstaller.msixbundle'
 
     try {
-        Write-Host 'Downloading signed App Installer dependencies from Microsoft and NuGet...'
-        Invoke-WebRequest -Uri 'https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx' -UseBasicParsing -OutFile $vclibsPath -ErrorAction Stop
-        Invoke-WebRequest -Uri 'https://www.nuget.org/api/v2/package/Microsoft.UI.Xaml/2.8.7' -UseBasicParsing -OutFile $uiXamlNuget -ErrorAction Stop
+        Write-Host 'Downloading the current signed App Installer bundle from Microsoft...'
         Invoke-WebRequest -Uri 'https://aka.ms/getwinget' -UseBasicParsing -OutFile $appInstallerPath -ErrorAction Stop
-
-        Remove-CwsPathIfPresent -LiteralPath $uiXamlExtract -Recurse
-        Expand-Archive -Path $uiXamlNuget -DestinationPath $uiXamlExtract -Force
-        $uiXamlPath = Get-ChildItem -Path $uiXamlExtract -Recurse -Filter 'Microsoft.UI.Xaml.2.8.appx' -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1
-
-        try { Add-AppxPackage -Path $vclibsPath -ErrorAction Stop } catch { Add-CwsWarning "VCLibs bootstrap: $($_.Exception.Message)" }
-        if ($uiXamlPath) {
-            try { Add-AppxPackage -Path $uiXamlPath.FullName -ErrorAction Stop } catch { Add-CwsWarning "UI.Xaml bootstrap: $($_.Exception.Message)" }
-        }
-        Add-AppxPackage -Path $appInstallerPath -ErrorAction Stop
+        Add-AppxPackage -Path $appInstallerPath -ForceApplicationShutdown -ErrorAction Stop
         Register-CwsWinGetForCurrentUser | Out-Null
         Start-Sleep -Seconds 5
-        return $true
+        return [bool](Get-WinGetExePath)
     } catch {
-        Add-CwsWarning "App Installer bootstrap failed: $($_.Exception.Message)"
+        Add-CwsWarning ("App Installer bundle installation failed: {0}" -f $_.Exception.Message)
         return $false
     }
+}
+
+function Install-CwsWinGetBootstrap {
+    # Microsoft documents Repair-WinGetPackageManager as the supported repair/bootstrap path.
+    if (Repair-CwsWinGetWithOfficialModule) { return $true }
+
+    # Current App Installer packages depend on Windows App Runtime 1.8. Install that
+    # signed Microsoft runtime first, then install the current App Installer bundle.
+    if (-not (Install-CwsWindowsAppRuntime18)) { return $false }
+    return (Install-CwsAppInstallerBundle)
 }
 
 Register-CwsWinGetForCurrentUser | Out-Null
 $script:wingetExe = Get-WinGetExePath
 if (-not $script:wingetExe) {
-    Write-Host "WinGet was not registered. Bootstrapping App Installer...`n" -ForegroundColor Yellow
+    Write-Host "WinGet is missing. Starting the supported repair/bootstrap sequence...`n" -ForegroundColor Yellow
     Install-CwsWinGetBootstrap | Out-Null
     $script:wingetExe = Get-WinGetExePath
 }
@@ -2903,11 +2972,11 @@ $wingetWorks = [bool]$script:wingetExe
 if ($wingetWorks) {
     Write-Host "Using WinGet: $script:wingetExe`n" -ForegroundColor Green
     $sourceOutput = & $script:wingetExe source update --disable-interactivity 2>&1
-    $sourceExit = $LASTEXITCODE
+    $sourceExit = [int]$LASTEXITCODE
     $sourceOutput | ForEach-Object { Write-Host $_ }
     if ($sourceExit -ne 0) { Add-CwsWarning "WinGet source update returned exit code $sourceExit." }
 } else {
-    Add-CwsWarning 'WinGet could not be resolved after App Installer registration and bootstrap. App installs will be skipped.'
+    Add-CwsWarning 'WinGet could not be repaired. App installs were skipped, but the rest of StepTwo will continue.'
 }
 
 function Invoke-CwsWinGetInstall {
@@ -3278,8 +3347,12 @@ cmd /c "reg add `"HKLM\SYSTEM\CurrentControlSet\Services\nvlddmkm\Parameters\FTS
 # turn on no scaling for all displays
 $configKeys = Get-ChildItem -Path "HKLM:\System\CurrentControlSet\Control\GraphicsDrivers\Configuration" -Recurse -ErrorAction SilentlyContinue
 foreach ($key in $configKeys) {
-$scalingValue = Get-ItemPropertyValue -Path $key.PSPath -Name 'Scaling' -ErrorAction SilentlyContinue
-if ($null -ne $scalingValue) {
+try {
+$scalingProperties = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
+} catch {
+continue
+}
+if ($scalingProperties.PSObject.Properties.Name -contains 'Scaling') {
 $regPath = $key.PSPath.Replace('Microsoft.PowerShell.Core\Registry::', '').Replace('HKEY_LOCAL_MACHINE', 'HKLM')
 Run-Trusted -command "reg add `"$regPath`" /v `"Scaling`" /t REG_DWORD /d `"2`" /f"
 }
@@ -3934,8 +4007,12 @@ cmd /c "reg add `"$regPath`" /v `"AutoColorManagementSupported`" /t REG_DWORD /d
 # turn on no scaling for all displays
 $configKeys = Get-ChildItem -Path "HKLM:\System\CurrentControlSet\Control\GraphicsDrivers\Configuration" -Recurse -ErrorAction SilentlyContinue
 foreach ($key in $configKeys) {
-$scalingValue = Get-ItemPropertyValue -Path $key.PSPath -Name 'Scaling' -ErrorAction SilentlyContinue
-if ($null -ne $scalingValue) {
+try {
+$scalingProperties = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
+} catch {
+continue
+}
+if ($scalingProperties.PSObject.Properties.Name -contains 'Scaling') {
 $regPath = $key.PSPath.Replace('Microsoft.PowerShell.Core\Registry::', '').Replace('HKEY_LOCAL_MACHINE', 'HKLM')
 Run-Trusted -command "reg add `"$regPath`" /v `"Scaling`" /t REG_DWORD /d `"2`" /f"
 }

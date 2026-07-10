@@ -2,7 +2,7 @@
 
 Required checks for this build:
 
-- `StepTwo.ps1` has the reliability12 marker and explicitly sets `$ErrorActionPreference = 'Continue'`.
+- `StepTwo.ps1` has the reliability13 marker and explicitly sets `$ErrorActionPreference = 'Continue'`.
 - `Resume-StepTwo.ps1` starts a separate `powershell.exe` process and does not call `& $stepTwoPath`.
 - `Recover-StepTwo.ps1` does not directly redirect `bcdedit.exe` stderr under a Stop preference.
 - All PowerShell files pass parser validation.
@@ -76,3 +76,10 @@ A real Windows rerun is still required to validate OS servicing, Store access, h
 - Confirmed `wsreset.exe -i` is bounded by a 180-second timeout.
 - Confirmed StepTwo verifies Microsoft Store and Desktop App Installer after Store recovery.
 - Confirmed a missing Store package does not prevent the separate WinGet bootstrap.
+
+## Reliability13 checks
+
+- Official WinGet repair command is present and bounded by a timeout.
+- Windows App Runtime 1.8 signed installer fallback precedes App Installer installation.
+- The obsolete fixed VCLibs/UI.Xaml dependency downloads are absent.
+- No active `Get-ItemPropertyValue` lookup is used for display `Scaling`.

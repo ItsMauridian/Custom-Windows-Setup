@@ -1,5 +1,5 @@
 # SCRIPT RUN AS ADMIN
-# BUILD MARKER: reliability12 2026-07-10 - one-command isolated StepTwo recovery
+# BUILD MARKER: reliability13 2026-07-10 - one-command isolated StepTwo recovery
 $ErrorActionPreference = 'Stop'
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
@@ -52,11 +52,11 @@ foreach ($scriptPath in @($stepTwoPath, $resumePath)) {
     }
 }
 
-if (-not (Select-String -Path $stepTwoPath -Pattern 'BUILD MARKER: reliability12' -Quiet)) {
-    throw 'GitHub is not serving the reliability12 StepTwo.ps1 file yet.'
+if (-not (Select-String -Path $stepTwoPath -Pattern 'BUILD MARKER: reliability13' -Quiet)) {
+    throw 'GitHub is not serving the reliability13 StepTwo.ps1 file yet.'
 }
-if (-not (Select-String -Path $resumePath -Pattern 'BUILD MARKER: reliability12' -Quiet)) {
-    throw 'GitHub is not serving the reliability12 Resume-StepTwo.ps1 file yet.'
+if (-not (Select-String -Path $resumePath -Pattern 'BUILD MARKER: reliability13' -Quiet)) {
+    throw 'GitHub is not serving the reliability13 Resume-StepTwo.ps1 file yet.'
 }
 
 Remove-Item -LiteralPath (Join-Path $workRoot 'StepTwo.completed') -Force -ErrorAction SilentlyContinue

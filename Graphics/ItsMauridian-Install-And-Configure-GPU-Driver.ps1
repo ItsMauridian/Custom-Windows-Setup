@@ -1,5 +1,5 @@
 # SCRIPT RUN AS ADMIN
-# BUILD MARKER: reliability9 2026-07-10 - guarded driver downloads and WinGet handling
+# BUILD MARKER: reliability13 2026-07-10 - guarded driver downloads and safe display scaling
 If (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]"Administrator")) {
     Write-Host "Run this from an elevated Administrator PowerShell window." -ForegroundColor Red
     Pause
@@ -401,8 +401,12 @@ cmd /c "reg add `"HKLM\SYSTEM\CurrentControlSet\Services\nvlddmkm\Parameters\FTS
 # turn on no scaling for all displays
 $configKeys = Get-ChildItem -Path "HKLM:\System\CurrentControlSet\Control\GraphicsDrivers\Configuration" -Recurse -ErrorAction SilentlyContinue
 foreach ($key in $configKeys) {
-$scalingValue = Get-ItemPropertyValue -Path $key.PSPath -Name 'Scaling' -ErrorAction SilentlyContinue
-if ($null -ne $scalingValue) {
+try {
+$scalingProperties = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
+} catch {
+continue
+}
+if ($scalingProperties.PSObject.Properties.Name -contains 'Scaling') {
 $regPath = $key.PSPath.Replace('Microsoft.PowerShell.Core\Registry::', '').Replace('HKEY_LOCAL_MACHINE', 'HKLM')
 Run-Trusted -command "reg add `"$regPath`" /v `"Scaling`" /t REG_DWORD /d `"2`" /f"
 }
@@ -1042,8 +1046,12 @@ cmd /c "reg add `"$regPath`" /v `"AutoColorManagementSupported`" /t REG_DWORD /d
 # turn on no scaling for all displays
 $configKeys = Get-ChildItem -Path "HKLM:\System\CurrentControlSet\Control\GraphicsDrivers\Configuration" -Recurse -ErrorAction SilentlyContinue
 foreach ($key in $configKeys) {
-$scalingValue = Get-ItemPropertyValue -Path $key.PSPath -Name 'Scaling' -ErrorAction SilentlyContinue
-if ($null -ne $scalingValue) {
+try {
+$scalingProperties = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
+} catch {
+continue
+}
+if ($scalingProperties.PSObject.Properties.Name -contains 'Scaling') {
 $regPath = $key.PSPath.Replace('Microsoft.PowerShell.Core\Registry::', '').Replace('HKEY_LOCAL_MACHINE', 'HKLM')
 Run-Trusted -command "reg add `"$regPath`" /v `"Scaling`" /t REG_DWORD /d `"2`" /f"
 }

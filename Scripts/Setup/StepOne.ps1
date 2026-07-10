@@ -1,5 +1,5 @@
 # SCRIPT RUN AS ADMIN
-# BUILD MARKER: reliability12 2026-07-10 - validated isolated DDU restart handoff
+# BUILD MARKER: reliability13 2026-07-10 - validated isolated DDU restart handoff
 If (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]"Administrator")) {
     Write-Host "Run this from an elevated Administrator PowerShell window." -ForegroundColor Red
     Pause
