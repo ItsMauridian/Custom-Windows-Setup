@@ -1,4 +1,5 @@
 # SCRIPT RUN AS ADMIN
+# BUILD MARKER: reliability11 2026-07-10 - validated DDU restart handoff
 If (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]"Administrator")) {
     Write-Host "Run this from an elevated Administrator PowerShell window." -ForegroundColor Red
     Pause
@@ -145,4 +146,12 @@ cmd /c "bcdedit /deletevalue {current} safeboot >nul 2>&1"
 
 # uninstall soundblaster realtek intel amd nvidia drivers & restart
 $DduExePath = Get-CwsDduExecutable
-Start-Process -FilePath $DduExePath -ArgumentList "-CleanSoundBlaster -CleanRealtek -CleanAllGpus -Restart" -Wait
+$dduProcess = Start-Process -FilePath $DduExePath -ArgumentList "-CleanSoundBlaster -CleanRealtek -CleanAllGpus -Restart" -PassThru -Wait
+
+# Normally DDU restarts Windows itself. If it returns instead, force the normal
+# reboot so the already-registered StepTwo handoff can continue the setup.
+if ($dduProcess -and $dduProcess.ExitCode -ne 0) {
+    Write-Host ("DDU returned exit code {0}. Windows will still restart so setup can continue." -f $dduProcess.ExitCode) -ForegroundColor Yellow
+}
+Start-Sleep -Seconds 5
+shutdown.exe /r /t 0 /f

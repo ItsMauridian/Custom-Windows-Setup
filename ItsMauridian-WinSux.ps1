@@ -1,6 +1,6 @@
 # ==============================================================================
 # WinSux - Forked & Modified by Mauridian (ItsMauridian)
-# BUILD MARKER: reliability10 2026-07-10 - persistent DDU resume handoff
+# BUILD MARKER: reliability11 2026-07-10 - persistent DDU resume handoff
 # Repo: https://github.com/ItsMauridian/Custom-Windows-Setup
 # Run: iwr https://winsetup.tsql.gg -useb | iex
 #
@@ -268,6 +268,20 @@ function Save-CwsRepoFile {
     Get-FileFromWeb -URL $url -File $Destination
 }
 
+function Assert-CwsPowerShellSyntax {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $tokens = $null
+    $parseErrors = $null
+    [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tokens, [ref]$parseErrors) | Out-Null
+    if ($parseErrors.Count -gt 0) {
+        $details = ($parseErrors | ForEach-Object {
+            "Line $($_.Extent.StartLineNumber), column $($_.Extent.StartColumnNumber): $($_.Message)"
+        }) -join [Environment]::NewLine
+        throw ("PowerShell syntax validation failed for {0}:{1}{2}" -f $Path, [Environment]::NewLine, $details)
+    }
+}
+
 New-CwsRestorePoint -Description "Before Custom Windows Setup"
 
 # SCRIPT CHECK INTERNET
@@ -454,18 +468,29 @@ function Register-CwsStepTwoResumeHandoff {
         Write-Host "Scheduled Task resume registration failed. RunOnce remains available as fallback." -ForegroundColor Yellow
     }
 
-    # Always create an independent HKLM RunOnce fallback. A task can register
-    # successfully but still miss a logon trigger. The ! prefix tells Windows
-    # to remove the value after the command has run rather than before it starts.
+    # Add two independent registry fallbacks. RunOnce is the immediate handoff.
+    # Run is deliberately persistent until StepTwo marks completion, so a missed
+    # task trigger or failed elevation can recover automatically at the next sign-in.
+    $resumeCommand = "`"$powerShellPath`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Maximized -File `"$ResumeScriptPath`""
+
     try {
         $runOncePath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"
         New-Item -Path $runOncePath -Force | Out-Null
-        $runOnceCommand = "`"$powerShellPath`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Maximized -File `"$ResumeScriptPath`""
-        New-ItemProperty -Path $runOncePath -Name "!ItsMauridian-StepTwo" -PropertyType String -Value $runOnceCommand -Force | Out-Null
+        New-ItemProperty -Path $runOncePath -Name "!ItsMauridian-StepTwo" -PropertyType String -Value $resumeCommand -Force | Out-Null
         "[$(Get-Date -Format o)] HKLM RunOnce fallback registered." | Add-Content -Path $LogPath -Encoding UTF8
     } catch {
         "[$(Get-Date -Format o)] HKLM RunOnce registration failed: $($_.Exception.Message)" | Add-Content -Path $LogPath -Encoding UTF8
         Write-Host "RunOnce resume registration failed. See $LogPath" -ForegroundColor Yellow
+    }
+
+    try {
+        $runPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+        New-Item -Path $runPath -Force | Out-Null
+        New-ItemProperty -Path $runPath -Name "ItsMauridian-StepTwoResume" -PropertyType String -Value $resumeCommand -Force | Out-Null
+        "[$(Get-Date -Format o)] Persistent HKLM Run recovery fallback registered." | Add-Content -Path $LogPath -Encoding UTF8
+    } catch {
+        "[$(Get-Date -Format o)] HKLM Run recovery registration failed: $($_.Exception.Message)" | Add-Content -Path $LogPath -Encoding UTF8
+        Write-Host "Persistent resume fallback registration failed. See $LogPath" -ForegroundColor Yellow
     }
 }
 
@@ -481,6 +506,19 @@ New-Item -Path $CwsWorkRoot -ItemType Directory -Force | Out-Null
 Save-CwsRepoFile -RelativePath "Scripts/Setup/StepOne.ps1" -Destination $CwsStepOnePath
 Save-CwsRepoFile -RelativePath "Scripts/Setup/StepTwo.ps1" -Destination $CwsStepTwoPath
 Save-CwsRepoFile -RelativePath "Scripts/Setup/Resume-StepTwo.ps1" -Destination $CwsResumePath
+
+# Do not enter Safe Mode until every reboot-boundary script has passed the real
+# Windows PowerShell parser. This prevents a half-completed machine after DDU.
+foreach ($scriptPath in @($CwsStepOnePath, $CwsStepTwoPath, $CwsResumePath)) {
+    Assert-CwsPowerShellSyntax -Path $scriptPath
+}
+if (-not (Select-String -Path $CwsStepTwoPath -Pattern 'BUILD MARKER: reliability11' -Quiet)) {
+    throw 'The downloaded StepTwo.ps1 is not the reliability11 build.'
+}
+if (-not (Select-String -Path $CwsResumePath -Pattern 'BUILD MARKER: reliability11' -Quiet)) {
+    throw 'The downloaded Resume-StepTwo.ps1 is not the reliability11 build.'
+}
+Write-Host "DDU continuation scripts validated successfully.`n" -ForegroundColor Green
 
 # Keep compatibility copies for diagnostics and older recovery instructions.
 Copy-Item -Path $CwsStepOnePath -Destination "$env:SystemRoot\Temp\StepOne.ps1" -Force

@@ -322,6 +322,8 @@ Graphics/ItsMauridian-DDU-Manual-Uninstall-GPU-Drivers.ps1
 Graphics/ItsMauridian-Install-And-Configure-GPU-Driver.ps1
 Scripts/Setup/StepOne.ps1
 Scripts/Setup/StepTwo.ps1
+Scripts/Setup/Resume-StepTwo.ps1
+Scripts/Setup/Recover-StepTwo.ps1
 ```
 
 `ItsMauridian-WinSux.ps1` remains the entrypoint. When run from a local clone it copies the local StepOne and StepTwo files. When run through `iwr | iex` it downloads them from the GitHub raw base configured near the top of the script. The GPU helper scripts remain in `Graphics/` to match the repository layout and avoid duplicate copies.
@@ -362,7 +364,7 @@ Brave Origin unattended install is intentionally skipped. The script creates an 
 
 ## Current patch note
 
-The current build marker in `Scripts/Setup/StepTwo.ps1` is `reliability10 2026-07-10`. Use this marker to verify that GitHub raw is serving the current file before testing.
+The current build marker in `Scripts/Setup/StepTwo.ps1` is `reliability11 2026-07-10`. Use this marker to verify that GitHub raw is serving the current file before testing.
 
 ## Technical references
 
@@ -386,10 +388,11 @@ The DDU reboot handoff stores `StepOne.ps1`, `StepTwo.ps1` and `Resume-StepTwo.p
 C:\ProgramData\ItsMauridian\Custom-Windows-Setup
 ```
 
-StepTwo is resumed through two independent mechanisms:
+StepTwo is resumed through three independent mechanisms:
 
 - A highest-privilege Task Scheduler logon task.
-- An HKLM RunOnce fallback.
+- An HKLM RunOnce immediate fallback.
+- An HKLM Run recovery fallback that remains until StepTwo completes.
 
 The resume wrapper uses a global mutex, so both mechanisms cannot start StepTwo twice. It validates the PowerShell syntax before execution and downloads a fresh StepTwo copy from GitHub when the local copy is missing. Resume diagnostics are written to:
 
@@ -399,13 +402,10 @@ C:\ProgramData\ItsMauridian\Custom-Windows-Setup\Resume-StepTwo.log
 
 ### Recover an installation that stopped after DDU
 
-Do not rerun the main setup. Upload the current repository files, open Administrator PowerShell, and run:
+Do not rerun DDU or the main setup. Upload the current repository files, open Administrator PowerShell, and run:
 
 ```powershell
-$root = Join-Path $env:ProgramData 'ItsMauridian\Custom-Windows-Setup'
-New-Item -Path $root -ItemType Directory -Force | Out-Null
-cmd /c 'bcdedit /deletevalue {current} safeboot' 2>$null
-Invoke-WebRequest 'https://raw.githubusercontent.com/ItsMauridian/Custom-Windows-Setup/refs/heads/main/Scripts/Setup/StepTwo.ps1' -UseBasicParsing -OutFile (Join-Path $root 'StepTwo.ps1')
-Invoke-WebRequest 'https://raw.githubusercontent.com/ItsMauridian/Custom-Windows-Setup/refs/heads/main/Scripts/Setup/Resume-StepTwo.ps1' -UseBasicParsing -OutFile (Join-Path $root 'Resume-StepTwo.ps1')
-powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Maximized -File (Join-Path $root 'Resume-StepTwo.ps1')
+iwr "https://raw.githubusercontent.com/ItsMauridian/Custom-Windows-Setup/main/Scripts/Setup/Recover-StepTwo.ps1?nocache=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" -UseBasicParsing | iex
 ```
+
+The recovery script removes any leftover Safe Mode boot value, downloads fresh reliability11 copies of StepTwo and the resume wrapper, parses both files, and starts StepTwo.

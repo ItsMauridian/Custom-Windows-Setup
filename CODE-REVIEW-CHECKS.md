@@ -1,13 +1,17 @@
-# Reliability 10 resume checks
+# Reliability 11 resume and parser checks
 
+- [x] The `$LiteralPath:` interpolation parser bug is removed.
+- [x] StepOne, StepTwo and Resume-StepTwo are parsed before Safe Mode is enabled.
 - [x] Critical reboot handoff files are stored under ProgramData, not only Windows Temp.
 - [x] Scheduled task registration is verified after creation.
-- [x] HKLM RunOnce is always registered as an independent fallback.
-- [x] Resume wrapper blocks Safe Mode execution.
+- [x] HKLM RunOnce is registered as an immediate fallback.
+- [x] HKLM Run is registered as a persistent recovery fallback until completion.
+- [x] Resume wrapper blocks execution while Safe Mode is still active.
 - [x] Resume wrapper prevents duplicate execution with a global mutex.
 - [x] Missing StepTwo can be restored from Temp or downloaded from GitHub.
-- [x] StepTwo syntax is parsed before execution.
-- [x] Resume mechanisms are removed only after StepTwo completes.
+- [x] Recover-StepTwo downloads and parses fresh files before executing them.
+- [x] StepTwo removes task, RunOnce and Run entries only after writing its completion marker.
+- [x] StepOne forces a reboot if DDU returns without rebooting Windows.
 
 # Reliability8 code review checks
 

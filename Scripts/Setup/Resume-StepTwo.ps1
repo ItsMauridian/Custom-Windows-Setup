@@ -1,5 +1,5 @@
 # SCRIPT RUN AS ADMIN
-# BUILD MARKER: reliability10 2026-07-10 - persistent DDU resume wrapper
+# BUILD MARKER: reliability11 2026-07-10 - persistent DDU resume wrapper
 $ErrorActionPreference = 'Stop'
 $workRoot = Join-Path $env:ProgramData 'ItsMauridian\Custom-Windows-Setup'
 $logPath = Join-Path $workRoot 'Resume-StepTwo.log'
@@ -14,6 +14,24 @@ function Write-CwsResumeLog {
     $line = "[$(Get-Date -Format o)] $Message"
     Add-Content -Path $logPath -Value $line -Encoding UTF8
     Write-Host $Message
+}
+
+function Remove-CwsResumeHandoff {
+    $taskName = 'ItsMauridian-Custom-Windows-Setup-StepTwo'
+    try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch { }
+    try { Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' -Name '!ItsMauridian-StepTwo' -ErrorAction SilentlyContinue } catch { }
+    try { Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -Name 'ItsMauridian-StepTwoResume' -ErrorAction SilentlyContinue } catch { }
+}
+
+function Ensure-CwsRegistryFallbacks {
+    $resumeCommand = "`"$powerShellPath`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Maximized -File `"$PSCommandPath`""
+    try {
+        $runPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run'
+        New-Item -Path $runPath -Force | Out-Null
+        New-ItemProperty -Path $runPath -Name 'ItsMauridian-StepTwoResume' -PropertyType String -Value $resumeCommand -Force | Out-Null
+    } catch {
+        Write-CwsResumeLog ("Could not refresh the persistent resume fallback: {0}" -f $_.Exception.Message)
+    }
 }
 
 function Ensure-CwsRetryTask {
@@ -50,7 +68,15 @@ if (-not $isAdmin) {
     exit 0
 }
 
+$completedMarker = Join-Path $workRoot 'StepTwo.completed'
+if (Test-Path -LiteralPath $completedMarker) {
+    Remove-CwsResumeHandoff
+    Write-CwsResumeLog 'StepTwo was already completed. Removed stale resume entries.'
+    exit 0
+}
+
 Ensure-CwsRetryTask
+Ensure-CwsRegistryFallbacks
 
 $createdNew = $false
 $mutex = New-Object System.Threading.Mutex($true, 'Global\ItsMauridian-CWS-StepTwo', [ref]$createdNew)
@@ -103,6 +129,12 @@ try {
     Write-CwsResumeLog "Starting StepTwo from $stepTwoPath"
     & $stepTwoPath
     Write-CwsResumeLog 'StepTwo returned to the resume wrapper.'
+    if (Test-Path -LiteralPath $completedMarker) {
+        Remove-CwsResumeHandoff
+        Write-CwsResumeLog 'StepTwo completed and all resume entries were removed.'
+    } else {
+        Write-CwsResumeLog 'StepTwo returned without creating its completion marker. Resume entries remain enabled.'
+    }
 } catch {
     Write-CwsResumeLog "StepTwo resume failed: $($_.Exception.Message)"
     Write-Host ''
