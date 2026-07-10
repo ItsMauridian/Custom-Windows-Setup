@@ -1,6 +1,5 @@
 # ==============================================================================
 # WinSux - Forked & Modified by Mauridian (ItsMauridian)
-# BUILD MARKER: reliability11 2026-07-10 - persistent DDU resume handoff
 # Repo: https://github.com/ItsMauridian/Custom-Windows-Setup
 # Run: iwr https://winsetup.tsql.gg -useb | iex
 #
@@ -76,7 +75,7 @@ If (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]:
     Pause
     Exit 1
 }
-$Host.UI.RawUI.WindowTitle = $myInvocation.MyCommand.Definition + " (Administrator)"
+$Host.UI.RawUI.WindowTitle = "Custom Windows Setup (Administrator)"
 $Host.UI.RawUI.BackgroundColor = "Black"
 $Host.PrivateData.ProgressBackgroundColor = "Black"
 $Host.PrivateData.ProgressForegroundColor = "White"
@@ -268,20 +267,6 @@ function Save-CwsRepoFile {
     Get-FileFromWeb -URL $url -File $Destination
 }
 
-function Assert-CwsPowerShellSyntax {
-    param([Parameter(Mandatory)][string]$Path)
-
-    $tokens = $null
-    $parseErrors = $null
-    [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tokens, [ref]$parseErrors) | Out-Null
-    if ($parseErrors.Count -gt 0) {
-        $details = ($parseErrors | ForEach-Object {
-            "Line $($_.Extent.StartLineNumber), column $($_.Extent.StartColumnNumber): $($_.Message)"
-        }) -join [Environment]::NewLine
-        throw ("PowerShell syntax validation failed for {0}:{1}{2}" -f $Path, [Environment]::NewLine, $details)
-    }
-}
-
 New-CwsRestorePoint -Description "Before Custom Windows Setup"
 
 # SCRIPT CHECK INTERNET
@@ -434,109 +419,49 @@ Get-FileFromWeb -URL $CwsDependencies.DirectX.Url -File $CwsDependencies.DirectX
 Start-Process -Wait "$env:SystemRoot\Temp\DirectX\DXSETUP.exe" -ArgumentList "/silent" -WindowStyle Hidden
 
 
-function Register-CwsStepTwoResumeHandoff {
-    param(
-        [Parameter(Mandatory)][string]$ResumeScriptPath,
-        [Parameter(Mandatory)][string]$LogPath
-    )
-
+function Register-CwsStepTwoResumeTask {
     $taskName = "ItsMauridian-Custom-Windows-Setup-StepTwo"
-    $powerShellPath = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-    $argument = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Maximized -File `"$ResumeScriptPath`""
+    $stepTwoPath = "$env:SystemRoot\Temp\StepTwo.ps1"
+    $argument = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Maximized -File `"$stepTwoPath`""
 
     try {
-        New-Item -Path (Split-Path -Path $LogPath -Parent) -ItemType Directory -Force | Out-Null
-        "[$(Get-Date -Format o)] Registering StepTwo resume handoff." | Add-Content -Path $LogPath -Encoding UTF8
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+    } catch { }
 
-        try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch { }
-
-        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-        $principalUser = $identity.User.Value
-        $action = New-ScheduledTaskAction -Execute $powerShellPath -Argument $argument
-        $trigger = New-ScheduledTaskTrigger -AtLogOn -RandomDelay (New-TimeSpan -Seconds 20)
+    try {
+        $principalUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $argument
+        $trigger = New-ScheduledTaskTrigger -AtLogOn -User $principalUser
         $principal = New-ScheduledTaskPrincipal -UserId $principalUser -LogonType Interactive -RunLevel Highest
         $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-
-        Register-ScheduledTask -TaskName $taskName -Description "Resume Custom Windows Setup StepTwo after DDU" -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-
-        $registeredTask = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
-        $registeredAction = $registeredTask.Actions | Where-Object { $_.Arguments -and $_.Arguments -like "*$ResumeScriptPath*" }
-        if (-not $registeredTask -or -not $registeredAction) { throw "The StepTwo scheduled task could not be verified after registration." }
-        "[$(Get-Date -Format o)] Scheduled task registered for SID $principalUser." | Add-Content -Path $LogPath -Encoding UTF8
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+        return $true
     } catch {
-        "[$(Get-Date -Format o)] Scheduled task registration failed: $($_.Exception.Message)" | Add-Content -Path $LogPath -Encoding UTF8
-        Write-Host "Scheduled Task resume registration failed. RunOnce remains available as fallback." -ForegroundColor Yellow
-    }
-
-    # Add two independent registry fallbacks. RunOnce is the immediate handoff.
-    # Run is deliberately persistent until StepTwo marks completion, so a missed
-    # task trigger or failed elevation can recover automatically at the next sign-in.
-    $resumeCommand = "`"$powerShellPath`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Maximized -File `"$ResumeScriptPath`""
-
-    try {
-        $runOncePath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"
-        New-Item -Path $runOncePath -Force | Out-Null
-        New-ItemProperty -Path $runOncePath -Name "!ItsMauridian-StepTwo" -PropertyType String -Value $resumeCommand -Force | Out-Null
-        "[$(Get-Date -Format o)] HKLM RunOnce fallback registered." | Add-Content -Path $LogPath -Encoding UTF8
-    } catch {
-        "[$(Get-Date -Format o)] HKLM RunOnce registration failed: $($_.Exception.Message)" | Add-Content -Path $LogPath -Encoding UTF8
-        Write-Host "RunOnce resume registration failed. See $LogPath" -ForegroundColor Yellow
-    }
-
-    try {
-        $runPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
-        New-Item -Path $runPath -Force | Out-Null
-        New-ItemProperty -Path $runPath -Name "ItsMauridian-StepTwoResume" -PropertyType String -Value $resumeCommand -Force | Out-Null
-        "[$(Get-Date -Format o)] Persistent HKLM Run recovery fallback registered." | Add-Content -Path $LogPath -Encoding UTF8
-    } catch {
-        "[$(Get-Date -Format o)] HKLM Run recovery registration failed: $($_.Exception.Message)" | Add-Content -Path $LogPath -Encoding UTF8
-        Write-Host "Persistent resume fallback registration failed. See $LogPath" -ForegroundColor Yellow
+        Write-Host "Scheduled Task resume registration failed. Falling back to HKLM RunOnce." -ForegroundColor Yellow
+        try { $_ | Out-String | Add-Content -Path "$env:SystemRoot\Temp\CWS-StepTwo-ResumeTask.log" -ErrorAction SilentlyContinue } catch { }
+        return $false
     }
 }
 
-$CwsWorkRoot = Join-Path $env:ProgramData "ItsMauridian\Custom-Windows-Setup"
-$CwsStepOnePath = Join-Path $CwsWorkRoot "StepOne.ps1"
-$CwsStepTwoPath = Join-Path $CwsWorkRoot "StepTwo.ps1"
-$CwsResumePath = Join-Path $CwsWorkRoot "Resume-StepTwo.ps1"
-$CwsResumeLogPath = Join-Path $CwsWorkRoot "Resume-StepTwo.log"
-New-Item -Path $CwsWorkRoot -ItemType Directory -Force | Out-Null
+# create stepone ps1 file
 
-# Keep the critical handoff scripts outside Windows Temp. Temp files are not a
-# reliable reboot boundary and can be removed by cleanup tools or maintenance.
-Save-CwsRepoFile -RelativePath "Scripts/Setup/StepOne.ps1" -Destination $CwsStepOnePath
-Save-CwsRepoFile -RelativePath "Scripts/Setup/StepTwo.ps1" -Destination $CwsStepTwoPath
-Save-CwsRepoFile -RelativePath "Scripts/Setup/Resume-StepTwo.ps1" -Destination $CwsResumePath
+# create step files from local repo checkout or GitHub raw when running through iwr | iex
+Save-CwsRepoFile -RelativePath "Scripts/Setup/StepOne.ps1" -Destination "$env:SystemRoot\Temp\StepOne.ps1"
+Save-CwsRepoFile -RelativePath "Scripts/Setup/StepTwo.ps1" -Destination "$env:SystemRoot\Temp\StepTwo.ps1"
 
-# Do not enter Safe Mode until every reboot-boundary script has passed the real
-# Windows PowerShell parser. This prevents a half-completed machine after DDU.
-foreach ($scriptPath in @($CwsStepOnePath, $CwsStepTwoPath, $CwsResumePath)) {
-    Assert-CwsPowerShellSyntax -Path $scriptPath
-}
-if (-not (Select-String -Path $CwsStepTwoPath -Pattern 'BUILD MARKER: reliability11' -Quiet)) {
-    throw 'The downloaded StepTwo.ps1 is not the reliability11 build.'
-}
-if (-not (Select-String -Path $CwsResumePath -Pattern 'BUILD MARKER: reliability11' -Quiet)) {
-    throw 'The downloaded Resume-StepTwo.ps1 is not the reliability11 build.'
-}
-Write-Host "DDU continuation scripts validated successfully.`n" -ForegroundColor Green
-
-# Keep compatibility copies for diagnostics and older recovery instructions.
-Copy-Item -Path $CwsStepOnePath -Destination "$env:SystemRoot\Temp\StepOne.ps1" -Force
-Copy-Item -Path $CwsStepTwoPath -Destination "$env:SystemRoot\Temp\StepTwo.ps1" -Force
-
-
-# Clean up legacy Winlogon Userinit method used by older builds.
+# clean up the legacy Winlogon Userinit method used by older builds only if it points to StepOne
 Repair-CwsLegacyUserinit
 
-# Run StepOne in Safe Mode. The * prefix forces RunOnce execution in Safe Mode,
-# while ! defers deletion until after the command has run.
-$stepOneRunOnce = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Maximized -File `"$CwsStepOnePath`""
-New-Item -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" -Force | Out-Null
-New-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" -Name "*!ItsMauridian-StepOne" -PropertyType String -Value $stepOneRunOnce -Force | Out-Null
+# install RunOnce StepOne file to run in Safe Mode. The * prefix makes RunOnce execute in Safe Mode.
+cmd /c "reg add `"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce`" /v `"*!StepOne`" /t REG_SZ /d `"powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Maximized -File `"$env:SystemRoot\Temp\StepOne.ps1`"`" /f >nul 2>&1"
 
-# Register two independent normal-boot continuation paths. The resume wrapper
-# uses a global mutex, so Task Scheduler and RunOnce cannot run StepTwo twice.
-Register-CwsStepTwoResumeHandoff -ResumeScriptPath $CwsResumePath -LogPath $CwsResumeLogPath
+# schedule StepTwo to resume elevated after DDU returns to normal Windows.
+# RunOnce is kept only as a fallback because HKCU RunOnce does not reliably resume elevated after reboot.
+cmd /c "reg delete `"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce`" /v `"!StepTwo`" /f >nul 2>&1"
+cmd /c "reg delete `"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce`" /v `"!StepTwo`" /f >nul 2>&1"
+if (-not (Register-CwsStepTwoResumeTask)) {
+    cmd /c "reg add `"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce`" /v `"!StepTwo`" /t REG_SZ /d `"powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Maximized -File `"$env:SystemRoot\Temp\StepTwo.ps1`"`" /f >nul 2>&1"
+}
 
 # disable open terminal by default
 cmd /c "reg add `"HKCU\Console\%%Startup`" /v `"DelegationConsole`" /t REG_SZ /d `"{B23D10C0-E52E-411E-9D5B-C09FDF709C7D}`" /f >nul 2>&1"

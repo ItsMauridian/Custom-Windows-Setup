@@ -1,16 +1,3 @@
-# Reliability 11
-
-- Fixed the PowerShell parser error caused by `$LiteralPath:` in an expandable string.
-- Added a pre-DDU parser gate. StepOne, StepTwo and Resume-StepTwo must all pass the real Windows PowerShell parser before the machine can enter Safe Mode.
-- Added `Scripts/Setup/Recover-StepTwo.ps1` for one-command recovery of a machine that stopped after DDU.
-- Kept the highest-privilege Task Scheduler logon task and HKLM RunOnce handoff.
-- Added a persistent HKLM Run fallback that remains until StepTwo creates its completion marker.
-- Resume logic can recover a missing local StepTwo from Windows Temp or GitHub.
-- Resume logic keeps a global mutex so duplicate triggers cannot start two StepTwo instances.
-- StepOne now forces a normal reboot if DDU exits without performing its requested restart.
-- StepTwo and the wrapper remove all resume entries only after completion.
-- GitHub Actions still parses every PowerShell file with Windows PowerShell 5.1 and PowerShell 7.
-
 # Reliability8 patch summary
 
 This build is based on the completed Windows 11 VM and laptop test logs from 10 July 2026. It focuses on observed failures, misleading logs, long silent stages and hardware-specific assumptions.
@@ -49,7 +36,7 @@ This build is based on the completed Windows 11 VM and laptop test logs from 10 
 ## Build marker
 
 ```text
-# BUILD MARKER: reliability11 2026-07-10 - persistent DDU resume handoff and recovery
+# BUILD MARKER: reliability9 2026-07-10 - guarded Store, AppX, WinGet, GPU, power and logging
 ```
 
 ## Reliability9 Store verification

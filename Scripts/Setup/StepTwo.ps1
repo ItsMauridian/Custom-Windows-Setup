@@ -1,5 +1,5 @@
 # SCRIPT RUN AS ADMIN
-# BUILD MARKER: reliability11 2026-07-10 - persistent DDU resume handoff and recovery
+# BUILD MARKER: reliability9 2026-07-10 - verified Store recovery, guarded AppX, WinGet, GPU, power and logging
 If (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]"Administrator")) {
     Write-Host "Run this from an elevated Administrator PowerShell window." -ForegroundColor Red
     Pause
@@ -71,7 +71,7 @@ function Remove-CwsPathIfPresent {
                 Remove-Item -LiteralPath $LiteralPath -Force -ErrorAction Stop
             }
         } catch {
-            Add-CwsWarning ("Could not remove {0}: {1}" -f $LiteralPath, $_.Exception.Message)
+            Add-CwsWarning "Could not remove ${LiteralPath}: $($_.Exception.Message)"
         }
     }
 }
@@ -4412,14 +4412,7 @@ if ($fatalErrors.Count -gt 0) {
 
 $logContent | Out-File -FilePath $logPath -Encoding UTF8 -Force
 
-$cwsWorkRoot = Join-Path $env:ProgramData 'ItsMauridian\Custom-Windows-Setup'
-try { Set-Content -Path (Join-Path $cwsWorkRoot 'StepTwo.completed') -Value (Get-Date -Format o) -Encoding ASCII -Force } catch { }
-try { Unregister-ScheduledTask -TaskName 'ItsMauridian-Custom-Windows-Setup-StepTwo' -TaskPath '\ItsMauridian\' -Confirm:$false -ErrorAction SilentlyContinue } catch { }
 try { Unregister-ScheduledTask -TaskName 'ItsMauridian-Custom-Windows-Setup-StepTwo' -Confirm:$false -ErrorAction SilentlyContinue } catch { }
-try { Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' -Name '!ItsMauridian-StepTwo' -ErrorAction SilentlyContinue } catch { }
-try { Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -Name 'ItsMauridian-StepTwoResume' -ErrorAction SilentlyContinue } catch { }
-try { Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' -Name '!StepTwo' -ErrorAction SilentlyContinue } catch { }
-try { Remove-ItemProperty -Path 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' -Name '!StepTwo' -ErrorAction SilentlyContinue } catch { }
 try { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null } catch { }
 
 # restart
