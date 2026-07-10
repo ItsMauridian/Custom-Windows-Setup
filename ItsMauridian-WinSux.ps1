@@ -20,13 +20,13 @@
 #   - Removed: force Windows Hello only sign-in (PasswordLess)
 #   - Removed: remove security taskbar icon
 #   - Removed: wipe Program Files (x86)\Microsoft folder (preserves WebView2)
-#   - Changed: Edge folder removal targets only Edge/EdgeUpdate/EdgeCore subfolders
+#   - Changed: Microsoft Edge and WebView2 are preserved; only stale shortcuts are removed
 #   - Changed: taskbar alignment set to centered (Windows 11 default)
 #   - Changed: ColorPrevalence set to 0 (fixes unreadable text on Windows 10)
 #   - Added: confirm file delete dialog
 #   - Added: enable text suggestions on physical keyboard + multilingual suggestions
 #   - Added: wsreset -i to reinstall Microsoft Store if missing
-#   - Added: warning prompt before Store settings page opens
+#   - Changed: Store initialization is non-interactive and protected by a timeout
 #   - Added: NetworkThrottlingIndex + SystemResponsiveness tweaks
 #   - Added: Nagle's algorithm disabled on all network adapters
 #   - Added: SysMain (Superfetch) disabled
@@ -38,19 +38,19 @@
 #            OnlineSpeechPrivacy, SvcHostSplitThresholdInKB, PowerShell/dotnet telemetry)
 #   - Added: Activity History disabled (EnableActivityFeed, UploadUserActivities)
 #   - Added: Copilot deep removal (appx, IsCopilotAvailable, AllowCopilotRuntime, CoreAI)
-#   - Added: Xbox & Gaming Components appx removal
+#   - Changed: AppX removal uses an explicit consumer-app list and preserves frameworks
 #   - Added: Widgets appx removal
 #   - Changed: service baseline aligned to current WinUtil safe subset
 #   - Added: Explorer Automatic Folder Discovery disabled
 #   - Added: Background apps GlobalUserDisabled
 #   - Added: Show hidden files (without system files)
 #   - Added: Num Lock on startup
-#   - Added: Disable Multiplane Overlay (MPO)
+#   - Changed: MPO handling is OS-aware and only forced on Windows 10
 #   - Added: Modern Standby fix (EnforceDisconnectedStandby)
 #   - Added: Verbose logon/logoff messages
 #   - Added: ShowHibernateOption=0
 #   - Added: winget app installs refreshed from the selected package list
-#            (Brave.Brave and PuTTY.PuTTY removed; Brave Origin installs from vendor URL)
+#            (Brave.Brave and PuTTY.PuTTY removed; Brave Origin is a manual vendor shortcut)
 #   - Added: Brave debloat registry keys refreshed from current WinUtil
 #   - Added: winget no longer uninstalled after use
 #   - Added: New Outlook no longer removed
@@ -80,6 +80,37 @@ $Host.UI.RawUI.BackgroundColor = "Black"
 $Host.PrivateData.ProgressBackgroundColor = "Black"
 $Host.PrivateData.ProgressForegroundColor = "White"
 Clear-Host
+
+# Prevent accidental mouse selection from pausing long-running console work.
+# Microsoft documents that Quick Edit is disabled by keeping
+# ENABLE_EXTENDED_FLAGS and clearing ENABLE_QUICK_EDIT_MODE.
+function Disable-CwsQuickEditMode {
+    try {
+        if (-not ('CwsConsoleNative' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class CwsConsoleNative {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr GetStdHandle(int nStdHandle);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+}
+'@ -ErrorAction Stop
+        }
+        $inputHandle = [CwsConsoleNative]::GetStdHandle(-10)
+        [uint32]$consoleMode = 0
+        if ([CwsConsoleNative]::GetConsoleMode($inputHandle, [ref]$consoleMode)) {
+            [uint32]$newMode = ($consoleMode -bor 0x0080) -band 0xFFFFFFBF
+            [void][CwsConsoleNative]::SetConsoleMode($inputHandle, $newMode)
+        }
+    } catch { }
+}
+Disable-CwsQuickEditMode
 
 # SCRIPT SILENT
 $progresspreference = 'silentlycontinue'

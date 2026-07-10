@@ -9,13 +9,17 @@ The goal is one script that applies the same overall setup philosophy on both Wi
 
 ## Current status
 
-- **Current Win11 VM status:** confirmed working well in the latest test VM.
-- **Current Win11 IoT Enterprise LTSC status on real hardware/base install:** LTSC winget/App Installer recovery is merged, and visual-effects handling is now narrowed further so classic context menus and modern apps keep normal rendering while animations are still turned off.
-- **Animation policy:** disable system-wide animations while preserving font smoothing, icon-label shadows, window drop shadows, the translucent desktop selection rectangle, the user-facing Animation effects toggle behavior, showing window contents while dragging, and normal focus rendering in modern apps.
-- **AppX removal noise:** known and intentionally left unchanged for now.
-- **Structure:** StepOne and StepTwo are now real files under `Scripts/Setup`, while the main script remains the public bootstrap entrypoint.
+- **Current validation status:** the Safe Mode and StepTwo resume flow completed in a Windows 11 VM and on a Windows 11 laptop. The reliability9 pass addresses the errors and confusing silent stages found in both resulting logs and now needs a fresh end-to-end rerun.
+- **LTSC Store recovery:** `wsreset.exe -i` is treated as a best-effort recovery step with a 180-second timeout. StepTwo then verifies Microsoft Store and Desktop App Installer separately before the dedicated WinGet bootstrap.
+- **WinGet handling:** App Installer is registered using the Microsoft-supported family registration command. If missing, the script installs signed App Installer dependencies and resolves the real package-local `winget.exe`.
+- **AppX handling:** only an explicit list of consumer apps is removed. AppX frameworks and protected Windows system packages are preserved.
+- **Power handling:** power values are normalized before use, failed hardware-specific settings are skipped, and existing OEM and built-in power plans are preserved.
+- **Logging:** the desktop log is categorized into real WinGet failures, notes, warnings and fatal errors. The full transcript remains in `C:\Windows\Temp\CWS-StepTwo.log`.
+- **Store handling:** Store initialization has a timeout and no longer opens an interactive Store settings page.
+- **Console handling:** Quick Edit selection is disabled while scripts run, so an accidental mouse click cannot pause the setup in `Select` mode.
+- **Structure:** StepOne and StepTwo are real files under `Scripts/Setup`, while the main script remains the public bootstrap entrypoint.
 
-That means the project is currently in a **functionally good state, with LTSC-specific winget/bootstrap handling merged and visual-effects handling narrowed to avoid unrelated UI regressions**.
+The current build focuses on repeatability, visible progress, safe package removal, reliable WinGet recovery and useful logs across VMs, laptops and desktop hardware.
 
 ## Run
 
@@ -217,17 +221,17 @@ The current intended defaults are:
 - The script should **not** force-hide the new/classic Outlook toggle, so classic Outlook remains available if installed
 - The script should **not** force accessibility/high-contrast/keyboard-preference state, because those broader profile-level writes can leak into white focus/border artifacts in modern apps.
 
-## AppX removal note
+## AppX removal policy
 
-When the log mentions **AppX**, it is talking about Microsoft Store / UWP / inbox package families handled by the Windows app deployment system.
+AppX cleanup now uses an explicit consumer-app list instead of removing nearly every package that is not allowlisted.
 
-The current Windows 11 logs still show removal attempts against some built-in package families that modern Windows treats as part of the OS. That produces predictable noise, but this project is **not changing that list right now by explicit decision**.
+The script:
 
-So the current stance is:
-
-- leave AppX removal behavior as-is for now,
-- treat that part of the log as known noise,
-- do not let that distract from functional regressions.
+- limits installed-package queries to `Main` and `Bundle` package types,
+- preserves frameworks such as `Microsoft.VCLibs`, `Microsoft.UI.Xaml`, .NET Native and Windows App Runtime,
+- preserves protected Windows system packages,
+- removes matching provisioned packages only for the same explicit consumer-app list,
+- records a warning when Windows keeps a selected package instead of filling the desktop log with every internal AppX error.
 
 ## Major changes from upstream WinSux
 
@@ -243,7 +247,7 @@ So the current stance is:
 
 ### Changed
 
-- Edge cleanup is narrowed so **WebView2 is preserved**
+- Microsoft Edge and WebView2 are preserved because both are part of the desired install set and Windows components can depend on WebView2
 - Taskbar work is **cleanup-first**, not forced repinning
 - `W32Time` is not demoted to Manual
 - `StorSvc` is not demoted to Manual
@@ -268,22 +272,20 @@ So the current stance is:
 
 ## Current known log behavior
 
-A setup log can contain some entries that are often noise rather than real failure, especially on VMs or on already-clean systems. Typical examples include:
+The desktop log is intentionally concise. It contains:
 
-- Missing files or folders that were already absent
-- Missing processes that were not running
-- Missing registry keys on a given Windows edition/build
-- Files temporarily in use during cleanup
-- VM-specific power-plan GUID mismatches
-- AppX removal errors from built-in modern Windows package families
+- actual WinGet package failures,
+- setup notes, including intentionally manual actions,
+- warnings for optional operations that Windows kept or skipped,
+- fatal PowerShell errors.
 
-These should be treated differently from real script breakage.
+The complete PowerShell transcript is stored at `C:\Windows\Temp\CWS-StepTwo.log` for detailed troubleshooting. Missing paths, missing processes and unsupported hardware-specific power settings no longer flood the desktop log.
 
 ## Current priorities
 
 - Keep the script functionally stable.
 - Keep changes minimal-diff by default.
-- Keep AppX removal behavior untouched for now.
+- Keep AppX removal explicit and preserve frameworks and protected Windows components.
 - Do a fuller Windows 10 / Windows 11 branch audit later, only where behavior genuinely differs.
 
 ## Other scripts
@@ -322,7 +324,7 @@ Scripts/Setup/StepOne.ps1
 Scripts/Setup/StepTwo.ps1
 ```
 
-`ItsMauridian-WinSux.ps1` remains the entrypoint. When run from a local clone it copies the local StepOne and StepTwo files. When run through `iwr | iex` it downloads them from the GitHub raw base configured near the top of the script. The GPU helper scripts stay in the root to match the original repository layout and avoid duplicate copies.
+`ItsMauridian-WinSux.ps1` remains the entrypoint. When run from a local clone it copies the local StepOne and StepTwo files. When run through `iwr | iex` it downloads them from the GitHub raw base configured near the top of the script. The GPU helper scripts remain in `Graphics/` to match the repository layout and avoid duplicate copies.
 
 ## Updated dependency notes
 
@@ -330,7 +332,7 @@ Scripts/Setup/StepTwo.ps1
 - DDU updated to 18.1.5.5.
 - NVIDIA Profile Inspector updated to 3.0.2.1.
 - Static Microsoft DirectX redist download uses SHA256 verification.
-- 7-Zip, DDU, Chrome and dynamic VC++ aka.ms downloads are left with empty hash placeholders unless you choose to pin exact binaries after locally verifying hashes.
+- DDU and the static DirectX redist use pinned SHA256 values. 7-Zip and NVIDIA Profile Inspector remain unpinned until their exact binaries are locally verified.
 
 
 ## Additional safety notes
@@ -346,6 +348,28 @@ Scripts/Setup/StepTwo.ps1
 Brave Origin unattended install is intentionally skipped. The script creates an `Install Brave Origin.url` desktop shortcut pointing to `https://laptop-updates.brave.com/latest/origin`, because the vendor web installer can fail with `0x80040C01` or hang behind an HTTP error dialog.
 
 
+## Reliability8 changes
+
+- Replaced broad AppX, Windows capability and optional-feature removal with explicit target lists.
+- Reworked WinGet registration and LTSC bootstrap without the legacy PowerShellGet 1.0 module path.
+- Fixed WinGet exit-code handling so command output is no longer mistaken for an exit code.
+- Preserved Edge, WebView2, Remote Desktop Connection, Snipping Tool, GameInput and unrelated startup entries.
+- Added clear progress messages for Windows settings, AppX, capabilities, features and each WinGet package.
+- Guarded GPU driver selection, extraction, setup paths, NVIDIA registry targeting and display-scaling values.
+- Replaced browser-process waits with an explicit prompt after opening the vendor driver page.
+- Normalized PowerCfg values, skip unsupported hardware settings, preserve OEM power plans and fixed the timer-resolution service internal name.
+- Disabled Quick Edit selection during script execution, removed the interactive Store settings step, added process timeouts, and replaced the global `$Error` dump with categorized logging.
+
 ## Current patch note
 
-The current build marker in `Scripts/Setup/StepTwo.ps1` is `hotfix6 2026-07-10`. Use this to verify that GitHub raw is serving the updated file before resuming StepTwo.
+The current build marker in `Scripts/Setup/StepTwo.ps1` is `reliability9 2026-07-10`. Use this marker to verify that GitHub raw is serving the current file before testing.
+
+## Technical references
+
+- [Microsoft: WinGet overview](https://learn.microsoft.com/windows/package-manager/winget/)
+- [Microsoft: WinGet install command](https://learn.microsoft.com/windows/package-manager/winget/install)
+- [Microsoft: WinGet troubleshooting and logs](https://learn.microsoft.com/windows/package-manager/winget/troubleshooting)
+- [Microsoft: Remove-AppxPackage](https://learn.microsoft.com/powershell/module/appx/remove-appxpackage)
+- [Microsoft: Remove-AppxProvisionedPackage](https://learn.microsoft.com/powershell/module/dism/remove-appxprovisionedpackage)
+- [Microsoft: PowerCfg command-line options](https://learn.microsoft.com/windows-hardware/design/device-experiences/powercfg-command-line-options)
+- [Microsoft: SetConsoleMode and Quick Edit](https://learn.microsoft.com/windows/console/setconsolemode)

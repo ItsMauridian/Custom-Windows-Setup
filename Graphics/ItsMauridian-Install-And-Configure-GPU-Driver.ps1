@@ -1,4 +1,5 @@
 # SCRIPT RUN AS ADMIN
+# BUILD MARKER: reliability9 2026-07-10 - guarded driver downloads and WinGet handling
 If (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]"Administrator")) {
     Write-Host "Run this from an elevated Administrator PowerShell window." -ForegroundColor Red
     Pause
@@ -9,6 +10,37 @@ $Host.UI.RawUI.BackgroundColor = "Black"
 $Host.PrivateData.ProgressBackgroundColor = "Black"
 $Host.PrivateData.ProgressForegroundColor = "White"
 Clear-Host
+
+# Prevent accidental mouse selection from pausing long-running console work.
+# Microsoft documents that Quick Edit is disabled by keeping
+# ENABLE_EXTENDED_FLAGS and clearing ENABLE_QUICK_EDIT_MODE.
+function Disable-CwsQuickEditMode {
+    try {
+        if (-not ('CwsConsoleNative' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class CwsConsoleNative {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr GetStdHandle(int nStdHandle);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+}
+'@ -ErrorAction Stop
+        }
+        $inputHandle = [CwsConsoleNative]::GetStdHandle(-10)
+        [uint32]$consoleMode = 0
+        if ([CwsConsoleNative]::GetConsoleMode($inputHandle, [ref]$consoleMode)) {
+            [uint32]$newMode = ($consoleMode -bor 0x0080) -band 0xFFFFFFBF
+            [void][CwsConsoleNative]::SetConsoleMode($inputHandle, $newMode)
+        }
+    } catch { }
+}
+Disable-CwsQuickEditMode
 
 # SCRIPT CHECK INTERNET
 try {
@@ -21,6 +53,15 @@ try {
 
 # SCRIPT SILENT
 $progresspreference = 'silentlycontinue'
+
+
+function Remove-CwsPathIfPresent {
+    param([Parameter(Mandatory)][string]$LiteralPath, [switch]$Recurse)
+    if (Test-Path -LiteralPath $LiteralPath) {
+        if ($Recurse) { Remove-Item -LiteralPath $LiteralPath -Recurse -Force -ErrorAction SilentlyContinue }
+        else { Remove-Item -LiteralPath $LiteralPath -Force -ErrorAction SilentlyContinue }
+    }
+}
 
 # FUNCTION FASTER DOWNLOADS WITH OPTIONAL SHA256 VERIFICATION
 function Test-FileHashSha256 {
@@ -230,19 +271,27 @@ cmd /c "sc delete `"$($service.Name)`" >nul 2>&1"
 
 # download driver
 Start-Sleep -Seconds 5
-Start-Process "C:\Program Files\Google\Chrome\Application\chrome.exe" "https://www.nvidia.com/en-us/drivers"
-Wait-Process -Name chrome
+Start-Process 'https://www.nvidia.com/en-us/drivers'
+Read-Host 'Download the correct NVIDIA driver, then press Enter to select it'
 
         Write-Host "SELECT DOWNLOADED DRIVER`n" -ForegroundColor Yellow
 
 # select driver
 Start-Sleep -Seconds 5
 $InstallFile = Show-ModernFilePicker -Mode File
+if ([string]::IsNullOrWhiteSpace($InstallFile) -or -not (Test-Path -LiteralPath $InstallFile)) { Write-Host 'No driver installer selected.' -ForegroundColor Yellow; Exit 0 }
 
         Write-Host "DEBLOATING DRIVER`n"
 
-# extract driver with 7zip
-& "C:\Program Files\7-Zip\7z.exe" x "$InstallFile" -o"$env:SystemRoot\Temp\NvidiaDriver" -y | Out-Null
+# extract driver with 7-Zip
+$sevenZipExe = 'C:\Program Files\7-Zip\7z.exe'
+if (-not (Test-Path -LiteralPath $sevenZipExe)) { throw '7-Zip is required to extract the NVIDIA driver.' }
+$nvidiaDriverPath = Join-Path $env:SystemRoot 'Temp\NvidiaDriver'
+Remove-CwsPathIfPresent -LiteralPath $nvidiaDriverPath -Recurse
+& $sevenZipExe x $InstallFile "-o$nvidiaDriverPath" -y | Out-Null
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $nvidiaDriverPath 'setup.exe'))) {
+    throw 'The NVIDIA driver could not be extracted or setup.exe was not found.'
+}
 
 # debloat nvidia driver
 Remove-Item "$env:SystemRoot\Temp\NvidiaDriver\Display.Nview" -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
@@ -277,38 +326,50 @@ Remove-Item "$env:SystemRoot\Temp\NvidiaDriver\NvApp\NvConfigGenerator.dll" -For
         Write-Host "INSTALLING DRIVER`n"
 
 # install nvidia driver
-Start-Process "$env:SystemRoot\Temp\NvidiaDriver\setup.exe" -ArgumentList "-s -noreboot -noeula -clean" -Wait -NoNewWindow
+Start-Process (Join-Path $nvidiaDriverPath 'setup.exe') -ArgumentList '-s -noreboot -noeula -clean' -Wait -NoNewWindow
 
-# install nvidia control panel
-try {
-Start-Process "winget" -ArgumentList "install `"9NF8H0H7WMLT`" --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --no-upgrade" -Wait -WindowStyle Hidden
-} catch { }
+# install NVIDIA Control Panel when WinGet is available
+$desktopAppInstaller = Get-AppxPackage -Name Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1
+$wingetExe = $null
+if ($desktopAppInstaller) {
+    $candidate = Join-Path $desktopAppInstaller.InstallLocation 'winget.exe'
+    if (Test-Path -LiteralPath $candidate) { $wingetExe = $candidate }
+}
+if (-not $wingetExe) {
+    $wingetCommand = Get-Command winget.exe -ErrorAction SilentlyContinue
+    if ($wingetCommand) { $wingetExe = $wingetCommand.Source }
+}
+if ($wingetExe) {
+    & $wingetExe install --id '9NF8H0H7WMLT' -e --source msstore --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --no-upgrade | Out-Host
+}
 
-# uninstall winget
-Get-AppxPackage -allusers *Microsoft.Winget.Source* | Remove-AppxPackage
 
 # delete download
-Remove-Item "$InstallFile" -Force -ErrorAction SilentlyContinue | Out-Null
+Remove-CwsPathIfPresent -LiteralPath $InstallFile
 
 # delete old driver files
-Remove-Item "$env:SystemDrive\NVIDIA" -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
+Remove-CwsPathIfPresent -LiteralPath "$env:SystemDrive\NVIDIA" -Recurse
 
         Write-Host "IMPORTING SETTINGS`n"
 
-# turn on disable dynamic pstate
-$subkeys = Get-ChildItem -Path "Registry::HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}" -Force -ErrorAction SilentlyContinue
-foreach($key in $subkeys){
-if ($key -notlike '*Configuration'){
-reg add "$key" /v "DisableDynamicPstate" /t REG_DWORD /d "1" /f | Out-Null
+function Get-CwsNvidiaDisplayRegistryKeys {
+    $classPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}'
+    if (-not (Test-Path $classPath)) { return @() }
+    return @(Get-ChildItem -Path $classPath -ErrorAction SilentlyContinue | Where-Object {
+        $properties = Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue
+        $properties.DriverDesc -match 'NVIDIA' -or $properties.ProviderName -match 'NVIDIA'
+    })
 }
+$nvidiaRegistryKeys = Get-CwsNvidiaDisplayRegistryKeys
+
+# turn on disable dynamic pstate
+foreach ($key in $nvidiaRegistryKeys) {
+    New-ItemProperty -Path $key.PSPath -Name 'DisableDynamicPstate' -PropertyType DWord -Value 1 -Force -ErrorAction SilentlyContinue | Out-Null
 }
 
-# disable hdcp
-$subkeys = Get-ChildItem -Path "Registry::HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}" -Force -ErrorAction SilentlyContinue
-foreach($key in $subkeys){
-if ($key -notlike '*Configuration'){
-reg add "$key" /v "RMHdcpKeyglobZero" /t REG_DWORD /d "1" /f | Out-Null
-}
+# disable HDCP for NVIDIA adapters only
+foreach ($key in $nvidiaRegistryKeys) {
+    New-ItemProperty -Path $key.PSPath -Name 'RMHdcpKeyglobZero' -PropertyType DWord -Value 1 -Force -ErrorAction SilentlyContinue | Out-Null
 }
 
 # unblock drs files
@@ -323,12 +384,9 @@ cmd /c "reg add `"HKLM\System\CurrentControlSet\Services\nvlddmkm\Parameters\Glo
 # enable developer settings
 cmd /c "reg add `"HKLM\System\CurrentControlSet\Services\nvlddmkm\Parameters\Global\NVTweak`" /v `"NvDevToolsVisible`" /t REG_DWORD /d `"1`" /f >nul 2>&1"
 
-# allow access to the gpu performance counters to all users
-$subkeys = Get-ChildItem -Path "Registry::HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}" -Force -ErrorAction SilentlyContinue
-foreach($key in $subkeys){
-if ($key -notlike '*Configuration'){
-reg add "$key" /v "RmProfilingAdminOnly" /t REG_DWORD /d "0" /f | Out-Null
-}
+# allow access to NVIDIA GPU performance counters for all users
+foreach ($key in $nvidiaRegistryKeys) {
+    New-ItemProperty -Path $key.PSPath -Name 'RmProfilingAdminOnly' -PropertyType DWord -Value 0 -Force -ErrorAction SilentlyContinue | Out-Null
 }
 cmd /c "reg add `"HKLM\System\CurrentControlSet\Services\nvlddmkm\Parameters\Global\NVTweak`" /v `"RmProfilingAdminOnly`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
 
@@ -343,8 +401,8 @@ cmd /c "reg add `"HKLM\SYSTEM\CurrentControlSet\Services\nvlddmkm\Parameters\FTS
 # turn on no scaling for all displays
 $configKeys = Get-ChildItem -Path "HKLM:\System\CurrentControlSet\Control\GraphicsDrivers\Configuration" -Recurse -ErrorAction SilentlyContinue
 foreach ($key in $configKeys) {
-$scalingValue = Get-ItemProperty -Path $key.PSPath -Name "Scaling" -ErrorAction SilentlyContinue
-if ($scalingValue) {
+$scalingValue = Get-ItemPropertyValue -Path $key.PSPath -Name 'Scaling' -ErrorAction SilentlyContinue
+if ($null -ne $scalingValue) {
 $regPath = $key.PSPath.Replace('Microsoft.PowerShell.Core\Registry::', '').Replace('HKEY_LOCAL_MACHINE', 'HKLM')
 Run-Trusted -command "reg add `"$regPath`" /v `"Scaling`" /t REG_DWORD /d `"2`" /f"
 }
@@ -583,14 +641,15 @@ Start-Process -wait "$env:SystemRoot\Temp\Inspector\nvidiaProfileInspector.exe" 
 
 # download driver
 Start-Sleep -Seconds 5
-Start-Process "C:\Program Files\Google\Chrome\Application\chrome.exe" "https://www.amd.com/en/support/download/drivers.html"
-Wait-Process -Name chrome
+Start-Process 'https://www.amd.com/en/support/download/drivers.html'
+Read-Host 'Download the correct AMD driver, then press Enter to select it'
 
         Write-Host "SELECT DOWNLOADED DRIVER`n" -ForegroundColor Yellow
 
 # select driver
 Start-Sleep -Seconds 5
 $InstallFile = Show-ModernFilePicker -Mode File
+if ([string]::IsNullOrWhiteSpace($InstallFile) -or -not (Test-Path -LiteralPath $InstallFile)) { Write-Host 'No driver installer selected.' -ForegroundColor Yellow; Exit 0 }
 
         Write-Host "DEBLOATING DRIVER`n"
 
@@ -809,14 +868,15 @@ cmd /c "reg add `"HKCU\Software\AMD\CN\VirtualSuperResolution`" /v `"AlreadyNoti
 
 # download driver
 Start-Sleep -Seconds 5
-Start-Process "C:\Program Files\Google\Chrome\Application\chrome.exe" "https://www.intel.com/content/www/us/en/search.html#sortCriteria=%40lastmodifieddt%20descending&f-operatingsystem_en=Windows%2011%20Family*&f-downloadtype=Drivers&cf-tabfilter=Downloads&cf-downloadsppth=Graphics"
-Wait-Process -Name chrome
+Start-Process 'https://www.intel.com/content/www/us/en/download-center/home.html'
+Read-Host 'Download the correct Intel graphics driver, then press Enter to select it'
 
         Write-Host "SELECT DOWNLOADED DRIVER`n" -ForegroundColor Yellow
 
 # select driver
 Start-Sleep -Seconds 5
 $InstallFile = Show-ModernFilePicker -Mode File
+if ([string]::IsNullOrWhiteSpace($InstallFile) -or -not (Test-Path -LiteralPath $InstallFile)) { Write-Host 'No driver installer selected.' -ForegroundColor Yellow; Exit 0 }
 
         Write-Host "DEBLOATING DRIVER`n"
 
@@ -965,7 +1025,7 @@ try {
 Start-Process shell:appsFolder\NVIDIACorp.NVIDIAControlPanel_56jybvy8sckqj!NVIDIACorp.NVIDIAControlPanel
 } catch { }
 Start-Process mmsys.cpl
-Pause
+Read-Host 'Configure display and sound settings if needed, then press Enter to continue'
 
         Clear-Host
 
@@ -982,8 +1042,8 @@ cmd /c "reg add `"$regPath`" /v `"AutoColorManagementSupported`" /t REG_DWORD /d
 # turn on no scaling for all displays
 $configKeys = Get-ChildItem -Path "HKLM:\System\CurrentControlSet\Control\GraphicsDrivers\Configuration" -Recurse -ErrorAction SilentlyContinue
 foreach ($key in $configKeys) {
-$scalingValue = Get-ItemProperty -Path $key.PSPath -Name "Scaling" -ErrorAction SilentlyContinue
-if ($scalingValue) {
+$scalingValue = Get-ItemPropertyValue -Path $key.PSPath -Name 'Scaling' -ErrorAction SilentlyContinue
+if ($null -ne $scalingValue) {
 $regPath = $key.PSPath.Replace('Microsoft.PowerShell.Core\Registry::', '').Replace('HKEY_LOCAL_MACHINE', 'HKLM')
 Run-Trusted -command "reg add `"$regPath`" /v `"Scaling`" /t REG_DWORD /d `"2`" /f"
 }

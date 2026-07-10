@@ -1,5 +1,5 @@
 # SCRIPT RUN AS ADMIN
-# BUILD MARKER: hotfix6 2026-07-10 - StepTwo line 2835 is the foreach closing brace
+# BUILD MARKER: reliability9 2026-07-10 - verified Store recovery, guarded AppX, WinGet, GPU, power and logging
 If (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]"Administrator")) {
     Write-Host "Run this from an elevated Administrator PowerShell window." -ForegroundColor Red
     Pause
@@ -11,12 +11,149 @@ $Host.PrivateData.ProgressBackgroundColor = "Black"
 $Host.PrivateData.ProgressForegroundColor = "White"
 Clear-Host
 
+# Prevent accidental mouse selection from pausing long-running console work.
+# Microsoft documents that Quick Edit is disabled by keeping
+# ENABLE_EXTENDED_FLAGS and clearing ENABLE_QUICK_EDIT_MODE.
+function Disable-CwsQuickEditMode {
+    try {
+        if (-not ('CwsConsoleNative' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class CwsConsoleNative {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr GetStdHandle(int nStdHandle);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+}
+'@ -ErrorAction Stop
+        }
+        $inputHandle = [CwsConsoleNative]::GetStdHandle(-10)
+        [uint32]$consoleMode = 0
+        if ([CwsConsoleNative]::GetConsoleMode($inputHandle, [ref]$consoleMode)) {
+            [uint32]$newMode = ($consoleMode -bor 0x0080) -band 0xFFFFFFBF
+            [void][CwsConsoleNative]::SetConsoleMode($inputHandle, $newMode)
+        }
+    } catch { }
+}
+Disable-CwsQuickEditMode
+
 $CwsStepTwoLog = Join-Path $env:SystemRoot "Temp\CWS-StepTwo.log"
+$failedApps = @()
+$setupNotes = @()
+$setupWarnings = @()
+$fatalErrors = @()
+$script:skippedPowerSettings = 0
+
+function Add-CwsNote {
+    param([Parameter(Mandatory)][string]$Message)
+    $script:setupNotes += $Message
+    Write-Host "[NOTE] $Message" -ForegroundColor Cyan
+}
+
+function Add-CwsWarning {
+    param([Parameter(Mandatory)][string]$Message)
+    $script:setupWarnings += $Message
+    Write-Host "[WARNING] $Message" -ForegroundColor Yellow
+}
+
+function Remove-CwsPathIfPresent {
+    param([Parameter(Mandatory)][string]$LiteralPath, [switch]$Recurse)
+    if (Test-Path -LiteralPath $LiteralPath) {
+        try {
+            if ($Recurse) {
+                Remove-Item -LiteralPath $LiteralPath -Recurse -Force -ErrorAction Stop
+            } else {
+                Remove-Item -LiteralPath $LiteralPath -Force -ErrorAction Stop
+            }
+        } catch {
+            Add-CwsWarning "Could not remove $LiteralPath: $($_.Exception.Message)"
+        }
+    }
+}
+
+function Stop-CwsProcessIfPresent {
+    param([Parameter(Mandatory)][string]$Name)
+    Get-Process -Name $Name -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+}
+
+function Set-CwsPowerSetting {
+    param(
+        [Parameter(Mandatory)][ValidateSet('AC','DC')][string]$Mode,
+        [Parameter(Mandatory)][string]$Scheme,
+        [Parameter(Mandatory)][string]$Subgroup,
+        [Parameter(Mandatory)][string]$Setting,
+        [Parameter(Mandatory)][string]$Value
+    )
+
+    # PowerCfg documents the setting value as an integer. Normalize inherited
+    # hexadecimal and zero-padded values before passing them to powercfg.exe.
+    try {
+        if ($Value -match '^0x[0-9a-fA-F]+$') {
+            $normalizedValue = [Convert]::ToUInt32($Value.Substring(2), 16).ToString()
+        } elseif ($Value -match '^\d+$') {
+            $normalizedValue = [Convert]::ToUInt64($Value, 10).ToString()
+        } else {
+            $script:skippedPowerSettings++
+            return $false
+        }
+    } catch {
+        $script:skippedPowerSettings++
+        return $false
+    }
+
+    # Do not pre-query with a third /query argument. Microsoft documents
+    # /query for a scheme and optional subgroup, while setac/setdc accept the
+    # individual setting. The set command itself is the authoritative check.
+    $command = if ($Mode -eq 'AC') { '/setacvalueindex' } else { '/setdcvalueindex' }
+    & powercfg.exe $command $Scheme $Subgroup $Setting $normalizedValue *> $null
+    if ($LASTEXITCODE -ne 0) {
+        $script:skippedPowerSettings++
+        return $false
+    }
+    return $true
+}
+
+function Invoke-CwsProcessWithTimeout {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$ArgumentList = @(),
+        [ValidateRange(1, 3600)][int]$TimeoutSeconds = 180,
+        [switch]$Hidden
+    )
+
+    try {
+        $startParameters = @{
+            FilePath = $FilePath
+            ArgumentList = $ArgumentList
+            PassThru = $true
+            ErrorAction = 'Stop'
+        }
+        if ($Hidden) { $startParameters.WindowStyle = 'Hidden' }
+        $process = Start-Process @startParameters
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            try { & taskkill.exe /PID $process.Id /T /F *> $null } catch { }
+            Add-CwsWarning "$FilePath timed out after $TimeoutSeconds seconds and was stopped."
+            return [int]1460
+        }
+        return [int]$process.ExitCode
+    } catch {
+        Add-CwsWarning "$FilePath could not be started: $($_.Exception.Message)"
+        return [int]1
+    }
+}
+
 try { Start-Transcript -Path $CwsStepTwoLog -Append -ErrorAction SilentlyContinue | Out-Null } catch { }
 trap {
+    $message = $_.Exception.Message
+    $script:fatalErrors += $message
     try { $_ | Out-String | Add-Content -Path $CwsStepTwoLog -ErrorAction SilentlyContinue } catch { }
     Write-Host "StepTwo failed. Details were written to $CwsStepTwoLog" -ForegroundColor Red
-    Write-Host $_.Exception.Message -ForegroundColor Red
+    Write-Host $message -ForegroundColor Red
     Pause
     Exit 1
 }
@@ -167,20 +304,42 @@ trap {
 
         Write-Host "STORE SETTINGS`n"
         ## ms-windows-store:settings
+Write-Host "Initializing Microsoft Store components. No input is required at this stage...`n" -ForegroundColor Cyan
 
-# reinstall microsoft store if missing
-Start-Process -Wait "wsreset.exe" -ArgumentList "-i" -WindowStyle Hidden
+# Initialize or repair Store registration, but never wait forever for wsreset.
+$wsresetExitCode = Invoke-CwsProcessWithTimeout -FilePath 'wsreset.exe' -ArgumentList @('-i') -TimeoutSeconds 180 -Hidden
+if ($wsresetExitCode -ne 0) {
+    Add-CwsNote "Store initialization returned exit code $wsresetExitCode. WinGet has its own App Installer bootstrap later in the script."
+}
 
-# open store settings page so disable personalized experiences on ms account sticks
-Write-Host "Opening Store settings - click 'Open Microsoft Store' if prompted`n" -ForegroundColor Yellow
-try {
-Start-Process "ms-windows-store:settings"
-} catch { }
-Start-Sleep -Seconds 5
+# Verify the two package families that matter after the LTSC recovery attempt.
+# Microsoft Store is useful, while Desktop App Installer is required for WinGet.
+Start-Sleep -Seconds 3
+$storePackage = Get-AppxPackage -Name Microsoft.WindowsStore -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $storePackage) {
+    $storePackage = Get-AppxPackage -AllUsers -Name Microsoft.WindowsStore -ErrorAction SilentlyContinue | Select-Object -First 1
+}
+$appInstallerPackage = Get-AppxPackage -Name Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $appInstallerPackage) {
+    $appInstallerPackage = Get-AppxPackage -AllUsers -Name Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue | Select-Object -First 1
+}
 
-# stop store running
-$stop = "WinStore.App", "backgroundTaskHost", "StoreDesktopExtension"
-$stop | ForEach-Object { Stop-Process -Name $_ -Force -ErrorAction SilentlyContinue }
+if ($storePackage) {
+    Add-CwsNote "Microsoft Store package detected after wsreset -i: $($storePackage.Version)."
+} else {
+    Add-CwsWarning 'Microsoft Store is still missing after wsreset -i. The setup will continue because App Installer and WinGet are bootstrapped separately.'
+}
+
+if ($appInstallerPackage) {
+    Add-CwsNote "Desktop App Installer package detected after wsreset -i: $($appInstallerPackage.Version)."
+} else {
+    Add-CwsNote 'Desktop App Installer is still missing after wsreset -i. The dedicated WinGet bootstrap later in StepTwo will attempt to install it.'
+}
+
+# Do not open the interactive Store settings page. The script applies the
+# settings.dat changes directly when that hive exists.
+$stop = 'WinStore.App', 'backgroundTaskHost', 'StoreDesktopExtension'
+$stop | ForEach-Object { Stop-CwsProcessIfPresent -Name $_ }
 Start-Sleep -Seconds 2
 
 # create reg file
@@ -201,20 +360,23 @@ Set-Content -Path "$env:SystemRoot\Temp\WindowsStore.reg" -Value $storesettings 
 $settingsdat = "$env:LocalAppData\Packages\Microsoft.WindowsStore_8wekyb3d8bbwe\Settings\settings.dat"
 $regfilewindowsstore = "$env:SystemRoot\Temp\WindowsStore.reg"
 
-# load hive
-reg load "HKLM\Settings" $settingsdat >$null 2>&1
-
-# import reg file
-if ($LASTEXITCODE -eq 0) {
-reg import $regfilewindowsstore >$null 2>&1
-
-# unload hive
-[gc]::Collect()
-Start-Sleep -Seconds 2
-reg unload "HKLM\Settings" >$null 2>&1
+# Load and edit the Store settings hive only when it already exists.
+if (Test-Path -LiteralPath $settingsdat) {
+    reg load "HKLM\Settings" $settingsdat >$null 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        reg import $regfilewindowsstore >$null 2>&1
+        [gc]::Collect()
+        Start-Sleep -Seconds 2
+        reg unload "HKLM\Settings" >$null 2>&1
+    } else {
+        Add-CwsNote 'The Microsoft Store settings hive was busy or unavailable, so Store preference edits were skipped.'
+    }
+} else {
+    Add-CwsNote 'The Microsoft Store settings hive was not present yet, so Store preference edits were skipped.'
 }
 
 		Write-Host "WINDOWS SETTINGS`n"
+Write-Host "Applying Windows privacy, shell and usability settings. This can take several minutes...`n" -ForegroundColor Cyan
 		## regedit
 		## control
         ## ms-settings:
@@ -1731,7 +1893,13 @@ $path = "$env:SystemRoot\Temp\WindowsSettings.reg"
 (Get-Content $path) -replace "\?","$" | Out-File $path
 
 # import reg file
-Start-Process -Wait "regedit.exe" -ArgumentList "/S `"$env:SystemRoot\Temp\WindowsSettings.reg`"" -WindowStyle Hidden
+Write-Host "Importing the main Windows settings registry file..." -ForegroundColor Cyan
+$regImportExitCode = Invoke-CwsProcessWithTimeout -FilePath 'regedit.exe' -ArgumentList @('/S', "$env:SystemRoot\Temp\WindowsSettings.reg") -TimeoutSeconds 180 -Hidden
+if ($regImportExitCode -ne 0) {
+    Add-CwsWarning "The main Windows settings registry import returned exit code $regImportExitCode."
+} else {
+    Write-Host "Main Windows settings import completed.`n" -ForegroundColor Green
+}
 
 # keep MPO disable OS-aware: OverlayTestMode=5 can help on some systems, but on
 # Win11 it can also interfere with DWM/composition and show light frame borders
@@ -1936,9 +2104,8 @@ Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
 
 # disable if you've been away, when should windows require you to sign in again?
         ## ms-settings:signinoptions
-powercfg /setdcvalueindex scheme_current sub_none consolelock 0 2>$null
-powercfg /setacvalueindex scheme_current sub_none consolelock 0 2>$null
-
+Set-CwsPowerSetting -Mode DC -Scheme 'scheme_current' -Subgroup 'sub_none' -Setting 'consolelock' -Value '0' | Out-Null
+Set-CwsPowerSetting -Mode AC -Scheme 'scheme_current' -Subgroup 'sub_none' -Setting 'consolelock' -Value '0' | Out-Null
 # disable set priority notifications
         ## ms-settings:notifications
 
@@ -2155,12 +2322,7 @@ reg unload "HKLM\Settings" >$null 2>&1
 cmd /c "reg delete HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband /f >nul 2>&1"
 Remove-Item -Recurse -Force "$env:USERPROFILE\AppData\Roaming\Microsoft\Internet Explorer\Quick Launch" -ErrorAction SilentlyContinue | Out-Null
 
-# hide desktop.ini files
-Get-ChildItem -Path "C:\" -Filter "desktop.ini" -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
-    try {
-        $_.Attributes = $_.Attributes -bor [System.IO.FileAttributes]::Hidden -bor [System.IO.FileAttributes]::System
-    } catch { }
-}
+# desktop.ini files keep their Windows-managed attributes. Avoid a full C:\ crawl.
 
 # disable explorer automatic folder type discovery
 $bags = "HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\Bags"
@@ -2417,421 +2579,440 @@ cmd /c "reg add `"HKCU\Software\Microsoft\Windows\CurrentVersion\Start`" /v `"Al
 Stop-Process -Force -Name explorer -ErrorAction SilentlyContinue | Out-Null
 Start-Sleep -Seconds 10
 
-        Write-Host "REMOVE EDGE`n"
-        ## c:\program files (x86)\microsoft
-        ## powershell -NoExit -c "reg query 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\Packages' | findstr 'Microsoft-Windows-Internet-Browser-Package' | findstr '~~'"
+        Write-Host "EDGE AND WEBVIEW2`n"
+Write-Host "Preserving Microsoft Edge and WebView2 because both are in the desired app set and Windows components can depend on WebView2.`n" -ForegroundColor Cyan
 
-# stop edge running
-$stop = "backgroundTaskHost", "Copilot", "CrossDeviceResume", "GameBar", "MicrosoftEdgeUpdate", "msedge", "msedgewebview2", "OneDrive", "OneDrive.Sync.Service", "OneDriveStandaloneUpdater", "Resume", "RuntimeBroker", "Search", "SearchHost", "Setup", "StoreDesktopExtension", "WidgetService", "Widgets"
-$stop | ForEach-Object { Stop-Process -Name $_ -Force -ErrorAction SilentlyContinue }
-Get-Process | Where-Object { $_.ProcessName -like "*edge*" } | Stop-Process -Force -ErrorAction SilentlyContinue
-
-# find edgeupdate.exe
-$edgeupdate = @(); "LocalApplicationData", "ProgramFilesX86", "ProgramFiles" | ForEach-Object {
-$folder = [Environment]::GetFolderPath($_)
-$edgeupdate += Get-ChildItem "$folder\Microsoft\EdgeUpdate\*.*.*.*\MicrosoftEdgeUpdate.exe" -rec -ea 0
-}
-
-# find edgeupdate & allow uninstall regedit
-$global:REG = "HKCU:\SOFTWARE", "HKLM:\SOFTWARE", "HKCU:\SOFTWARE\Policies", "HKLM:\SOFTWARE\Policies", "HKCU:\SOFTWARE\WOW6432Node", "HKLM:\SOFTWARE\WOW6432Node", "HKCU:\SOFTWARE\WOW6432Node\Policies", "HKLM:\SOFTWARE\WOW6432Node\Policies"
-foreach ($location in $REG) { Remove-Item "$location\Microsoft\EdgeUpdate" -recurse -force -ErrorAction SilentlyContinue }
-
-# uninstall edgeupdate
-foreach ($path in $edgeupdate) {
-if (Test-Path $path) { Start-Process -Wait $path -Args "/unregsvc" | Out-Null }
-do { Start-Sleep 3 } while ((Get-Process -Name "setup", "MicrosoftEdge*" -ErrorAction SilentlyContinue).Path -like "*\Microsoft\Edge*")
-if (Test-Path $path) { Start-Process -Wait $path -Args "/uninstall" | Out-Null }
-do { Start-Sleep 3 } while ((Get-Process -Name "setup", "MicrosoftEdge*" -ErrorAction SilentlyContinue).Path -like "*\Microsoft\Edge*")
-}
-
-# new folder to uninstall edge
-New-Item -Path "$env:SystemRoot\SystemApps\Microsoft.MicrosoftEdge_8wekyb3d8bbwe" -ItemType Directory -ErrorAction SilentlyContinue | Out-Null
-
-# new file to uninstall edge
-New-Item -Path "$env:SystemRoot\SystemApps\Microsoft.MicrosoftEdge_8wekyb3d8bbwe" -ItemType File -Name "MicrosoftEdge.exe" -ErrorAction SilentlyContinue | Out-Null
-
-# find edge uninstall string
-$regview = [Microsoft.Win32.RegistryView]::Registry32
-$microsoft = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, $regview).
-OpenSubKey("SOFTWARE\Microsoft", $true)
-$uninstallregkey = $microsoft.OpenSubKey("Windows\CurrentVersion\Uninstall\Microsoft Edge")
-try {
-$uninstallstring = $uninstallregkey.GetValue("UninstallString") + " --force-uninstall"
-} catch {
-}
-
-# uninstall edge
-Start-Process cmd.exe "/c $uninstallstring" -WindowStyle Hidden -Wait
-
-# clean folder file
-Remove-Item -Recurse -Force "$env:SystemRoot\SystemApps\Microsoft.MicrosoftEdge_8wekyb3d8bbwe" -ErrorAction SilentlyContinue | Out-Null
-
-# remove edgewebview uninstaller
-cmd /c "reg delete `"HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft EdgeWebView`" /f >nul 2>&1"
-
-# remove edge shortcut
-Remove-Item -Recurse -Force "$env:SystemDrive\Windows\System32\config\systemprofile\AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\Microsoft Edge.lnk" -ErrorAction SilentlyContinue | Out-Null
-
-# remove edge folders
-Remove-Item -Recurse -Force "$env:SystemDrive\Program Files (x86)\Microsoft\Edge" -ErrorAction SilentlyContinue | Out-Null
-Remove-Item -Recurse -Force "$env:SystemDrive\Program Files (x86)\Microsoft\EdgeUpdate" -ErrorAction SilentlyContinue | Out-Null
-Remove-Item -Recurse -Force "$env:SystemDrive\Program Files (x86)\Microsoft\EdgeCore" -ErrorAction SilentlyContinue | Out-Null
-
-# remove edge services
-$services = Get-Service | Where-Object { $_.Name -match 'Edge' }
-foreach ($service in $services) {
-cmd /c "sc stop `"$($service.Name)`" >nul 2>&1"
-cmd /c "sc delete `"$($service.Name)`" >nul 2>&1"
-}
-
-# windows 10 remove microsoft edge legacy package
-$EdgeLegacyPackage = (Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\Packages" -ErrorAction SilentlyContinue |
-Where-Object { $_.PSChildName -like "*Microsoft-Windows-Internet-Browser-Package*~~*" }).PSChildName
-if ($EdgeLegacyPackage) {
-$regPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\Packages\$EdgeLegacyPackage"
-cmd /c "reg add `"$($regPath.Replace('HKLM:\', 'HKLM\'))`" /v Visibility /t REG_DWORD /d 1 /f >nul 2>&1"
-cmd /c "reg delete `"$($regPath.Replace('HKLM:\', 'HKLM\'))\Owners`" /va /f >nul 2>&1"
-dism /online /Remove-Package /PackageName:$EdgeLegacyPackage /quiet /norestart 2>$null | Out-Null
+# Remove only stale Edge shortcuts. Do not remove Edge, Edge Update, WebView2, services or registry state.
+$edgeShortcutPaths = @(
+    "$env:PUBLIC\Desktop\Microsoft Edge.lnk",
+    "$env:USERPROFILE\Desktop\Microsoft Edge.lnk"
+)
+foreach ($edgeShortcut in $edgeShortcutPaths) {
+    Remove-CwsPathIfPresent -LiteralPath $edgeShortcut
 }
 
         Write-Host "REMOVE UWP APPS`n"
         ## ms-settings:appsfeatures
         ## powershell -noexit -command "get-appxpackage | select name | format-table -autosize"
+Write-Host "Removing only explicitly selected consumer AppX packages. Frameworks and protected Windows system apps are preserved.`n" -ForegroundColor Cyan
 
-Get-AppXPackage -AllUsers | Where-Object {
-# breaks file explorer
-$_.Name -notlike '*CBS*' -and
-$_.Name -notlike '*Microsoft.AV1VideoExtension*' -and
-$_.Name -notlike '*Microsoft.AVCEncoderVideoExtension*' -and
-$_.Name -notlike '*Microsoft.HEIFImageExtension*' -and
-$_.Name -notlike '*Microsoft.HEVCVideoExtension*' -and
-$_.Name -notlike '*Microsoft.MPEG2VideoExtension*' -and
-$_.Name -notlike '*Microsoft.Paint*' -and
-$_.Name -notlike '*Microsoft.DesktopAppInstaller*' -and
-$_.Name -notlike '*Microsoft.UI.Xaml*' -and
-$_.Name -notlike '*Microsoft.VCLibs*' -and
-$_.Name -notlike '*Microsoft.WindowsAppRuntime*' -and
-$_.Name -notlike '*Microsoft.RawImageExtension*' -and
-# breaks windows server defender
-$_.Name -notlike '*Microsoft.SecHealthUI*' -and
-$_.Name -notlike '*Microsoft.VP9VideoExtensions*' -and
-$_.Name -notlike '*Microsoft.WebMediaExtensions*' -and
-$_.Name -notlike '*Microsoft.WebpImageExtension*' -and
-$_.Name -notlike '*Microsoft.Windows.Photos*' -and
-# breaks windows server task bar
-$_.Name -notlike '*Microsoft.Windows.ShellExperienceHost*' -and
-# breaks windows server start menu
-$_.Name -notlike '*Microsoft.Windows.StartMenuExperienceHost*' -and
-$_.Name -notlike '*Microsoft.WindowsNotepad*' -and
-$_.Name -notlike '*Microsoft.WindowsStore*' -and
-$_.Name -notlike '*NVIDIACorp.NVIDIAControlPanel*' -and
-# breaks windows server immersive control panel
-$_.Name -notlike '*windows.immersivecontrolpanel*'
-} | Remove-AppxPackage -ErrorAction SilentlyContinue
+$appxRemovalPatterns = @(
+    'Clipchamp.Clipchamp',
+    'Microsoft.549981C3F5F10',
+    'Microsoft.BingFinance',
+    'Microsoft.BingFoodAndDrink',
+    'Microsoft.BingHealthAndFitness',
+    'Microsoft.BingNews',
+    'Microsoft.BingSports',
+    'Microsoft.BingTravel',
+    'Microsoft.BingWeather',
+    'Microsoft.GetHelp',
+    'Microsoft.Getstarted',
+    'Microsoft.Microsoft3DViewer',
+    'Microsoft.MicrosoftOfficeHub',
+    'Microsoft.MicrosoftSolitaireCollection',
+    'Microsoft.MixedReality.Portal',
+    'Microsoft.People',
+    'Microsoft.PowerAutomateDesktop',
+    'Microsoft.SkypeApp',
+    'Microsoft.Todos',
+    'Microsoft.WindowsFeedbackHub',
+    'Microsoft.WindowsMaps',
+    'Microsoft.WindowsSoundRecorder',
+    'Microsoft.XboxApp',
+    'Microsoft.XboxGamingOverlay',
+    'Microsoft.XboxIdentityProvider',
+    'Microsoft.XboxSpeechToTextOverlay',
+    'Microsoft.GamingApp',
+    'Microsoft.YourPhone',
+    'Microsoft.ZuneMusic',
+    'Microsoft.ZuneVideo',
+    'MicrosoftCorporationII.MicrosoftFamily',
+    'MicrosoftCorporationII.QuickAssist',
+    'MicrosoftTeams',
+    'MSTeams',
+    'Microsoft.WidgetsPlatformRuntime',
+    'MicrosoftWindows.Client.WebExperience',
+    '*Copilot*'
+)
+
+Write-Host "Reading installed and provisioned AppX inventories once..." -ForegroundColor Cyan
+$installedAppxInventory = @(Get-AppxPackage -AllUsers -PackageTypeFilter Main,Bundle -ErrorAction SilentlyContinue)
+$provisionedAppxInventory = @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue)
+$appxRemovedCount = 0
+$appxProvisionedRemovedCount = 0
+
+foreach ($pattern in $appxRemovalPatterns) {
+    $packages = @($installedAppxInventory | Where-Object { $_.Name -like $pattern } | Sort-Object PackageFullName -Unique)
+    $provisioned = @($provisionedAppxInventory | Where-Object { $_.DisplayName -like $pattern } | Sort-Object PackageName -Unique)
+    if ($packages.Count -eq 0 -and $provisioned.Count -eq 0) { continue }
+
+    Write-Host "  AppX pattern: $pattern"
+    foreach ($package in $packages) {
+        try {
+            Remove-AppxPackage -Package $package.PackageFullName -AllUsers -ErrorAction Stop
+            $appxRemovedCount++
+        } catch {
+            Add-CwsWarning "AppX package was kept: $($package.Name) ($($_.Exception.Message))"
+        }
+    }
+
+    foreach ($package in $provisioned) {
+        try {
+            Remove-AppxProvisionedPackage -Online -PackageName $package.PackageName -ErrorAction Stop | Out-Null
+            $appxProvisionedRemovedCount++
+        } catch {
+            Add-CwsWarning "Provisioned AppX package was kept: $($package.DisplayName) ($($_.Exception.Message))"
+        }
+    }
+}
+Add-CwsNote "Removed $appxRemovedCount installed AppX package entries and $appxProvisionedRemovedCount provisioned package entries from the explicit consumer list."
+Write-Host "Selected AppX cleanup finished.`n" -ForegroundColor Green
 
         Write-Host "REMOVE UWP FEATURES`n"
         ## ms-settings:optionalfeatures
         ## powershell -noexit -command "dism /online /get-capabilities /format:table"
+Write-Host "Removing only explicitly selected optional capabilities. Permanent capabilities are not touched.`n" -ForegroundColor Cyan
 
-Get-WindowsCapability -Online | Where-Object {
-$_.Name -notlike '*Microsoft.Windows.Ethernet*' -and
-# windows 10
-$_.Name -notlike '*Microsoft.Windows.MSPaint*' -and
-# windows 10
-$_.Name -notlike '*Microsoft.Windows.Notepad*' -and
-$_.Name -notlike '*Microsoft.Windows.Notepad.System*' -and
-$_.Name -notlike '*Microsoft.Windows.Wifi*' -and
-$_.Name -notlike '*NetFX3*' -and
-# windows 11 breaks msi installers if removed
-$_.Name -notlike '*VBSCRIPT*' -and
-# breaks monitoring programs
-$_.Name -notlike '*WMIC*' -and
-# windows 10 breaks uwp snippingtool if removed
-$_.Name -notlike '*Windows.Client.ShellComponents*'
-} | ForEach-Object {
-try {
-Remove-WindowsCapability -Online -Name $_.Name | Out-Null
-} catch { }
+$capabilityPatterns = @(
+    'App.Support.QuickAssist*',
+    'Browser.InternetExplorer*',
+    'Microsoft.Windows.WordPad*',
+    'StepsRecorder*',
+    'XPS.Viewer*'
+)
+Write-Host "Reading installed Windows capabilities once. This can take several minutes..." -ForegroundColor Cyan
+$installedCapabilities = @(Get-WindowsCapability -Online -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Installed' })
+$capabilitiesRemovedCount = 0
+foreach ($pattern in $capabilityPatterns) {
+    $capabilities = @($installedCapabilities | Where-Object { $_.Name -like $pattern })
+    foreach ($capability in $capabilities) {
+        Write-Host "  Capability: $($capability.Name)"
+        try {
+            Remove-WindowsCapability -Online -Name $capability.Name -ErrorAction Stop | Out-Null
+            $capabilitiesRemovedCount++
+        } catch {
+            Add-CwsWarning "Capability was kept: $($capability.Name) ($($_.Exception.Message))"
+        }
+    }
 }
+Add-CwsNote "Removed $capabilitiesRemovedCount installed optional capabilities from the explicit list."
+Write-Host "Selected capability cleanup finished.`n" -ForegroundColor Green
 
         Write-Host "REMOVE LEGACY FEATURES`n"
         ## c:\windows\system32\optionalfeatures.exe
-		## powershell -noexit -command "dism /online /get-features /format:table"
+        ## powershell -noexit -command "dism /online /get-features /format:table"
+Write-Host "Disabling only explicitly selected legacy features when present.`n" -ForegroundColor Cyan
 
-Get-WindowsOptionalFeature -Online | Where-Object {
-$_.FeatureName -notlike '*DirectPlay*' -and
-$_.FeatureName -notlike '*LegacyComponents*' -and
-$_.FeatureName -notlike '*NetFx3*' -and
-# breaks windows server turn windows features on or off
-$_.FeatureName -notlike '*NetFx4*' -and
-$_.FeatureName -notlike '*NetFx4-AdvSrvs*' -and
-# breaks windows server turn windows features on or off
-$_.FeatureName -notlike '*NetFx4ServerFeatures*' -and
-# breaks search
-$_.FeatureName -notlike '*SearchEngine-Client-Package*' -and
-# breaks windows server desktop
-$_.FeatureName -notlike '*Server-Shell*' -and
-# breaks windows server defender
-$_.FeatureName -notlike '*Windows-Defender*' -and
-# breaks windows server internet
-$_.FeatureName -notlike '*Server-Drivers-General*' -and
-# breaks windows server internet
-$_.FeatureName -notlike '*ServerCore-Drivers-General*' -and
-# breaks windows server internet
-$_.FeatureName -notlike '*ServerCore-Drivers-General-WOW64*' -and
-# breaks windows server turn windows features on or off
-$_.FeatureName -notlike '*Server-Gui-Mgmt*' -and
-# breaks windows server nvidia app
-$_.FeatureName -notlike '*WirelessNetworking*'
-} | ForEach-Object {
-try {
-Disable-WindowsOptionalFeature -Online -FeatureName $_.FeatureName -NoRestart -WarningAction SilentlyContinue | Out-Null
-} catch { }
+$optionalFeatures = @(
+    'MicrosoftWindowsPowerShellV2',
+    'MicrosoftWindowsPowerShellV2Root',
+    'Printing-XPSServices-Features',
+    'SMB1Protocol',
+    'WorkFolders-Client'
+)
+Write-Host "Reading enabled Windows optional features once..." -ForegroundColor Cyan
+$enabledOptionalFeatures = @(Get-WindowsOptionalFeature -Online -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Enabled' })
+$featuresDisabledCount = 0
+foreach ($featureName in $optionalFeatures) {
+    $feature = $enabledOptionalFeatures | Where-Object { $_.FeatureName -eq $featureName } | Select-Object -First 1
+    if ($feature) {
+        Write-Host "  Feature: $featureName"
+        try {
+            Disable-WindowsOptionalFeature -Online -FeatureName $featureName -NoRestart -ErrorAction Stop | Out-Null
+            $featuresDisabledCount++
+        } catch {
+            Add-CwsWarning "Optional feature was kept: $featureName ($($_.Exception.Message))"
+        }
+    }
 }
+Add-CwsNote "Disabled $featuresDisabledCount enabled legacy optional features from the explicit list."
+Write-Host "Selected legacy feature cleanup finished.`n" -ForegroundColor Green
 
 		Write-Host "REMOVE LEGACY APPS`n"
 		## appwiz.cpl
 
-# uninstall microsoft gameinput
-$findmicrosoftgameinput = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
-$microsoftgameinput = Get-ItemProperty $findmicrosoftgameinput -ErrorAction SilentlyContinue |
-Where-Object { $_.DisplayName -like "*Microsoft GameInput*" }
-if ($microsoftgameinput) {
-$guid = $microsoftgameinput.PSChildName
-Start-Process "msiexec.exe" -ArgumentList "/x $guid /qn /norestart" -Wait -NoNewWindow
+# Microsoft GameInput is preserved because games and input devices can depend on it.
+Add-CwsNote 'Microsoft GameInput was preserved.'
+
+# stop and uninstall OneDrive if present
+Stop-CwsProcessIfPresent -Name 'OneDrive'
+$oneDriveInstallers = @(
+    "$env:SystemRoot\System32\OneDriveSetup.exe",
+    "$env:SystemRoot\SysWOW64\OneDriveSetup.exe"
+)
+foreach ($installer in $oneDriveInstallers) {
+    if (Test-Path -LiteralPath $installer) {
+        try { Start-Process -FilePath $installer -ArgumentList '/uninstall' -Wait -WindowStyle Hidden -ErrorAction Stop } catch { }
+    }
 }
 
-# stop onedrive running
-Stop-Process -Force -Name OneDrive -ErrorAction SilentlyContinue | Out-Null
+Get-ChildItem -Path "C:\Program Files*\Microsoft OneDrive", "$env:LOCALAPPDATA\Microsoft\OneDrive" -Filter 'OneDriveSetup.exe' -Recurse -ErrorAction SilentlyContinue |
+    ForEach-Object { try { Start-Process -FilePath $_.FullName -ArgumentList '/uninstall /allusers' -Wait -WindowStyle Hidden -ErrorAction Stop } catch { } }
 
-# uninstall onedrive
-cmd /c "C:\Windows\System32\OneDriveSetup.exe -uninstall >nul 2>&1"
-# uninstall office 365 onedrive
-Get-ChildItem -Path "C:\Program Files*\Microsoft OneDrive", "$env:LOCALAPPDATA\Microsoft\OneDrive" -Filter "OneDriveSetup.exe" -Recurse -ErrorAction SilentlyContinue |
-ForEach-Object { Start-Process -Wait $_.FullName -ArgumentList "/uninstall /allusers" -WindowStyle Hidden -ErrorAction SilentlyContinue }
-# windows 10 uninstall onedrive
-cmd /c "C:\Windows\SysWOW64\OneDriveSetup.exe -uninstall >nul 2>&1"
-# windows 10 remove onedrive scheduled tasks
-Get-ScheduledTask | Where-Object {$_.Taskname -match 'OneDrive'} | Unregister-ScheduledTask -Confirm:$false
+Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -match 'OneDrive' } |
+    Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
 
-# remove onedrive from startup
 cmd /c "reg delete `"HKCU\Software\Microsoft\Windows\CurrentVersion\Run`" /v `"OneDrive`" /f >nul 2>&1"
 cmd /c "reg delete `"HKLM\Software\Microsoft\Windows\CurrentVersion\Run`" /v `"OneDrive`" /f >nul 2>&1"
-
-# prevent onedrive from being reinstalled by windows
 cmd /c "reg add `"HKLM\SOFTWARE\Policies\Microsoft\Windows\OneDrive`" /v `"DisableFileSyncNGSC`" /t REG_DWORD /d `"1`" /f >nul 2>&1"
 cmd /c "reg add `"HKLM\SOFTWARE\Policies\Microsoft\Windows\OneDrive`" /v `"DisableFileSync`" /t REG_DWORD /d `"1`" /f >nul 2>&1"
 
-# remove onedrive leftover folders
-Remove-Item -Recurse -Force "$env:USERPROFILE\OneDrive" -ErrorAction SilentlyContinue | Out-Null
-Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Microsoft\OneDrive" -ErrorAction SilentlyContinue | Out-Null
-Remove-Item -Recurse -Force "$env:PROGRAMDATA\Microsoft OneDrive" -ErrorAction SilentlyContinue | Out-Null
-
-# uninstall remote desktop connection
-try {
-Start-Process "mstsc" -ArgumentList "/Uninstall" -ErrorAction SilentlyContinue
-} catch { }
-# silent window for remote desktop connection
-$processExists = Get-Process -Name mstsc -ErrorAction SilentlyContinue
-if ($processExists) {
-$running = $true
-$timeout = 0
-do {
-$mstscProcess = Get-Process -Name mstsc -ErrorAction SilentlyContinue
-if ($mstscProcess -and $mstscProcess.MainWindowHandle -ne 0) {
-Stop-Process -Force -Name mstsc -ErrorAction SilentlyContinue | Out-Null
-$running = $false
-}
-Start-Sleep -Milliseconds 100
-$timeout++
-if ($timeout -gt 100) {
-Stop-Process -Name mstsc -Force -ErrorAction SilentlyContinue
-$running = $false
-}
-} while ($running)
-}
-Start-Sleep -Seconds 1
-
-# windows 10 uninstall old snipping tool
-try {
-Start-Process "C:\Windows\System32\SnippingTool.exe" -ArgumentList "/Uninstall" -ErrorAction SilentlyContinue
-} catch { }
-# silent window for uninstall old snipping tool
-$processExists = Get-Process -Name SnippingTool -ErrorAction SilentlyContinue
-if ($processExists) {
-$running = $true
-$timeout = 0
-do {
-$snipProcess = Get-Process -Name SnippingTool -ErrorAction SilentlyContinue
-if ($snipProcess -and $snipProcess.MainWindowHandle -ne 0) {
-Stop-Process -Force -Name SnippingTool -ErrorAction SilentlyContinue | Out-Null
-$running = $false
-}
-Start-Sleep -Milliseconds 100
-$timeout++
-if ($timeout -gt 100) {
-Stop-Process -Name SnippingTool -Force -ErrorAction SilentlyContinue
-$running = $false
-}
-} while ($running)
-}
-Start-Sleep -Seconds 1
-
-# windows 10 uninstall update for windows 10 for x64-based systems
-$findupdateforwindows = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
-$updateforwindows = Get-ItemProperty $findupdateforwindows -ErrorAction SilentlyContinue |
-Where-Object { $_.DisplayName -like "*Update for x64-based Windows Systems*" }
-if ($updateforwindows) {
-$guid = $updateforwindows.PSChildName
-Start-Process "msiexec.exe" -ArgumentList "/x $guid /qn /norestart" -Wait -NoNewWindow
+foreach ($oneDrivePath in @("$env:USERPROFILE\OneDrive", "$env:LOCALAPPDATA\Microsoft\OneDrive", "$env:PROGRAMDATA\Microsoft OneDrive")) {
+    Remove-CwsPathIfPresent -LiteralPath $oneDrivePath -Recurse
 }
 
-# windows 10 uninstall microsoft update health tools
-$findupdatehealthtools = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
-$updatehealthtools = Get-ItemProperty $findupdatehealthtools -ErrorAction SilentlyContinue |
-Where-Object { $_.DisplayName -like "*Microsoft Update Health Tools*" }
-if ($updatehealthtools) {
-$guid = $updatehealthtools.PSChildName
-Start-Process "msiexec.exe" -ArgumentList "/x $guid /qn /norestart" -Wait -NoNewWindow
+# Preserve Remote Desktop Connection and Snipping Tool. They are Windows features and should not be uninstalled by a general setup script.
+Add-CwsNote 'Remote Desktop Connection and Snipping Tool were preserved.'
+
+# Remove Microsoft Update Health Tools only when its uninstall entry is present.
+$findUpdateHealthTools = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+$updateHealthTools = Get-ItemProperty $findUpdateHealthTools -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like '*Microsoft Update Health Tools*' }
+if ($updateHealthTools) {
+    $guid = $updateHealthTools.PSChildName
+    try { Start-Process 'msiexec.exe' -ArgumentList "/x $guid /qn /norestart" -Wait -NoNewWindow -ErrorAction Stop } catch { }
 }
 cmd /c "reg delete `"HKLM\SYSTEM\CurrentControlSet\Services\uhssvc`" /f >nul 2>&1"
-Unregister-ScheduledTask -TaskName PLUGScheduler -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
 
-# remove startup apps
-        ## taskmgr /0 /startup
-        ## ms-settings:startupapps
-cmd /c "reg delete `"HKCU\Software\Microsoft\Windows\CurrentVersion\RunNotification`" /f >nul 2>&1"
-cmd /c "reg add `"HKCU\Software\Microsoft\Windows\CurrentVersion\RunNotification`" /f >nul 2>&1"
-cmd /c "reg delete `"HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce`" /f >nul 2>&1"
-cmd /c "reg add `"HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce`" /f >nul 2>&1"
-cmd /c "reg delete `"HKCU\Software\Microsoft\Windows\CurrentVersion\Run`" /f >nul 2>&1"
-cmd /c "reg add `"HKCU\Software\Microsoft\Windows\CurrentVersion\Run`" /f >nul 2>&1"
-cmd /c "reg delete `"HKLM\Software\Microsoft\Windows\CurrentVersion\RunOnce`" /f >nul 2>&1"
-cmd /c "reg add `"HKLM\Software\Microsoft\Windows\CurrentVersion\RunOnce`" /f >nul 2>&1"
-cmd /c "reg delete `"HKLM\Software\Microsoft\Windows\CurrentVersion\Run`" /f >nul 2>&1"
-cmd /c "reg add `"HKLM\Software\Microsoft\Windows\CurrentVersion\Run`" /f >nul 2>&1"
-cmd /c "reg delete `"HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce`" /f >nul 2>&1"
-cmd /c "reg add `"HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce`" /f >nul 2>&1"
-cmd /c "reg delete `"HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run`" /f >nul 2>&1"
-cmd /c "reg add `"HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run`" /f >nul 2>&1"
-Remove-Item -Recurse -Force "$env:AppData\Microsoft\Windows\Start Menu\Programs\Startup" -ErrorAction SilentlyContinue | Out-Null
-Remove-Item -Recurse -Force "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp" -ErrorAction SilentlyContinue | Out-Null
-New-Item -Path "$env:AppData\Microsoft\Windows\Start Menu\Programs\Startup" -ItemType Directory -ErrorAction SilentlyContinue | Out-Null
-New-Item -Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp" -ItemType Directory -ErrorAction SilentlyContinue | Out-Null
+$plugScheduler = Get-ScheduledTask -TaskName 'PLUGScheduler' -ErrorAction SilentlyContinue
+if ($plugScheduler) {
+    Unregister-ScheduledTask -TaskName 'PLUGScheduler' -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+}
+
+# Preserve unrelated Run, RunOnce and Startup entries. Only known unwanted entries are removed above.
+Add-CwsNote 'Existing third-party startup entries were preserved.'
 
         Write-Host "INSTALLING APPS`n"
 
-# winget bootstrap helpers
+# WinGet bootstrap helpers
+function Get-CwsDesktopAppInstallerPackage {
+    $packages = @()
+    $packages += @(Get-AppxPackage -Name Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue)
+    $packages += @(Get-AppxPackage -AllUsers -Name Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue)
+    return $packages | Where-Object { $_.InstallLocation } | Sort-Object Version -Descending | Select-Object -First 1
+}
+
 function Get-WinGetExePath {
-    $candidate = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\winget.exe'
-    if (Test-Path $candidate) { return $candidate }
+    $candidates = New-Object System.Collections.Generic.List[string]
+
+    $package = Get-CwsDesktopAppInstallerPackage
+    if ($package) {
+        $candidates.Add((Join-Path $package.InstallLocation 'winget.exe'))
+    }
 
     $command = Get-Command winget.exe -ErrorAction SilentlyContinue
-    if ($command -and $command.Source) { return $command.Source }
+    if ($command -and $command.Source) { $candidates.Add($command.Source) }
 
+    $aliasCandidate = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\winget.exe'
+    if (Test-Path -LiteralPath $aliasCandidate) { $candidates.Add($aliasCandidate) }
+
+    foreach ($candidate in ($candidates | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $candidate)) { continue }
+        $versionOutput = & $candidate --version 2>&1
+        $exitCode = $LASTEXITCODE
+        if ($exitCode -eq 0 -and ($versionOutput -match '\d+\.\d+')) {
+            return $candidate
+        }
+    }
     return $null
 }
 
-function Test-WinGet {
-    $exe = Get-WinGetExePath
-    if ($exe) {
-        $wingetCheck = & $exe --version 2>&1
-        if ($LASTEXITCODE -eq 0 -or ($wingetCheck -match 'v?\d+\.\d+')) { return $true }
+function Register-CwsWinGetForCurrentUser {
+    try {
+        Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe -ErrorAction Stop
+        Start-Sleep -Seconds 3
+        return $true
+    } catch {
+        return $false
     }
-
-    $wingetCheck = cmd /c "winget --version" 2>&1
-    if ($LASTEXITCODE -eq 0 -or ($wingetCheck -match 'v?\d+\.\d+')) { return $true }
-
-    return $false
 }
 
-# register winget for current user session if App Installer already exists
-$desktopAppInstaller = Get-AppxPackage -AllUsers Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($desktopAppInstaller) {
+function Install-CwsWinGetBootstrap {
+    $bootstrapDir = Join-Path $env:SystemRoot 'Temp\CWS-WinGet'
+    New-Item -Path $bootstrapDir -ItemType Directory -Force | Out-Null
+
+    $vclibsPath = Join-Path $bootstrapDir 'Microsoft.VCLibs.x64.14.00.Desktop.appx'
+    $uiXamlNuget = Join-Path $bootstrapDir 'Microsoft.UI.Xaml.2.8.7.zip'
+    $uiXamlExtract = Join-Path $bootstrapDir 'Microsoft.UI.Xaml.2.8.7'
+    $appInstallerPath = Join-Path $bootstrapDir 'Microsoft.DesktopAppInstaller.msixbundle'
+
     try {
-        Add-AppxPackage -DisableDevelopmentMode -Register "$($desktopAppInstaller.InstallLocation)\AppXManifest.xml" -ErrorAction SilentlyContinue
-    } catch { }
-    Start-Sleep -Seconds 5
-}
+        Write-Host 'Downloading signed App Installer dependencies from Microsoft and NuGet...'
+        Invoke-WebRequest -Uri 'https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx' -UseBasicParsing -OutFile $vclibsPath -ErrorAction Stop
+        Invoke-WebRequest -Uri 'https://www.nuget.org/api/v2/package/Microsoft.UI.Xaml/2.8.7' -UseBasicParsing -OutFile $uiXamlNuget -ErrorAction Stop
+        Invoke-WebRequest -Uri 'https://aka.ms/getwinget' -UseBasicParsing -OutFile $appInstallerPath -ErrorAction Stop
 
-$wingetWorks = Test-WinGet
+        Remove-CwsPathIfPresent -LiteralPath $uiXamlExtract -Recurse
+        Expand-Archive -Path $uiXamlNuget -DestinationPath $uiXamlExtract -Force
+        $uiXamlPath = Get-ChildItem -Path $uiXamlExtract -Recurse -Filter 'Microsoft.UI.Xaml.2.8.appx' -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1
 
-# bootstrap winget on LTSC/IoT when App Installer is missing
-if (!$wingetWorks) {
-    Write-Host "winget not found, bootstrapping App Installer...`n" -ForegroundColor Yellow
-    try {
-        Set-ExecutionPolicy Bypass -Scope Process -Force
-        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-        Install-PackageProvider -Name NuGet -Force | Out-Null
-        Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue
-        Install-Module -Name Microsoft.WinGet.Client -Force -Repository PSGallery -Scope AllUsers -ErrorAction SilentlyContinue | Out-Null
-        Import-Module Microsoft.WinGet.Client -ErrorAction SilentlyContinue | Out-Null
-        Repair-WinGetPackageManager -AllUsers -ErrorAction SilentlyContinue | Out-Null
-    } catch { }
-
-    Start-Sleep -Seconds 10
-
-    $desktopAppInstaller = Get-AppxPackage -AllUsers Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($desktopAppInstaller) {
-        try {
-            Add-AppxPackage -DisableDevelopmentMode -Register "$($desktopAppInstaller.InstallLocation)\AppXManifest.xml" -ErrorAction SilentlyContinue
-        } catch { }
+        try { Add-AppxPackage -Path $vclibsPath -ErrorAction Stop } catch { Add-CwsWarning "VCLibs bootstrap: $($_.Exception.Message)" }
+        if ($uiXamlPath) {
+            try { Add-AppxPackage -Path $uiXamlPath.FullName -ErrorAction Stop } catch { Add-CwsWarning "UI.Xaml bootstrap: $($_.Exception.Message)" }
+        }
+        Add-AppxPackage -Path $appInstallerPath -ErrorAction Stop
+        Register-CwsWinGetForCurrentUser | Out-Null
         Start-Sleep -Seconds 5
+        return $true
+    } catch {
+        Add-CwsWarning "App Installer bootstrap failed: $($_.Exception.Message)"
+        return $false
     }
-
-    $wingetWorks = Test-WinGet
 }
 
-$wingetExe = Get-WinGetExePath
-if (!$wingetExe -and $wingetWorks) { $wingetExe = 'winget' }
+Register-CwsWinGetForCurrentUser | Out-Null
+$script:wingetExe = Get-WinGetExePath
+if (-not $script:wingetExe) {
+    Write-Host "WinGet was not registered. Bootstrapping App Installer...`n" -ForegroundColor Yellow
+    Install-CwsWinGetBootstrap | Out-Null
+    $script:wingetExe = Get-WinGetExePath
+}
 
-if (!$wingetWorks) {
-    Write-Host "winget could not be found after bootstrap attempt, skipping app installs`n" -ForegroundColor Red
+$wingetWorks = [bool]$script:wingetExe
+if ($wingetWorks) {
+    Write-Host "Using WinGet: $script:wingetExe`n" -ForegroundColor Green
+    $sourceOutput = & $script:wingetExe source update --disable-interactivity 2>&1
+    $sourceExit = $LASTEXITCODE
+    $sourceOutput | ForEach-Object { Write-Host $_ }
+    if ($sourceExit -ne 0) { Add-CwsWarning "WinGet source update returned exit code $sourceExit." }
+} else {
+    Add-CwsWarning 'WinGet could not be resolved after App Installer registration and bootstrap. App installs will be skipped.'
 }
 
 function Invoke-CwsWinGetInstall {
     param(
         [Parameter(Mandatory)][string]$Id,
-        [string]$Source = ""
+        [string]$Source = ''
     )
 
-    if (-not $wingetExe) { return 1 }
+    if (-not $script:wingetExe) { return [int]1 }
 
     $arguments = @(
-        "install",
-        "--id", $Id,
-        "-e",
-        "--silent",
-        "--accept-package-agreements",
-        "--accept-source-agreements",
-        "--disable-interactivity",
-        "--no-upgrade"
+        'install', '--id', $Id, '-e', '--silent',
+        '--accept-package-agreements', '--accept-source-agreements',
+        '--disable-interactivity', '--no-upgrade'
     )
+    if (-not [string]::IsNullOrWhiteSpace($Source)) { $arguments += @('--source', $Source) }
 
-    if (-not [string]::IsNullOrWhiteSpace($Source)) {
-        $arguments += @("--source", $Source)
+    $output = & $script:wingetExe @arguments 2>&1
+    $exitCode = [int]$LASTEXITCODE
+    $output | ForEach-Object { Write-Host $_ }
+
+    if ($exitCode -ne 0) {
+        $listArguments = @('list', '--id', $Id, '-e', '--accept-source-agreements', '--disable-interactivity')
+        if (-not [string]::IsNullOrWhiteSpace($Source)) { $listArguments += @('--source', $Source) }
+        $listOutput = & $script:wingetExe @listArguments 2>&1
+        $listExitCode = [int]$LASTEXITCODE
+        if ($listExitCode -eq 0 -and (($listOutput | Out-String) -match [regex]::Escape($Id))) {
+            return [int]0
+        }
     }
-
-    & $wingetExe @arguments
-    return $LASTEXITCODE
+    return [int]$exitCode
 }
 
-# Brave Origin is intentionally not installed unattended.
-# The vendor web installer currently can fail with 0x80040C01 or show an HTTP error dialog during silent/system-level installation.
-# Keep the script non-blocking and create a manual install shortcut instead.
+$apps = @(
+    '7zip.7zip',
+    'Microsoft.AppInstaller',
+    'Balena.Etcher',
+    'Bambulab.Bambustudio',
+    'Apple.Bonjour',
+    'Anthropic.Claude',
+    'Microsoft.DirectX',
+    'Discord.Discord',
+    'Discord.Discord.PTB',
+    'File-New-Project.EarTrumpet',
+    'Element.Element',
+    'Elgato.StreamDeck',
+    'EpicGames.EpicGamesLauncher',
+    'Futuremark.FuturemarkSystemInfo',
+    'Google.Chrome',
+    'REALiX.HWiNFO',
+    'Oracle.JavaRuntimeEnvironment',
+    'Logitech.GHUB',
+    'Microsoft.DotNet.Framework.DeveloperPack.4.5',
+    'Microsoft.DotNet.Framework.DeveloperPack_4',
+    'Microsoft.DotNet.Native.Runtime',
+    'Microsoft.DotNet.Runtime.3_1',
+    'Microsoft.DotNet.Runtime.5',
+    'Microsoft.DotNet.Runtime.6',
+    'Microsoft.DotNet.Runtime.7',
+    'Microsoft.DotNet.Runtime.8',
+    'Microsoft.Edge',
+    'Microsoft.EdgeWebView2Runtime',
+    'Microsoft.VCRedist.2005.x86',
+    'Microsoft.VCRedist.2005.x64',
+    'Microsoft.VCRedist.2008.x64',
+    'Microsoft.VCRedist.2008.x86',
+    'Microsoft.VCRedist.2010.x64',
+    'Microsoft.VCRedist.2010.x86',
+    'Microsoft.VCRedist.2012.x64',
+    'Microsoft.VCRedist.2012.x86',
+    'Microsoft.VCRedist.2013.x64',
+    'Microsoft.VCRedist.2013.x86',
+    'Microsoft.VCLibs.Desktop.14',
+    'Microsoft.VCLibs.14',
+    'Microsoft.VCRedist.2015+.x64',
+    'Microsoft.VCRedist.2015+.x86',
+    'Microsoft.UI.Xaml.2.8',
+    'rcmaehl.MSEdgeRedirect',
+    'Nvidia.PhysX',
+    'Obsidian.Obsidian',
+    'Microsoft.OpenSSH.Preview',
+    'Perplexity.Perplexity',
+    'Microsoft.PowerShell',
+    'Microsoft.PowerToys',
+    'Proton.ProtonDrive',
+    'Proton.ProtonMail',
+    'Proton.ProtonVPN',
+    'RaspberryPiFoundation.RaspberryPiImager',
+    'RevoUninstaller.RevoUninstallerPro',
+    'RockstarGames.Launcher',
+    'ShareX.ShareX',
+    'SlackTechnologies.Slack',
+    'Valve.Steam',
+    'SublimeHQ.SublimeText.4',
+    'SergeySerkov.TagScanner',
+    'Tailscale.Tailscale',
+    'Telegram.TelegramDesktop',
+    'Termius.Termius',
+    'Ubisoft.Connect',
+    'VideoLAN.VLC',
+    'Microsoft.WindowsApp',
+    'Microsoft.WindowsAppRuntime.1.6',
+    'Microsoft.WindowsAppRuntime.1.7',
+    'Microsoft.WindowsAppRuntime.1.8',
+    'Microsoft.WindowsTerminal',
+    'memstechtips.Winhance',
+    'RARLab.WinRAR',
+    'WinSCP.WinSCP',
+    'Zoom.Zoom',
+    'Devolutions.UniGetUI',
+    'Apple.iTunes',
+    'ElectronicArts.EADesktop',
+    'Microsoft.Sysinternals.Autoruns'
+)
+if ([Environment]::OSVersion.Version.Build -ge 22000) { $apps += 'StartIsBack.StartAllBack' }
+
+# Brave Origin is intentionally manual because its web installer is not reliable unattended.
 Write-Host "BRAVE ORIGIN`n"
-$braveOriginUrl = "https://laptop-updates.brave.com/latest/origin"
-$braveOriginManualPath = Join-Path ([Environment]::GetFolderPath('Desktop')) "Install Brave Origin.url"
+$braveOriginUrl = 'https://laptop-updates.brave.com/latest/origin'
+$braveOriginManualPath = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Install Brave Origin.url'
 try {
     Set-Content -Path $braveOriginManualPath -Value "[InternetShortcut]`r`nURL=$braveOriginUrl`r`n" -Encoding ASCII -Force
-    $failedApps += "Brave Origin skipped for manual install - desktop shortcut created"
+    Add-CwsNote 'Brave Origin was left as a manual desktop shortcut.'
 } catch {
-    $failedApps += "Brave Origin manual shortcut failed ($($_.Exception.Message))"
+    Add-CwsWarning "Brave Origin shortcut could not be created: $($_.Exception.Message)"
 }
 
-foreach ($app in $apps) {
-    $installExitCode = Invoke-CwsWinGetInstall -Id $app
-    if ($installExitCode -ne 0) { $failedApps += "$app (exit $installExitCode)" }
+if ($wingetWorks) {
+    $appNumber = 0
+    foreach ($app in $apps) {
+        $appNumber++
+        Write-Host "[$appNumber/$($apps.Count)] Installing $app" -ForegroundColor Cyan
+        $installExitCode = Invoke-CwsWinGetInstall -Id $app
+        if ($installExitCode -ne 0) { $failedApps += "$app (exit $installExitCode)" }
+    }
 }
 
 # clean up taskbar - remove all pins, clear stale layout XMLs, remove duplicate shortcuts
@@ -2940,21 +3121,31 @@ cmd /c "reg add `"HKLM\SOFTWARE\Policies\BraveSoftware\Brave`" /v `"MetricsRepor
     	## explorer "https://www.nvidia.com/en-us/drivers"
 		## shell:appsFolder\NVIDIACorp.NVIDIAControlPanel_56jybvy8sckqj!NVIDIACorp.NVIDIAControlPanel
 
-# download driver
-Start-Sleep -Seconds 5
-Start-Process "C:\Program Files\Google\Chrome\Application\chrome.exe" "https://www.nvidia.com/en-us/drivers"
-Wait-Process -Name chrome
+# open the official NVIDIA driver page in the default browser
+Start-Process 'https://www.nvidia.com/en-us/drivers'
+Read-Host 'Download the correct NVIDIA driver, then press Enter to select the downloaded installer'
 
         Write-Host "SELECT DOWNLOADED DRIVER`n" -ForegroundColor Yellow
 
-# select driver
-Start-Sleep -Seconds 5
 $InstallFile = Show-ModernFilePicker -Mode File
+if ([string]::IsNullOrWhiteSpace($InstallFile) -or -not (Test-Path -LiteralPath $InstallFile)) {
+    Add-CwsWarning 'No NVIDIA driver installer was selected. NVIDIA installation was skipped.'
+    break
+}
+
+$sevenZipExe = 'C:\Program Files\7-Zip\7z.exe'
+if (-not (Test-Path -LiteralPath $sevenZipExe)) {
+    throw '7-Zip is required to extract the NVIDIA driver, but 7z.exe was not found.'
+}
 
         Write-Host "DEBLOATING DRIVER`n"
 
-# extract driver with 7zip
-& "C:\Program Files\7-Zip\7z.exe" x "$InstallFile" -o"$env:SystemRoot\Temp\NvidiaDriver" -y | Out-Null
+$driverExtractPath = Join-Path $env:SystemRoot 'Temp\NvidiaDriver'
+Remove-CwsPathIfPresent -LiteralPath $driverExtractPath -Recurse
+& $sevenZipExe x $InstallFile "-o$driverExtractPath" -y | Out-Null
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $driverExtractPath 'setup.exe'))) {
+    throw 'The NVIDIA driver could not be extracted or setup.exe was not found.'
+}
 
 # debloat nvidia driver
 Remove-Item "$env:SystemRoot\Temp\NvidiaDriver\Display.Nview" -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
@@ -2989,7 +3180,7 @@ Remove-Item "$env:SystemRoot\Temp\NvidiaDriver\NvApp\NvConfigGenerator.dll" -For
         Write-Host "INSTALLING DRIVER`n"
 
 # install nvidia driver
-Start-Process "$env:SystemRoot\Temp\NvidiaDriver\setup.exe" -ArgumentList "-s -noreboot -noeula -clean" -Wait -NoNewWindow
+Start-Process (Join-Path $driverExtractPath 'setup.exe') -ArgumentList '-s -noreboot -noeula -clean' -Wait -NoNewWindow
 
 # install nvidia control panel
 try {
@@ -3000,27 +3191,32 @@ if ($wingetWorks) {
 } catch { }
 
 # delete download
-Remove-Item "$InstallFile" -Force -ErrorAction SilentlyContinue | Out-Null
+Remove-CwsPathIfPresent -LiteralPath $InstallFile
 
 # delete old driver files
-Remove-Item "$env:SystemDrive\NVIDIA" -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
+Remove-CwsPathIfPresent -LiteralPath "$env:SystemDrive\NVIDIA" -Recurse
 
         Write-Host "IMPORTING SETTINGS`n"
 
-# turn on disable dynamic pstate
-$subkeys = Get-ChildItem -Path "Registry::HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}" -Force -ErrorAction SilentlyContinue
-foreach($key in $subkeys){
-if ($key -notlike '*Configuration'){
-reg add "$key" /v "DisableDynamicPstate" /t REG_DWORD /d "1" /f | Out-Null
-}
+function Get-CwsNvidiaDisplayRegistryKeys {
+    $classPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}'
+    if (-not (Test-Path $classPath)) { return @() }
+    return @(Get-ChildItem -Path $classPath -ErrorAction SilentlyContinue | Where-Object {
+        $properties = Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue
+        $properties.DriverDesc -match 'NVIDIA' -or $properties.ProviderName -match 'NVIDIA'
+    })
 }
 
-# disable hdcp
-$subkeys = Get-ChildItem -Path "Registry::HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}" -Force -ErrorAction SilentlyContinue
-foreach($key in $subkeys){
-if ($key -notlike '*Configuration'){
-reg add "$key" /v "RMHdcpKeyglobZero" /t REG_DWORD /d "1" /f | Out-Null
+$nvidiaRegistryKeys = Get-CwsNvidiaDisplayRegistryKeys
+
+# turn on disable dynamic pstate
+foreach ($key in $nvidiaRegistryKeys) {
+    try { New-ItemProperty -Path $key.PSPath -Name 'DisableDynamicPstate' -PropertyType DWord -Value 1 -Force -ErrorAction Stop | Out-Null } catch { Add-CwsWarning "NVIDIA DisableDynamicPstate was not applied to $($key.PSChildName)." }
 }
+
+# disable HDCP for NVIDIA adapters only
+foreach ($key in $nvidiaRegistryKeys) {
+    try { New-ItemProperty -Path $key.PSPath -Name 'RMHdcpKeyglobZero' -PropertyType DWord -Value 1 -Force -ErrorAction Stop | Out-Null } catch { Add-CwsWarning "NVIDIA HDCP setting was not applied to $($key.PSChildName)." }
 }
 
 # unblock drs files
@@ -3035,12 +3231,9 @@ cmd /c "reg add `"HKLM\System\CurrentControlSet\Services\nvlddmkm\Parameters\Glo
 # enable developer settings
 cmd /c "reg add `"HKLM\System\CurrentControlSet\Services\nvlddmkm\Parameters\Global\NVTweak`" /v `"NvDevToolsVisible`" /t REG_DWORD /d `"1`" /f >nul 2>&1"
 
-# allow access to the gpu performance counters to all users
-$subkeys = Get-ChildItem -Path "Registry::HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}" -Force -ErrorAction SilentlyContinue
-foreach($key in $subkeys){
-if ($key -notlike '*Configuration'){
-reg add "$key" /v "RmProfilingAdminOnly" /t REG_DWORD /d "0" /f | Out-Null
-}
+# allow access to NVIDIA GPU performance counters for all users
+foreach ($key in $nvidiaRegistryKeys) {
+    try { New-ItemProperty -Path $key.PSPath -Name 'RmProfilingAdminOnly' -PropertyType DWord -Value 0 -Force -ErrorAction Stop | Out-Null } catch { Add-CwsWarning "NVIDIA profiling setting was not applied to $($key.PSChildName)." }
 }
 cmd /c "reg add `"HKLM\System\CurrentControlSet\Services\nvlddmkm\Parameters\Global\NVTweak`" /v `"RmProfilingAdminOnly`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
 
@@ -3055,8 +3248,8 @@ cmd /c "reg add `"HKLM\SYSTEM\CurrentControlSet\Services\nvlddmkm\Parameters\FTS
 # turn on no scaling for all displays
 $configKeys = Get-ChildItem -Path "HKLM:\System\CurrentControlSet\Control\GraphicsDrivers\Configuration" -Recurse -ErrorAction SilentlyContinue
 foreach ($key in $configKeys) {
-$scalingValue = Get-ItemProperty -Path $key.PSPath -Name "Scaling" -ErrorAction SilentlyContinue
-if ($scalingValue) {
+$scalingValue = Get-ItemPropertyValue -Path $key.PSPath -Name 'Scaling' -ErrorAction SilentlyContinue
+if ($null -ne $scalingValue) {
 $regPath = $key.PSPath.Replace('Microsoft.PowerShell.Core\Registry::', '').Replace('HKEY_LOCAL_MACHINE', 'HKLM')
 Run-Trusted -command "reg add `"$regPath`" /v `"Scaling`" /t REG_DWORD /d `"2`" /f"
 }
@@ -3293,30 +3486,37 @@ Start-Process -wait "$env:SystemRoot\Temp\Inspector\nvidiaProfileInspector.exe" 
 		## explorer "https://www.amd.com/en/support/download/drivers.html"
 		## C:\Program Files\AMD\CNext\CNext\RadeonSoftware.exe
 
-# download driver
-Start-Sleep -Seconds 5
-Start-Process "C:\Program Files\Google\Chrome\Application\chrome.exe" "https://www.amd.com/en/support/download/drivers.html"
-Wait-Process -Name chrome
+# open the official AMD driver page in the default browser
+Start-Process 'https://www.amd.com/en/support/download/drivers.html'
+Read-Host 'Download the correct AMD driver, then press Enter to select the downloaded installer'
 
         Write-Host "SELECT DOWNLOADED DRIVER`n" -ForegroundColor Yellow
 
-# select driver
-Start-Sleep -Seconds 5
 $InstallFile = Show-ModernFilePicker -Mode File
+if ([string]::IsNullOrWhiteSpace($InstallFile) -or -not (Test-Path -LiteralPath $InstallFile)) {
+    Add-CwsWarning 'No AMD driver installer was selected. AMD installation was skipped.'
+    break
+}
+
+$sevenZipExe = 'C:\Program Files\7-Zip\7z.exe'
+if (-not (Test-Path -LiteralPath $sevenZipExe)) { throw '7-Zip is required to extract the AMD driver.' }
+$amdDriverPath = Join-Path $env:SystemRoot 'Temp\AmdDriver'
+Remove-CwsPathIfPresent -LiteralPath $amdDriverPath -Recurse
+& $sevenZipExe x $InstallFile "-o$amdDriverPath" -y | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'The AMD driver could not be extracted.' }
 
         Write-Host "DEBLOATING DRIVER`n"
 
-# extract driver with 7zip
-& "C:\Program Files\7-Zip\7z.exe" x "$InstallFile" -o"$env:SystemRoot\Temp\AmdDriver" -y | Out-Null
-
 # debloat amd driver
 $path = "$env:SystemRoot\Temp\AmdDriver\Packages\Drivers\Display\WT6A_INF"
+if (Test-Path -LiteralPath $path) {
 Get-ChildItem $path -Directory | Where-Object {
     $_.Name -notlike "B*" -and
     $_.Name -ne "amdvlk" -and
     $_.Name -ne "amdogl" -and
 	$_.Name -ne "amdocl"
-} | Remove-Item -Recurse -Force
+} | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 # edit xml files, set enabled & hidden to false
 $xmlFiles = @(
@@ -3356,7 +3556,9 @@ Set-Content $file -Value $content -NoNewline
         Write-Host "INSTALLING DRIVER`n"
 
 # install amd driver
-Start-Process -Wait "$env:SystemRoot\Temp\AmdDriver\Bin64\ATISetup.exe" -ArgumentList "-INSTALL -VIEW:2" -WindowStyle Hidden
+if (Test-Path -LiteralPath (Join-Path $amdDriverPath 'Bin64\ATISetup.exe')) {
+    Start-Process -Wait (Join-Path $amdDriverPath 'Bin64\ATISetup.exe') -ArgumentList '-INSTALL -VIEW:2' -WindowStyle Hidden
+} else { throw 'AMD ATISetup.exe was not found after extraction.' }
 
 # delete amdnoisesuppression startup
 cmd /c "reg delete `"HKCU\Software\Microsoft\Windows\CurrentVersion\Run`" /v `"AMDNoiseSuppression`" /f >nul 2>&1"
@@ -3393,7 +3595,7 @@ Start-Process "msiexec.exe" -ArgumentList "/x $guid /qn /norestart" -Wait -NoNew
 }
 
 # delete download
-Remove-Item "$InstallFile" -Force -ErrorAction SilentlyContinue | Out-Null
+Remove-CwsPathIfPresent -LiteralPath $InstallFile
 
 # cleaner start menu shortcut path
 $folderName = "AMD Software$([char]0xA789) Adrenalin Edition"
@@ -3401,7 +3603,7 @@ Move-Item -Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\$folderN
 Remove-Item "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\$folderName" -Recurse -Force -ErrorAction SilentlyContinue
 
 # delete old driver files
-Remove-Item "$env:SystemDrive\AMD" -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
+Remove-CwsPathIfPresent -LiteralPath "$env:SystemDrive\AMD" -Recurse
 
 # wait incase driver timeout or installer bugs
 
@@ -3519,31 +3721,39 @@ cmd /c "reg add `"HKCU\Software\AMD\CN\VirtualSuperResolution`" /v `"AlreadyNoti
 		## shell:appsFolder\AppUp.IntelGraphicsExperience_8j3eq9eme6ctt!App
 		## C:\Program Files\Intel\Intel Graphics Software\IntelGraphicsSoftware.exe
 
-# download driver
-Start-Sleep -Seconds 5
-Start-Process "C:\Program Files\Google\Chrome\Application\chrome.exe" "https://www.intel.com/content/www/us/en/search.html#sortCriteria=%40lastmodifieddt%20descending&f-operatingsystem_en=Windows%2011%20Family*&f-downloadtype=Drivers&cf-tabfilter=Downloads&cf-downloadsppth=Graphics"
-Wait-Process -Name chrome
+# open the official Intel driver page in the default browser
+$intelDriverUrl = 'https://www.intel.com/content/www/us/en/download-center/home.html'
+Start-Process $intelDriverUrl
+Read-Host 'Download the correct Intel graphics driver, then press Enter to select the downloaded installer'
 
         Write-Host "SELECT DOWNLOADED DRIVER`n" -ForegroundColor Yellow
 
-# select driver
-Start-Sleep -Seconds 5
 $InstallFile = Show-ModernFilePicker -Mode File
+if ([string]::IsNullOrWhiteSpace($InstallFile) -or -not (Test-Path -LiteralPath $InstallFile)) {
+    Add-CwsWarning 'No Intel driver installer was selected. Intel installation was skipped.'
+    break
+}
+
+$sevenZipExe = 'C:\Program Files\7-Zip\7z.exe'
+if (-not (Test-Path -LiteralPath $sevenZipExe)) { throw '7-Zip is required to extract the Intel driver.' }
+$intelDriverPath = Join-Path $env:SystemDrive 'IntelDriver'
+Remove-CwsPathIfPresent -LiteralPath $intelDriverPath -Recurse
+& $sevenZipExe x $InstallFile "-o$intelDriverPath" -y | Out-Null
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $intelDriverPath 'Installer.exe'))) {
+    throw 'The Intel driver could not be extracted or Installer.exe was not found.'
+}
 
         Write-Host "DEBLOATING DRIVER`n"
-
-# extract driver with 7zip
-& "C:\Program Files\7-Zip\7z.exe" x "$InstallFile" -o"$env:SystemDrive\IntelDriver" -y | Out-Null
 
         Write-Host "INSTALLING DRIVER`n"
 
 # install intel driver
-Start-Process "cmd.exe" -ArgumentList "/c `"$env:SystemDrive\IntelDriver\Installer.exe`" -f --noExtras --terminateProcesses -s" -WindowStyle Hidden -Wait
+Start-Process 'cmd.exe' -ArgumentList "/c `"$intelDriverPath\Installer.exe`" -f --noExtras --terminateProcesses -s" -WindowStyle Hidden -Wait
 
 # install intel control panel
-$IntelGraphicsSoftware = Get-ChildItem "$env:SystemDrive\IntelDriver\Resources\Extras\IntelGraphicsSoftware_*.exe" | Select-Object -First 1 -ExpandProperty Name
+$IntelGraphicsSoftware = Get-ChildItem (Join-Path $intelDriverPath 'Resources\Extras\IntelGraphicsSoftware_*.exe') -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($IntelGraphicsSoftware) {
-Start-Process "$env:SystemDrive\IntelDriver\Resources\Extras\$IntelGraphicsSoftware" -ArgumentList "/s" -Wait -NoNewWindow
+Start-Process $IntelGraphicsSoftware.FullName -ArgumentList '/s' -Wait -NoNewWindow
 }
 
 # delete intel® graphics software startup
@@ -3579,7 +3789,7 @@ Start-Sleep -Seconds 2
 Remove-Item "$env:SystemDrive\Program Files\Intel\Intel Graphics Software\PresentMonService.exe" -Force -ErrorAction SilentlyContinue | Out-Null 
 
 # delete download
-Remove-Item "$InstallFile" -Force -ErrorAction SilentlyContinue | Out-Null
+Remove-CwsPathIfPresent -LiteralPath $InstallFile
 
 # cleaner start menu shortcut path
 $FileName = "Intel$([char]0xAE) Graphics Software"
@@ -3677,7 +3887,7 @@ try {
 Start-Process shell:appsFolder\NVIDIACorp.NVIDIAControlPanel_56jybvy8sckqj!NVIDIACorp.NVIDIAControlPanel
 } catch { }
 Start-Process mmsys.cpl
-Pause
+Read-Host 'Configure display and sound settings if needed, then press Enter to continue'
 
         Clear-Host
 
@@ -3694,8 +3904,8 @@ cmd /c "reg add `"$regPath`" /v `"AutoColorManagementSupported`" /t REG_DWORD /d
 # turn on no scaling for all displays
 $configKeys = Get-ChildItem -Path "HKLM:\System\CurrentControlSet\Control\GraphicsDrivers\Configuration" -Recurse -ErrorAction SilentlyContinue
 foreach ($key in $configKeys) {
-$scalingValue = Get-ItemProperty -Path $key.PSPath -Name "Scaling" -ErrorAction SilentlyContinue
-if ($scalingValue) {
+$scalingValue = Get-ItemPropertyValue -Path $key.PSPath -Name 'Scaling' -ErrorAction SilentlyContinue
+if ($null -ne $scalingValue) {
 $regPath = $key.PSPath.Replace('Microsoft.PowerShell.Core\Registry::', '').Replace('HKEY_LOCAL_MACHINE', 'HKLM')
 Run-Trusted -command "reg add `"$regPath`" /v `"Scaling`" /t REG_DWORD /d `"2`" /f"
 }
@@ -3711,29 +3921,22 @@ cmd /c "reg add `"HKLM\SYSTEM\CurrentControlSet\Enum\$instanceID\Device Paramete
         Write-Host "POWER PLAN`n"
         ## powercfg.cpl
 
-# import ultimate power plan
-cmd /c "powercfg /duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 99999999-9999-9999-9999-999999999999 >nul 2>&1"
-
-# set ultimate power plan active
-cmd /c "powercfg /SETACTIVE 99999999-9999-9999-9999-999999999999 >nul 2>&1"
-
-# get all powerplans
-$output = powercfg /L
-$powerPlans = @()
-foreach ($line in $output) {
-
-# extract guid manually to avoid language issues
-if ($line -match ':') {
-$parse = $line -split ':'
-$index = $parse[1].Trim().indexof('(')
-$guid = $parse[1].Trim().Substring(0, $index)
-$powerPlans += $guid
+# Create or reuse a dedicated Ultimate Performance plan without deleting OEM or built-in plans.
+$cwsPowerScheme = '99999999-9999-9999-9999-999999999999'
+$availablePowerPlans = (& powercfg.exe /list 2>&1 | Out-String)
+if ($availablePowerPlans -notmatch [regex]::Escape($cwsPowerScheme)) {
+    & powercfg.exe /duplicatescheme 'e9a42b02-d5df-448d-aa00-03f14749eb61' $cwsPowerScheme *> $null
 }
-}
-
-# delete all powerplans
-foreach ($plan in $powerPlans) {
-cmd /c "powercfg /delete $plan 2>nul" | Out-Null
+$availablePowerPlans = (& powercfg.exe /list 2>&1 | Out-String)
+if ($availablePowerPlans -match [regex]::Escape($cwsPowerScheme)) {
+    & powercfg.exe /setactive $cwsPowerScheme *> $null
+    if ($LASTEXITCODE -ne 0) {
+        Add-CwsWarning 'The custom Ultimate Performance plan exists but could not be activated. Current plan settings will be used.'
+        $cwsPowerScheme = 'SCHEME_CURRENT'
+    }
+} else {
+    Add-CwsWarning 'Ultimate Performance is unavailable on this hardware. Current plan settings will be used.'
+    $cwsPowerScheme = 'SCHEME_CURRENT'
 }
 
 # disable hibernate
@@ -3755,170 +3958,135 @@ cmd /c "reg add `"HKLM\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling`" 
 
 # modify desktop & laptop settings
 # hard disk turn off hard disk after 0%
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 0012ee47-9041-4b5d-9b77-535fba8b1442 6738e2c4-e8a5-4a42-b16a-e040e769756e 0x00000000 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 0012ee47-9041-4b5d-9b77-535fba8b1442 6738e2c4-e8a5-4a42-b16a-e040e769756e 0x00000000 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '0012ee47-9041-4b5d-9b77-535fba8b1442' -Setting '6738e2c4-e8a5-4a42-b16a-e040e769756e' -Value '0x00000000' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '0012ee47-9041-4b5d-9b77-535fba8b1442' -Setting '6738e2c4-e8a5-4a42-b16a-e040e769756e' -Value '0x00000000' | Out-Null
 # desktop background settings slide show paused
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 0d7dbae2-4294-402a-ba8e-26777e8488cd 309dce9b-bef4-4119-9921-a851fb12f0f4 001 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 0d7dbae2-4294-402a-ba8e-26777e8488cd 309dce9b-bef4-4119-9921-a851fb12f0f4 001 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '0d7dbae2-4294-402a-ba8e-26777e8488cd' -Setting '309dce9b-bef4-4119-9921-a851fb12f0f4' -Value '001' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '0d7dbae2-4294-402a-ba8e-26777e8488cd' -Setting '309dce9b-bef4-4119-9921-a851fb12f0f4' -Value '001' | Out-Null
 # wireless adapter settings power saving mode maximum performance
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 19cbb8fa-5279-450e-9fac-8a3d5fedd0c1 12bbebe6-58d6-4636-95bb-3217ef867c1a 000 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 19cbb8fa-5279-450e-9fac-8a3d5fedd0c1 12bbebe6-58d6-4636-95bb-3217ef867c1a 000 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '19cbb8fa-5279-450e-9fac-8a3d5fedd0c1' -Setting '12bbebe6-58d6-4636-95bb-3217ef867c1a' -Value '000' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '19cbb8fa-5279-450e-9fac-8a3d5fedd0c1' -Setting '12bbebe6-58d6-4636-95bb-3217ef867c1a' -Value '000' | Out-Null
 # sleep
 # sleep after 0%
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 238c9fa8-0aad-41ed-83f4-97be242c8f20 29f6c1db-86da-48c5-9fdb-f2b67b1f44da 0x00000000 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 238c9fa8-0aad-41ed-83f4-97be242c8f20 29f6c1db-86da-48c5-9fdb-f2b67b1f44da 0x00000000 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '238c9fa8-0aad-41ed-83f4-97be242c8f20' -Setting '29f6c1db-86da-48c5-9fdb-f2b67b1f44da' -Value '0x00000000' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '238c9fa8-0aad-41ed-83f4-97be242c8f20' -Setting '29f6c1db-86da-48c5-9fdb-f2b67b1f44da' -Value '0x00000000' | Out-Null
 # allow hybrid sleep off
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 238c9fa8-0aad-41ed-83f4-97be242c8f20 94ac6d29-73ce-41a6-809f-6363ba21b47e 000 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 238c9fa8-0aad-41ed-83f4-97be242c8f20 94ac6d29-73ce-41a6-809f-6363ba21b47e 000 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '238c9fa8-0aad-41ed-83f4-97be242c8f20' -Setting '94ac6d29-73ce-41a6-809f-6363ba21b47e' -Value '000' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '238c9fa8-0aad-41ed-83f4-97be242c8f20' -Setting '94ac6d29-73ce-41a6-809f-6363ba21b47e' -Value '000' | Out-Null
 # hibernate after
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 238c9fa8-0aad-41ed-83f4-97be242c8f20 9d7815a6-7ee4-497e-8888-515a05f02364 0x00000000 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 238c9fa8-0aad-41ed-83f4-97be242c8f20 9d7815a6-7ee4-497e-8888-515a05f02364 0x00000000 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '238c9fa8-0aad-41ed-83f4-97be242c8f20' -Setting '9d7815a6-7ee4-497e-8888-515a05f02364' -Value '0x00000000' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '238c9fa8-0aad-41ed-83f4-97be242c8f20' -Setting '9d7815a6-7ee4-497e-8888-515a05f02364' -Value '0x00000000' | Out-Null
 # allow wake timers disable
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 238c9fa8-0aad-41ed-83f4-97be242c8f20 bd3b718a-0680-4d9d-8ab2-e1d2b4ac806d 000 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 238c9fa8-0aad-41ed-83f4-97be242c8f20 bd3b718a-0680-4d9d-8ab2-e1d2b4ac806d 000 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '238c9fa8-0aad-41ed-83f4-97be242c8f20' -Setting 'bd3b718a-0680-4d9d-8ab2-e1d2b4ac806d' -Value '000' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '238c9fa8-0aad-41ed-83f4-97be242c8f20' -Setting 'bd3b718a-0680-4d9d-8ab2-e1d2b4ac806d' -Value '000' | Out-Null
 # usb settings
 # unhide hub selective suspend timeout
 cmd /c "reg add `"HKLM\System\CurrentControlSet\Control\Power\PowerSettings\2a737441-1930-4402-8d77-b2bebba308a3\0853a681-27c8-4100-a2fd-82013e970683`" /v `"Attributes`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
 
 # hub selective suspend timeout 0
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 2a737441-1930-4402-8d77-b2bebba308a3 0853a681-27c8-4100-a2fd-82013e970683 0x00000000 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 2a737441-1930-4402-8d77-b2bebba308a3 0853a681-27c8-4100-a2fd-82013e970683 0x00000000 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '2a737441-1930-4402-8d77-b2bebba308a3' -Setting '0853a681-27c8-4100-a2fd-82013e970683' -Value '0x00000000' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '2a737441-1930-4402-8d77-b2bebba308a3' -Setting '0853a681-27c8-4100-a2fd-82013e970683' -Value '0x00000000' | Out-Null
 # usb selective suspend setting disabled
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 000 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 000 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '2a737441-1930-4402-8d77-b2bebba308a3' -Setting '48e6b7a6-50f5-4782-a5d4-53bb8f07e226' -Value '000' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '2a737441-1930-4402-8d77-b2bebba308a3' -Setting '48e6b7a6-50f5-4782-a5d4-53bb8f07e226' -Value '000' | Out-Null
 # unhide usb 3 link power management
 cmd /c "reg add `"HKLM\System\CurrentControlSet\Control\Power\PowerSettings\2a737441-1930-4402-8d77-b2bebba308a3\d4e98f31-5ffe-4ce1-be31-1b38b384c009`" /v `"Attributes`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
 
 # usb 3 link power management - off
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 2a737441-1930-4402-8d77-b2bebba308a3 d4e98f31-5ffe-4ce1-be31-1b38b384c009 000 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 2a737441-1930-4402-8d77-b2bebba308a3 d4e98f31-5ffe-4ce1-be31-1b38b384c009 000 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '2a737441-1930-4402-8d77-b2bebba308a3' -Setting 'd4e98f31-5ffe-4ce1-be31-1b38b384c009' -Value '000' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '2a737441-1930-4402-8d77-b2bebba308a3' -Setting 'd4e98f31-5ffe-4ce1-be31-1b38b384c009' -Value '000' | Out-Null
 # power buttons and lid start menu power button shut down
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 4f971e89-eebd-4455-a8de-9e59040e7347 a7066653-8d6c-40a8-910e-a1f54b84c7e5 002 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 4f971e89-eebd-4455-a8de-9e59040e7347 a7066653-8d6c-40a8-910e-a1f54b84c7e5 002 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '4f971e89-eebd-4455-a8de-9e59040e7347' -Setting 'a7066653-8d6c-40a8-910e-a1f54b84c7e5' -Value '002' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '4f971e89-eebd-4455-a8de-9e59040e7347' -Setting 'a7066653-8d6c-40a8-910e-a1f54b84c7e5' -Value '002' | Out-Null
 # pci express link state power management off
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 501a4d13-42af-4429-9fd1-a8218c268e20 ee12f906-d277-404b-b6da-e5fa1a576df5 000 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 501a4d13-42af-4429-9fd1-a8218c268e20 ee12f906-d277-404b-b6da-e5fa1a576df5 000 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '501a4d13-42af-4429-9fd1-a8218c268e20' -Setting 'ee12f906-d277-404b-b6da-e5fa1a576df5' -Value '000' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '501a4d13-42af-4429-9fd1-a8218c268e20' -Setting 'ee12f906-d277-404b-b6da-e5fa1a576df5' -Value '000' | Out-Null
 # processor power management
 # minimum processor state 100%
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 54533251-82be-4824-96c1-47b60b740d00 893dee8e-2bef-41e0-89c6-b55d0929964c 0x00000064 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 54533251-82be-4824-96c1-47b60b740d00 893dee8e-2bef-41e0-89c6-b55d0929964c 0x00000064 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '54533251-82be-4824-96c1-47b60b740d00' -Setting '893dee8e-2bef-41e0-89c6-b55d0929964c' -Value '0x00000064' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '54533251-82be-4824-96c1-47b60b740d00' -Setting '893dee8e-2bef-41e0-89c6-b55d0929964c' -Value '0x00000064' | Out-Null
 # system cooling policy active
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 54533251-82be-4824-96c1-47b60b740d00 94d3a615-a899-4ac5-ae2b-e4d8f634367f 001 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 54533251-82be-4824-96c1-47b60b740d00 94d3a615-a899-4ac5-ae2b-e4d8f634367f 001 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '54533251-82be-4824-96c1-47b60b740d00' -Setting '94d3a615-a899-4ac5-ae2b-e4d8f634367f' -Value '001' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '54533251-82be-4824-96c1-47b60b740d00' -Setting '94d3a615-a899-4ac5-ae2b-e4d8f634367f' -Value '001' | Out-Null
 # maximum processor state 100%
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 54533251-82be-4824-96c1-47b60b740d00 bc5038f7-23e0-4960-96da-33abaf5935ec 0x00000064 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 54533251-82be-4824-96c1-47b60b740d00 bc5038f7-23e0-4960-96da-33abaf5935ec 0x00000064 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '54533251-82be-4824-96c1-47b60b740d00' -Setting 'bc5038f7-23e0-4960-96da-33abaf5935ec' -Value '0x00000064' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '54533251-82be-4824-96c1-47b60b740d00' -Setting 'bc5038f7-23e0-4960-96da-33abaf5935ec' -Value '0x00000064' | Out-Null
 # unhide processor performance core parking min cores
 cmd /c "reg add `"HKLM\System\CurrentControlSet\Control\Power\PowerSettings\54533251-82be-4824-96c1-47b60b740d00\0cc5b647-c1df-4637-891a-dec35c318583`" /v `"Attributes`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
 
 # unpark cpu cores
 # processor performance core parking min cores 100%
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 54533251-82be-4824-96c1-47b60b740d00 0cc5b647-c1df-4637-891a-dec35c318583 0x00000064 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 54533251-82be-4824-96c1-47b60b740d00 0cc5b647-c1df-4637-891a-dec35c318583 0x00000064 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '54533251-82be-4824-96c1-47b60b740d00' -Setting '0cc5b647-c1df-4637-891a-dec35c318583' -Value '0x00000064' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '54533251-82be-4824-96c1-47b60b740d00' -Setting '0cc5b647-c1df-4637-891a-dec35c318583' -Value '0x00000064' | Out-Null
 # unhide processor performance core parking max cores
 cmd /c "reg add `"HKLM\System\CurrentControlSet\Control\Power\PowerSettings\54533251-82be-4824-96c1-47b60b740d00\ea062031-0e34-4ff1-9b6d-eb1059334028`" /v `"Attributes`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
 
 # unpark cpu cores
 # processor performance core parking max cores 100%
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 54533251-82be-4824-96c1-47b60b740d00 ea062031-0e34-4ff1-9b6d-eb1059334028 0x00000064 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 54533251-82be-4824-96c1-47b60b740d00 ea062031-0e34-4ff1-9b6d-eb1059334028 0x00000064 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '54533251-82be-4824-96c1-47b60b740d00' -Setting 'ea062031-0e34-4ff1-9b6d-eb1059334028' -Value '0x00000064' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '54533251-82be-4824-96c1-47b60b740d00' -Setting 'ea062031-0e34-4ff1-9b6d-eb1059334028' -Value '0x00000064' | Out-Null
 # display
 # turn off display after 10 min - oled protection
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 7516b95f-f776-4464-8c53-06167f40cc99 3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e 600 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 7516b95f-f776-4464-8c53-06167f40cc99 3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e 600 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '7516b95f-f776-4464-8c53-06167f40cc99' -Setting '3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e' -Value '600' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '7516b95f-f776-4464-8c53-06167f40cc99' -Setting '3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e' -Value '600' | Out-Null
 # display brightness 100%
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 7516b95f-f776-4464-8c53-06167f40cc99 aded5e82-b909-4619-9949-f5d71dac0bcb 0x00000064 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 7516b95f-f776-4464-8c53-06167f40cc99 aded5e82-b909-4619-9949-f5d71dac0bcb 0x00000064 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '7516b95f-f776-4464-8c53-06167f40cc99' -Setting 'aded5e82-b909-4619-9949-f5d71dac0bcb' -Value '0x00000064' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '7516b95f-f776-4464-8c53-06167f40cc99' -Setting 'aded5e82-b909-4619-9949-f5d71dac0bcb' -Value '0x00000064' | Out-Null
 # dimmed display brightness 100%
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 7516b95f-f776-4464-8c53-06167f40cc99 f1fbfde2-a960-4165-9f88-50667911ce96 0x00000064 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 7516b95f-f776-4464-8c53-06167f40cc99 f1fbfde2-a960-4165-9f88-50667911ce96 0x00000064 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '7516b95f-f776-4464-8c53-06167f40cc99' -Setting 'f1fbfde2-a960-4165-9f88-50667911ce96' -Value '0x00000064' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '7516b95f-f776-4464-8c53-06167f40cc99' -Setting 'f1fbfde2-a960-4165-9f88-50667911ce96' -Value '0x00000064' | Out-Null
 # enable adaptive brightness off
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 7516b95f-f776-4464-8c53-06167f40cc99 fbd9aa66-9553-4097-ba44-ed6e9d65eab8 000 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 7516b95f-f776-4464-8c53-06167f40cc99 fbd9aa66-9553-4097-ba44-ed6e9d65eab8 000 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '7516b95f-f776-4464-8c53-06167f40cc99' -Setting 'fbd9aa66-9553-4097-ba44-ed6e9d65eab8' -Value '000' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '7516b95f-f776-4464-8c53-06167f40cc99' -Setting 'fbd9aa66-9553-4097-ba44-ed6e9d65eab8' -Value '000' | Out-Null
 # video playback quality bias video playback performance bias
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 9596fb26-9850-41fd-ac3e-f7c3c00afd4b 10778347-1370-4ee0-8bbd-33bdacaade49 001 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 9596fb26-9850-41fd-ac3e-f7c3c00afd4b 10778347-1370-4ee0-8bbd-33bdacaade49 001 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '9596fb26-9850-41fd-ac3e-f7c3c00afd4b' -Setting '10778347-1370-4ee0-8bbd-33bdacaade49' -Value '001' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '9596fb26-9850-41fd-ac3e-f7c3c00afd4b' -Setting '10778347-1370-4ee0-8bbd-33bdacaade49' -Value '001' | Out-Null
 # when playing video optimize video quality
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 9596fb26-9850-41fd-ac3e-f7c3c00afd4b 34c7b99f-9a6d-4b3c-8dc7-b6693b78cef4 000 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 9596fb26-9850-41fd-ac3e-f7c3c00afd4b 34c7b99f-9a6d-4b3c-8dc7-b6693b78cef4 000 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '9596fb26-9850-41fd-ac3e-f7c3c00afd4b' -Setting '34c7b99f-9a6d-4b3c-8dc7-b6693b78cef4' -Value '000' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '9596fb26-9850-41fd-ac3e-f7c3c00afd4b' -Setting '34c7b99f-9a6d-4b3c-8dc7-b6693b78cef4' -Value '000' | Out-Null
 # modify laptop settings
 # intel(r) graphics settings intel(r) graphics power plan maximum performance
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 44f3beca-a7c0-460e-9df2-bb8b99e0cba6 3619c3f2-afb2-4afc-b0e9-e7fef372de36 002 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 44f3beca-a7c0-460e-9df2-bb8b99e0cba6 3619c3f2-afb2-4afc-b0e9-e7fef372de36 002 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '44f3beca-a7c0-460e-9df2-bb8b99e0cba6' -Setting '3619c3f2-afb2-4afc-b0e9-e7fef372de36' -Value '002' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '44f3beca-a7c0-460e-9df2-bb8b99e0cba6' -Setting '3619c3f2-afb2-4afc-b0e9-e7fef372de36' -Value '002' | Out-Null
 # amd power slider overlay best performance
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 c763b4ec-0e50-4b6b-9bed-2b92a6ee884e 7ec1751b-60ed-4588-afb5-9819d3d77d90 003 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 c763b4ec-0e50-4b6b-9bed-2b92a6ee884e 7ec1751b-60ed-4588-afb5-9819d3d77d90 003 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup 'c763b4ec-0e50-4b6b-9bed-2b92a6ee884e' -Setting '7ec1751b-60ed-4588-afb5-9819d3d77d90' -Value '003' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup 'c763b4ec-0e50-4b6b-9bed-2b92a6ee884e' -Setting '7ec1751b-60ed-4588-afb5-9819d3d77d90' -Value '003' | Out-Null
 # ati graphics power settings ati powerplay settings maximize performance
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 f693fb01-e858-4f00-b20f-f30e12ac06d6 191f65b5-d45c-4a4f-8aae-1ab8bfd980e6 001 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 f693fb01-e858-4f00-b20f-f30e12ac06d6 191f65b5-d45c-4a4f-8aae-1ab8bfd980e6 001 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup 'f693fb01-e858-4f00-b20f-f30e12ac06d6' -Setting '191f65b5-d45c-4a4f-8aae-1ab8bfd980e6' -Value '001' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup 'f693fb01-e858-4f00-b20f-f30e12ac06d6' -Setting '191f65b5-d45c-4a4f-8aae-1ab8bfd980e6' -Value '001' | Out-Null
 # switchable dynamic graphics global settings maximize performance
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 e276e160-7cb0-43c6-b20b-73f5dce39954 a1662ab2-9d34-4e53-ba8b-2639b9e20857 003 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 e276e160-7cb0-43c6-b20b-73f5dce39954 a1662ab2-9d34-4e53-ba8b-2639b9e20857 003 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup 'e276e160-7cb0-43c6-b20b-73f5dce39954' -Setting 'a1662ab2-9d34-4e53-ba8b-2639b9e20857' -Value '003' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup 'e276e160-7cb0-43c6-b20b-73f5dce39954' -Setting 'a1662ab2-9d34-4e53-ba8b-2639b9e20857' -Value '003' | Out-Null
 # battery
 # critical battery notification off
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 e73a048d-bf27-4f12-9731-8b2076e8891f 5dbb7c9f-38e9-40d2-9749-4f8a0e9f640f 000 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 e73a048d-bf27-4f12-9731-8b2076e8891f 5dbb7c9f-38e9-40d2-9749-4f8a0e9f640f 000 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting '5dbb7c9f-38e9-40d2-9749-4f8a0e9f640f' -Value '000' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting '5dbb7c9f-38e9-40d2-9749-4f8a0e9f640f' -Value '000' | Out-Null
 # critical battery action do nothing
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 e73a048d-bf27-4f12-9731-8b2076e8891f 637ea02f-bbcb-4015-8e2c-a1c7b9c0b546 000 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 e73a048d-bf27-4f12-9731-8b2076e8891f 637ea02f-bbcb-4015-8e2c-a1c7b9c0b546 000 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting '637ea02f-bbcb-4015-8e2c-a1c7b9c0b546' -Value '000' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting '637ea02f-bbcb-4015-8e2c-a1c7b9c0b546' -Value '000' | Out-Null
 # low battery level 0%
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 e73a048d-bf27-4f12-9731-8b2076e8891f 8183ba9a-e910-48da-8769-14ae6dc1170a 0x00000000 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 e73a048d-bf27-4f12-9731-8b2076e8891f 8183ba9a-e910-48da-8769-14ae6dc1170a 0x00000000 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting '8183ba9a-e910-48da-8769-14ae6dc1170a' -Value '0x00000000' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting '8183ba9a-e910-48da-8769-14ae6dc1170a' -Value '0x00000000' | Out-Null
 # critical battery level 0%
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 e73a048d-bf27-4f12-9731-8b2076e8891f 9a66d8d7-4ff7-4ef9-b5a2-5a326ca2a469 0x00000000 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 e73a048d-bf27-4f12-9731-8b2076e8891f 9a66d8d7-4ff7-4ef9-b5a2-5a326ca2a469 0x00000000 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting '9a66d8d7-4ff7-4ef9-b5a2-5a326ca2a469' -Value '0x00000000' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting '9a66d8d7-4ff7-4ef9-b5a2-5a326ca2a469' -Value '0x00000000' | Out-Null
 # low battery notification off
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 e73a048d-bf27-4f12-9731-8b2076e8891f bcded951-187b-4d05-bccc-f7e51960c258 000 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 e73a048d-bf27-4f12-9731-8b2076e8891f bcded951-187b-4d05-bccc-f7e51960c258 000 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting 'bcded951-187b-4d05-bccc-f7e51960c258' -Value '000' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting 'bcded951-187b-4d05-bccc-f7e51960c258' -Value '000' | Out-Null
 # low battery action do nothing
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 e73a048d-bf27-4f12-9731-8b2076e8891f d8742dcb-3e6a-4b3c-b3fe-374623cdcf06 000 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 e73a048d-bf27-4f12-9731-8b2076e8891f d8742dcb-3e6a-4b3c-b3fe-374623cdcf06 000 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting 'd8742dcb-3e6a-4b3c-b3fe-374623cdcf06' -Value '000' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting 'd8742dcb-3e6a-4b3c-b3fe-374623cdcf06' -Value '000' | Out-Null
 # reserve battery level 0%
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 e73a048d-bf27-4f12-9731-8b2076e8891f f3c5027d-cd16-4930-aa6b-90db844a8f00 0x00000000 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 e73a048d-bf27-4f12-9731-8b2076e8891f f3c5027d-cd16-4930-aa6b-90db844a8f00 0x00000000 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting 'f3c5027d-cd16-4930-aa6b-90db844a8f00' -Value '0x00000000' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting 'f3c5027d-cd16-4930-aa6b-90db844a8f00' -Value '0x00000000' | Out-Null
 # immersive control panel
 # low screen brightness when using battery saver disable
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 de830923-a562-41af-a086-e3a2c6bad2da 13d09884-f74e-474a-a852-b6bde8ad03a8 0x00000064 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 de830923-a562-41af-a086-e3a2c6bad2da 13d09884-f74e-474a-a852-b6bde8ad03a8 0x00000064 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup 'de830923-a562-41af-a086-e3a2c6bad2da' -Setting '13d09884-f74e-474a-a852-b6bde8ad03a8' -Value '0x00000064' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup 'de830923-a562-41af-a086-e3a2c6bad2da' -Setting '13d09884-f74e-474a-a852-b6bde8ad03a8' -Value '0x00000064' | Out-Null
 # turn battery saver on automatically at never
-powercfg /setacvalueindex 99999999-9999-9999-9999-999999999999 de830923-a562-41af-a086-e3a2c6bad2da e69653ca-cf7f-4f05-aa73-cb833fa90ad4 0x00000000 2>$null
-powercfg /setdcvalueindex 99999999-9999-9999-9999-999999999999 de830923-a562-41af-a086-e3a2c6bad2da e69653ca-cf7f-4f05-aa73-cb833fa90ad4 0x00000000 2>$null
-
+Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup 'de830923-a562-41af-a086-e3a2c6bad2da' -Setting 'e69653ca-cf7f-4f05-aa73-cb833fa90ad4' -Value '0x00000000' | Out-Null
+Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup 'de830923-a562-41af-a086-e3a2c6bad2da' -Setting 'e69653ca-cf7f-4f05-aa73-cb833fa90ad4' -Value '0x00000000' | Out-Null
+if ($cwsPowerScheme -ne 'SCHEME_CURRENT') { & powercfg.exe /setactive $cwsPowerScheme *> $null }
         Write-Host "TIMER RESOLUTION`n"
         ## services.msc
 
@@ -4129,12 +4297,12 @@ Start-Process -Wait "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe" -A
 Remove-Item "$env:SystemDrive\Windows\SetTimerResolutionService.cs" -ErrorAction SilentlyContinue | Out-Null
 
 # remove old service if exists
-if (Get-Service -Name "Set Timer Resolution Service" -ErrorAction SilentlyContinue) {
-    Stop-Service -Name "Set Timer Resolution Service" -Force -ErrorAction SilentlyContinue | Out-Null
-    sc.exe delete "Set Timer Resolution Service" | Out-Null
+if (Get-Service -Name "STR" -ErrorAction SilentlyContinue) {
+    Stop-Service -Name "STR" -Force -ErrorAction SilentlyContinue | Out-Null
+    sc.exe delete "STR" | Out-Null
     # wait for SCM to fully release the service before recreating
     $timeout = 30
-    while ((Get-Service -Name "Set Timer Resolution Service" -ErrorAction SilentlyContinue) -and $timeout -gt 0) {
+    while ((Get-Service -Name "STR" -ErrorAction SilentlyContinue) -and $timeout -gt 0) {
         Start-Sleep -Seconds 1
         $timeout--
     }
@@ -4143,9 +4311,9 @@ if (Get-Service -Name "Set Timer Resolution Service" -ErrorAction SilentlyContin
 
 # install and start service only if exe was successfully compiled
 if (Test-Path "$env:SystemDrive\Windows\SetTimerResolutionService.exe") {
-    New-Service -Name "Set Timer Resolution Service" -BinaryPathName "$env:SystemDrive\Windows\SetTimerResolutionService.exe" -ErrorAction SilentlyContinue | Out-Null
-    Set-Service -Name "Set Timer Resolution Service" -StartupType Auto -ErrorAction SilentlyContinue | Out-Null
-    Set-Service -Name "Set Timer Resolution Service" -Status Running -ErrorAction SilentlyContinue | Out-Null
+    New-Service -Name "STR" -DisplayName "Set Timer Resolution Service" -BinaryPathName "$env:SystemDrive\Windows\SetTimerResolutionService.exe" -ErrorAction SilentlyContinue | Out-Null
+    Set-Service -Name "STR" -StartupType Auto -ErrorAction SilentlyContinue | Out-Null
+    Set-Service -Name "STR" -Status Running -ErrorAction SilentlyContinue | Out-Null
 }
 
 # enable global timer resolution requests
@@ -4161,103 +4329,90 @@ cmd /c "bcdedit /set disabledynamictick yes >nul 2>&1"
 cmd /c "cd /d %systemroot%\system32 && lodctr /R >nul 2>&1"
 cmd /c "cd /d %systemroot%\sysWOW64 && lodctr /R >nul 2>&1"
 
-# remove uwp apps pesky on ms account
-        ## ms-settings:appsfeatures
-        ## powershell -noexit -command "get-appxpackage | select name | format-table -autosize"
-Get-AppxPackage -allusers *MSTeams* | Remove-AppxPackage -ErrorAction SilentlyContinue
+# Late AppX cleanup is intentionally omitted. The explicit package list above is the single source of truth.
 
-# remove xbox & gaming components
-Get-AppxPackage -allusers *Microsoft.XboxIdentityProvider* | Remove-AppxPackage -ErrorAction SilentlyContinue
-Get-AppxPackage -allusers *Microsoft.XboxSpeechToTextOverlay* | Remove-AppxPackage -ErrorAction SilentlyContinue
-Get-AppxPackage -allusers *Microsoft.GamingApp* | Remove-AppxPackage -ErrorAction SilentlyContinue
-Get-AppxPackage -allusers *Microsoft.Xbox.TCUI* | Remove-AppxPackage -ErrorAction SilentlyContinue
-Get-AppxPackage -allusers *Microsoft.XboxGamingOverlay* | Remove-AppxPackage -ErrorAction SilentlyContinue
-
-# remove widgets
-Stop-Process -Name Widgets -Force -ErrorAction SilentlyContinue | Out-Null
-Get-AppxPackage -allusers *Microsoft.WidgetsPlatformRuntime* | Remove-AppxPackage -ErrorAction SilentlyContinue
-Get-AppxPackage -allusers *MicrosoftWindows.Client.WebExperience* | Remove-AppxPackage -ErrorAction SilentlyContinue
-
-# remove copilot
-Get-AppxPackage -AllUsers *Copilot* | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
-try { Get-AppxPackage -AllUsers *Microsoft.MicrosoftOfficeHub* | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue } catch { }
-$Appx = (Get-AppxPackage MicrosoftWindows.Client.CoreAI -ErrorAction SilentlyContinue).PackageFullName
-if ($Appx) {
-$Sid = (Get-LocalUser $Env:UserName).Sid.Value
-New-Item "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\EndOfLife\$Sid\$Appx" -Force -ErrorAction SilentlyContinue | Out-Null
-Remove-AppxPackage $Appx -ErrorAction SilentlyContinue
-}
-try { Set-Service -Name WSAIFabricSvc -StartupType Disabled -ErrorAction SilentlyContinue } catch { }
-try { Disable-WindowsOptionalFeature -FeatureName Recall -Online -NoRestart -ErrorAction SilentlyContinue | Out-Null } catch { }
-
-		Write-Host "DISK CLEANUP`n"
+            Write-Host "DISK CLEANUP`n"
 		## cleanmgr.exe
 		## %temp%
 		## temp
 
-# clear %temp% folder
-Remove-Item -Path "$env:USERPROFILE\AppData\Local\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
+# clear user temp while preserving files currently locked by running applications
+Get-ChildItem -LiteralPath "$env:LOCALAPPDATA\Temp" -Force -ErrorAction SilentlyContinue | ForEach-Object {
+    try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop } catch { }
+}
 
-# clear temp folder
-Remove-Item -Path "$env:SystemDrive\Windows\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
+# clear Windows temp selectively. Preserve this script, transcript and handoff files while StepTwo is running.
+$protectedTempNames = @('CWS-StepTwo.log', 'StepOne.ps1', 'StepTwo.ps1', 'DDU.ps1', 'DDU.path')
+Get-ChildItem -LiteralPath "$env:SystemRoot\Temp" -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -notin $protectedTempNames } |
+    ForEach-Object { try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop } catch { } }
 
-# run disk cleanup
-cleanmgr.exe /autoclean /d C:
+try { Start-Process -FilePath 'cleanmgr.exe' -ArgumentList '/autoclean /d C:' -Wait -WindowStyle Hidden -ErrorAction Stop } catch { }
 
-# delete folders & files
-Remove-Item "$env:SystemDrive\inetpub" -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
-Remove-Item "$env:SystemDrive\PerfLogs" -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
-Remove-Item "$env:SystemDrive\XboxGames" -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
-Remove-Item "$env:SystemDrive\Windows.old" -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
-Remove-Item "$env:SystemDrive\DumpStack.log" -Force -ErrorAction SilentlyContinue | Out-Null
+foreach ($cleanupPath in @(
+    "$env:SystemDrive\inetpub",
+    "$env:SystemDrive\PerfLogs",
+    "$env:SystemDrive\XboxGames",
+    "$env:SystemDrive\Windows.old",
+    "$env:SystemDrive\DumpStack.log"
+)) {
+    Remove-CwsPathIfPresent -LiteralPath $cleanupPath -Recurse
+}
 
         Write-Host "RESTORE POINT`n"
-        ## c:\windows\system32\control.exe sysdm.cpl ,4
-        ## rstrui
-
 try {
-# allow multiple restore points
-cmd /c "reg add `"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore`" /v `"SystemRestorePointCreationFrequency`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
-
-# enable restore point
-Enable-ComputerRestore -Drive "C:\" -ErrorAction SilentlyContinue | Out-Null
-
-# create restore point
-Checkpoint-Computer -Description "After Custom Windows Setup" -RestorePointType "MODIFY_SETTINGS" -ErrorAction SilentlyContinue | Out-Null
-
-# revert allow multiple restore points
-cmd /c "reg delete `"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore`" /v `"SystemRestorePointCreationFrequency`" /f >nul 2>&1"
-} catch { }
+    cmd /c "reg add `"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore`" /v `"SystemRestorePointCreationFrequency`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
+    Enable-ComputerRestore -Drive 'C:\' -ErrorAction SilentlyContinue | Out-Null
+    Checkpoint-Computer -Description 'After Custom Windows Setup' -RestorePointType 'MODIFY_SETTINGS' -ErrorAction SilentlyContinue | Out-Null
+    cmd /c "reg delete `"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore`" /v `"SystemRestorePointCreationFrequency`" /f >nul 2>&1"
+} catch { Add-CwsWarning "Final restore point was not created: $($_.Exception.Message)" }
 
         Write-Host "RESTARTING`n" -ForegroundColor Red
 
-# write log file to desktop
+# Write a concise, categorized log. The detailed transcript remains in C:\Windows\Temp.
 $logPath = "$env:USERPROFILE\Desktop\WinSux-Setup-Log.txt"
-$logContent = @()
-$logContent += "WinSux Setup Log - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-$logContent += "=" * 60
-if ($failedApps -and $failedApps.Count -gt 0) {
-    $logContent += "Failed winget installs:"
-    $logContent += ""
+$logContent = @(
+    "WinSux Setup Log - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
+    ('=' * 60),
+    "Detailed transcript: $CwsStepTwoLog",
+    ''
+)
+
+if ($failedApps.Count -gt 0) {
+    $logContent += 'Failed winget installs:'
     foreach ($failed in $failedApps) { $logContent += "[WINGET] $failed" }
-    $logContent += ""
-}
-if ($Error.Count -gt 0) {
-    $logContent += "The following errors occurred during setup:"
-    $logContent += ""
-    foreach ($err in $Error) {
-        $logContent += "[ERROR] $($err.Exception.Message)"
-        if ($err.InvocationInfo.PositionMessage) {
-            $logContent += "        At: $($err.InvocationInfo.PositionMessage -replace '\n.*','')"
-        }
-        $logContent += ""
-    }
+    $logContent += ''
 } else {
-    $logContent += "No errors detected during setup."
+    $logContent += 'All requested WinGet installs completed or were already installed.'
+    $logContent += ''
 }
+
+if ($script:skippedPowerSettings -gt 0) {
+    $setupNotes += "$script:skippedPowerSettings unsupported hardware-specific power settings were skipped."
+}
+
+if ($setupNotes.Count -gt 0) {
+    $logContent += 'Notes:'
+    foreach ($note in $setupNotes) { $logContent += "[NOTE] $note" }
+    $logContent += ''
+}
+
+if ($setupWarnings.Count -gt 0) {
+    $logContent += 'Warnings:'
+    foreach ($warning in $setupWarnings) { $logContent += "[WARNING] $warning" }
+    $logContent += ''
+}
+
+if ($fatalErrors.Count -gt 0) {
+    $logContent += 'Fatal errors:'
+    foreach ($fatal in $fatalErrors) { $logContent += "[FATAL] $fatal" }
+} else {
+    $logContent += 'Setup reached the final stage without a fatal PowerShell error.'
+}
+
 $logContent | Out-File -FilePath $logPath -Encoding UTF8 -Force
 
-try { Unregister-ScheduledTask -TaskName "ItsMauridian-Custom-Windows-Setup-StepTwo" -Confirm:$false -ErrorAction SilentlyContinue } catch { }
+try { Unregister-ScheduledTask -TaskName 'ItsMauridian-Custom-Windows-Setup-StepTwo' -Confirm:$false -ErrorAction SilentlyContinue } catch { }
 try { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null } catch { }
 
 # restart

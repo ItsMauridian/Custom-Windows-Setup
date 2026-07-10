@@ -10,6 +10,37 @@ $Host.PrivateData.ProgressBackgroundColor = "Black"
 $Host.PrivateData.ProgressForegroundColor = "White"
 Clear-Host
 
+# Prevent accidental mouse selection from pausing long-running console work.
+# Microsoft documents that Quick Edit is disabled by keeping
+# ENABLE_EXTENDED_FLAGS and clearing ENABLE_QUICK_EDIT_MODE.
+function Disable-CwsQuickEditMode {
+    try {
+        if (-not ('CwsConsoleNative' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class CwsConsoleNative {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr GetStdHandle(int nStdHandle);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+}
+'@ -ErrorAction Stop
+        }
+        $inputHandle = [CwsConsoleNative]::GetStdHandle(-10)
+        [uint32]$consoleMode = 0
+        if ([CwsConsoleNative]::GetConsoleMode($inputHandle, [ref]$consoleMode)) {
+            [uint32]$newMode = ($consoleMode -bor 0x0080) -band 0xFFFFFFBF
+            [void][CwsConsoleNative]::SetConsoleMode($inputHandle, $newMode)
+        }
+    } catch { }
+}
+Disable-CwsQuickEditMode
+
         # FUNCTION RUN AS TRUSTED INSTALLER
         function Run-Trusted([String]$command) {
         try {

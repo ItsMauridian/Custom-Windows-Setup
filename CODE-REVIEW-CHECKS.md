@@ -1,88 +1,53 @@
-# Code review checks
+# Reliability8 code review checks
 
-This pass focused on stability, security defaults, current upstream patterns, and packaging the repository back in its original GitHub-ready structure.
+## Source-based design checks
 
-## Static checks performed in this sandbox
+- WinGet registration uses the Microsoft-supported `Add-AppxPackage -RegisterByFamilyName` command.
+- App Installer fallback uses signed packages from Microsoft and Microsoft.UI.Xaml from NuGet.
+- The real `winget.exe` is resolved from the registered App Installer package and validated with `--version`.
+- WinGet output is not returned as function data, so exit-code logging remains numeric.
+- AppX removal uses `Main` and `Bundle` package types and an explicit consumer-app list.
+- AppX frameworks and protected system packages are not blanket-removed.
+- Windows capabilities and optional features use explicit target lists and one inventory query per stage.
+- Quick Edit mode is disabled in the main, setup and standalone GPU scripts.
+- Store initialization and the main registry import have timeouts.
+- PowerCfg values are normalized to decimal integers and unsupported settings are counted instead of logged as errors.
+- OEM and built-in power plans are preserved.
 
-- Checked for remaining active old security downgrade writes:
-  - `EnableLUA=0`
-  - `RunAsPPL=0`
-  - `VulnerableDriverBlocklistEnable=0`
-  - HVCI disable writes
-  - kernel `MitigationOptions` overwrites
-  - SmartScreen, PUA, WTDS, phishing, Tamper Protection, Controlled Folder Access and Exploit Guard disable writes
-- Checked for old download references:
-  - 7-Zip 23.01
-  - DDU 18.1.4.2
-- Checked for old connectivity checks:
-  - `Test-Connection 8.8.8.8`
-- Checked for removed app IDs:
-  - `Brave.Brave`
-  - `PuTTY.PuTTY`
-- Checked for active `reg add ... Userinit` handoffs. None remain.
-- Checked here-string headers and terminators for obvious split/extraction damage.
-- Removed duplicate GPU helper copies; GPU helper scripts now exist only in `Graphics/`.
-- Tested the final zip integrity with `unzip -t`.
+## Regression checks
 
-## Important limitation
+- `DigitalExtremes.Warframe`: absent.
+- `Brave.Brave`: absent from the WinGet list.
+- `PuTTY.PuTTY`: absent from the WinGet list.
+- Legacy PowerShellGet WinGet bootstrap: absent.
+- Broad AppX removal: absent.
+- Broad capability removal: absent.
+- Broad optional-feature removal: absent.
+- Destructive Edge and WebView2 uninstall block: absent.
+- Full C drive `desktop.ini` recursion: absent.
+- Full Run and RunOnce key deletion: absent.
+- `Wait-Process -Name chrome`: absent from StepTwo and the standalone GPU installer.
+- WinGet source package removal: absent from the standalone GPU installer.
+- Active transcript deletion during Windows Temp cleanup: prevented.
+- Interactive Microsoft Store settings opening: absent.
+- Deletion of all power plans: absent.
 
-This Linux sandbox does not have Windows PowerShell or PowerShell 7 installed, so I could not run a real Windows PowerShell AST parser or a VM execution test here. The repository includes `.github/workflows/powershell-parse.yml`, which runs parser checks on `windows-latest` after you push.
+## Validation included in the repository
 
-## Extra review improvements in this pass
+`.github/workflows/powershell-parse.yml` runs:
 
-- Replaced the remaining standalone DDU helper `Winlogon\Userinit` handoff with `HKCU\...\RunOnce` using the Safe Mode `*` prefix.
-- Kept a guarded cleanup path for old builds that may have left `DDU.ps1` or `StepOne.ps1` in `Userinit`.
-- Preserved Chrome and Brave update tasks/services so installed browsers do not become stale.
-- Restored Windows driver searching to enabled after the main setup registry pass. DDU still handles temporary Windows Update blocking during driver cleanup.
+- PowerShell parsing with Windows PowerShell 5.1,
+- PowerShell parsing with PowerShell 7,
+- static regression checks for known failures.
 
-- Fixed DDU 18.1.5.5 extraction path handling: the scripts now search for the real `Display Driver Uninstaller.exe`, create the `Settings` folder if needed, and reuse the detected path in Safe Mode.
+## Local validation in the build environment
 
+- All PowerShell files passed a lexical delimiter and here-string balance scan.
+- Repository static checks passed.
+- Zip integrity is checked after packaging.
 
-## DDU resume follow-up check
-- Rechecked StepTwo split output for leftover monolithic here-string escapes.
-- Replaced HKCU StepTwo RunOnce resume with elevated scheduled task resume.
-- Added visible StepTwo failure logging to `C:\Windows\Temp\CWS-StepTwo.log`.
+A real Windows rerun is still required to validate OS servicing, Store access, hardware drivers and vendor installers end to end.
 
-- Follow-up: removed leftover Brave/Chrome update scheduled task deletion lines.
-
-## Hotfix checks
-
-- `DigitalExtremes.Warframe` removed from active app list.
-- Empty SHA256 values no longer hit mandatory parameter binding.
-- Missing NVIDIA DRS folder is guarded with `Test-Path`.
-
-
-## Hotfix 2 checks
-
-- `DigitalExtremes.Warframe` not present in active install list.
-- `Devolutions.UniGetUI` present instead of `MartiCliment.UniGetUI`.
-- `Microsoft.Sysinternals.Autoruns` present instead of `Sysinternals.Autoruns`.
-- `Invoke-CwsWinGetInstall` present in StepTwo.
-- NVIDIA Control Panel install uses `--source msstore`.
-
-
-## Hotfix 3 checks
-
-- Brave Origin installer no longer uses `Start-Process -Wait` without timeout.
-- Brave Origin failure is captured in `$failedApps` and does not block the rest of StepTwo.
-- A manual desktop link is created if Brave Origin cannot be installed silently.
-## Hotfix 4 checks
-
-- Brave Origin no longer starts a web installer from StepTwo.
-- `https://laptop-updates.brave.com/latest/origin` is preserved only as a desktop shortcut target.
-- No `BraveOriginSetup.exe` process is launched by the script.
-- Warframe remains absent from the active install list.
-
-
-## Hotfix 5 checks
-
-- Verified `Scripts/Setup/StepTwo.ps1` no longer contains the stray closing brace after the app install loop.
-- Static brace scan across all `.ps1` files: OK.
-- Static here-string scan across all `.ps1` files: OK.
-
-
-## Hotfix 6
-
-- Added a StepTwo build marker so the GitHub raw file can be verified after upload.
-- Confirmed StepTwo line 2835 is only the foreach closing brace, not an extra stray brace.
-- This hotfix exists because the GitHub raw URL was still serving an older StepTwo file during testing.
+- Confirmed `wsreset.exe -i` is bounded by a 180-second timeout.
+- Confirmed StepTwo verifies Microsoft Store and Desktop App Installer after Store recovery.
+- Confirmed a missing Store package does not prevent the separate WinGet bootstrap.
