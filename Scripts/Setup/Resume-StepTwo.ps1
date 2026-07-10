@@ -1,10 +1,12 @@
 # SCRIPT RUN AS ADMIN
-# BUILD MARKER: reliability13 2026-07-10 - isolated StepTwo child process
+# BUILD MARKER: reliability14 2026-07-10 - isolated StepTwo child process
 $ErrorActionPreference = 'Stop'
 $workRoot = Join-Path $env:ProgramData 'ItsMauridian\Custom-Windows-Setup'
 $logPath = Join-Path $workRoot 'Resume-StepTwo.log'
 $stepTwoPath = Join-Path $workRoot 'StepTwo.ps1'
+$verifyPath = Join-Path $workRoot 'Verify-Setup.ps1'
 $rawStepTwoUrl = 'https://raw.githubusercontent.com/ItsMauridian/Custom-Windows-Setup/refs/heads/main/Scripts/Setup/StepTwo.ps1'
+$rawVerifyUrl = 'https://raw.githubusercontent.com/ItsMauridian/Custom-Windows-Setup/refs/heads/main/Scripts/Setup/Verify-Setup.ps1'
 $powerShellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 
 New-Item -Path $workRoot -ItemType Directory -Force | Out-Null
@@ -117,12 +119,28 @@ try {
         Move-Item -LiteralPath $downloadPath -Destination $stepTwoPath -Force
     }
 
+    if (-not (Test-Path -LiteralPath $verifyPath)) {
+        Write-CwsResumeLog 'Verification script is missing locally. Downloading a fresh copy from GitHub.'
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $verifyDownloadPath = "$verifyPath.download"
+        Invoke-WebRequest -Uri "${rawVerifyUrl}?nocache=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" -UseBasicParsing -TimeoutSec 60 -OutFile $verifyDownloadPath
+        Move-Item -LiteralPath $verifyDownloadPath -Destination $verifyPath -Force
+    }
+
     $tokens = $null
     $parseErrors = $null
     [System.Management.Automation.Language.Parser]::ParseFile($stepTwoPath, [ref]$tokens, [ref]$parseErrors) | Out-Null
     if ($parseErrors.Count -gt 0) {
         $parseText = ($parseErrors | ForEach-Object { $_.Message }) -join '; '
         throw "StepTwo parser validation failed: $parseText"
+    }
+
+    $verifyTokens = $null
+    $verifyParseErrors = $null
+    [System.Management.Automation.Language.Parser]::ParseFile($verifyPath, [ref]$verifyTokens, [ref]$verifyParseErrors) | Out-Null
+    if ($verifyParseErrors.Count -gt 0) {
+        $verifyParseText = ($verifyParseErrors | ForEach-Object { $_.Message }) -join '; '
+        throw "Verify-Setup parser validation failed: $verifyParseText"
     }
 
     Set-Content -Path (Join-Path $workRoot 'StepTwo.started') -Value (Get-Date -Format o) -Encoding ASCII -Force

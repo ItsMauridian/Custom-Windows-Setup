@@ -1,77 +1,90 @@
-# Reliability 12 patch
+# Reliability14 patch summary
 
-## Reliability13
+## Grounding from reliability13
 
-- Replaced the old VCLibs/UI.Xaml/App Installer bootstrap sequence with Microsoft's documented `Repair-WinGetPackageManager` flow.
-- Added a bounded fallback that installs signed Windows App Runtime 1.8 before the current App Installer bundle.
-- Treats already-newer VCLibs and UI.Xaml packages as healthy instead of attempting downgrades.
-- Replaced unsafe `Get-ItemPropertyValue` display-scaling reads in StepTwo and the standalone GPU script.
-- WinGet repair has a 10-minute timeout and StepTwo continues safely if repair is unavailable.
+The successful hardware run reached the final stage without a fatal PowerShell error. WinGet was repaired, most requested applications installed, NVIDIA driver setup completed and the machine restarted normally.
 
+The remaining observed issues were:
 
-- Fixed preference-variable leakage from `Resume-StepTwo.ps1` into `StepTwo.ps1`.
-- StepTwo now runs in a separate Windows PowerShell process after DDU.
-- StepTwo explicitly sets `$ErrorActionPreference = 'Continue'`.
-- Recovery invokes `bcdedit.exe` through `Start-Process` and ignores the expected missing-safeboot result.
-- Added regression checks that reject an in-process `& $stepTwoPath` handoff.
+- Perplexity WinGet EXE installer failure
+- Rockstar Games Launcher manifest hash mismatch
+- .NET Framework developer pack failure
+- four unsupported power settings
+- locked temp files during cleanup
+- inherited transcript noise from earlier failed attempts
 
-# Reliability 12
+Reliability14 addresses these without reintroducing the destructive behavior removed in earlier builds.
 
-- Fixed the PowerShell parser error caused by `$LiteralPath:` in an expandable string.
-- Added a pre-DDU parser gate. StepOne, StepTwo and Resume-StepTwo must all pass the real Windows PowerShell parser before the machine can enter Safe Mode.
-- Added `Scripts/Setup/Recover-StepTwo.ps1` for one-command recovery of a machine that stopped after DDU.
-- Kept the highest-privilege Task Scheduler logon task and HKLM RunOnce handoff.
-- Added a persistent HKLM Run fallback that remains until StepTwo creates its completion marker.
-- Resume logic can recover a missing local StepTwo from Windows Temp or GitHub.
-- Resume logic keeps a global mutex so duplicate triggers cannot start two StepTwo instances.
-- StepOne now forces a normal reboot if DDU exits without performing its requested restart.
-- StepTwo and the wrapper remove all resume entries only after completion.
-- GitHub Actions still parses every PowerShell file with Windows PowerShell 5.1 and PowerShell 7.
+## Resume and DDU
 
-# Reliability8 patch summary
+- Saves all choices before Safe Mode.
+- Keeps reboot-boundary scripts under ProgramData.
+- Parses StepOne, StepTwo, Resume-StepTwo and Verify-Setup before enabling Safe Mode.
+- Uses scheduled task, HKLM RunOnce and persistent HKLM Run recovery paths.
+- Uses an isolated StepTwo PowerShell process and a global mutex.
+- Keeps Recover-StepTwo.ps1 for one-command recovery.
+- Keeps the Safe Mode password warning.
 
-This build is based on the completed Windows 11 VM and laptop test logs from 10 July 2026. It focuses on observed failures, misleading logs, long silent stages and hardware-specific assumptions.
+## WinGet and applications
 
-## Main fixes
+- Uses the package-local WinGet executable instead of relying on PATH aliases.
+- Registers App Installer for the current user when possible.
+- Uses Microsoft.WinGet.Client and Repair-WinGetPackageManager as the primary repair path.
+- Installs Windows App Runtime 1.8 before the current App Installer bundle as fallback.
+- Adds per-package timeouts and progress heartbeats.
+- Uses the `winget` source for normal packages and `msstore` only for selected Store packages.
+- Verifies each selected package after installation.
+- Translates important WinGet exit codes to readable text.
+- Installs Perplexity through its Microsoft Store product ID and adds an official manual shortcut on failure.
+- Adds an official manual shortcut for Rockstar failures.
+- Keeps package hash verification enabled.
+- Keeps .NET 8 and .NET 10 as defaults.
+- Moves .NET 3.1, 5, 6, 7, .NET Native and developer packs to opt-in groups.
+- Keeps Warframe, normal Brave and PuTTY removed.
+- Keeps Brave Origin manual-only.
 
-- Quick Edit selection is disabled while the scripts run, preventing an accidental console click from pausing the process in Select mode.
-- Store initialization now has a three-minute timeout and no longer opens the interactive Microsoft Store settings page.
-- Long Windows settings, AppX, capability and optional-feature stages now print explicit progress.
-- AppX inventory is read once and only an explicit consumer-app list is processed.
-- AppX frameworks, Windows App Runtime, App Installer dependencies and protected Windows system packages are preserved.
-- Windows capabilities and optional features are read once and only explicit targets are removed or disabled.
-- WinGet registration and bootstrap use App Installer, signed Microsoft dependencies and the real package-local `winget.exe`.
-- The legacy PowerShellGet and `Microsoft.WinGet.Client` bootstrap route remains removed.
-- WinGet output is displayed while the helper returns only a numeric exit code.
-- A post-install `winget list` check distinguishes a real failure from an already-installed package.
-- Microsoft Edge and WebView2 are preserved instead of being removed and reinstalled in the same run.
-- Remote Desktop Connection, Snipping Tool, Microsoft GameInput and unrelated startup entries are preserved.
-- GPU vendor pages use the default browser and driver selection is validated before extraction.
-- NVIDIA registry changes target NVIDIA adapter keys and optional DRS/scaling paths are guarded.
-- PowerCfg values are normalized to integers, unsupported settings are skipped, and existing OEM/built-in plans are no longer deleted.
-- The timer-resolution service uses its internal service name `STR` consistently.
-- Temp cleanup preserves StepTwo and its live transcript.
-- The desktop log is categorized instead of dumping the global PowerShell error buffer.
-- GitHub Actions parses every PowerShell file with Windows PowerShell 5.1 and PowerShell 7 and runs regression checks.
+## Privacy and Windows AI
 
-## Intentionally unchanged
+- Disables Windows Copilot through policy and selected package removal.
+- Applies RemoveMicrosoftCopilotApp where supported.
+- Disables Recall availability, Recall snapshots and Click to Do.
+- Disables selected Paint AI features.
+- Removes selected Widgets and Web Experience packages.
+- Disables Spotlight, consumer experiences, suggestions, web search and activity history.
+- Uses edition-aware diagnostic-data values.
+- Disables telemetry services and feedback prompts.
+- Applies supported AppPrivacy policies.
+- Keeps camera, microphone and notifications user controlled.
+- Denies packaged background activity by default with a selected PFN allowlist.
+- Disables Edge Startup Boost and background mode while preserving Edge updates.
+- Removes known heavy application auto-start entries when selected.
 
-- MAS activation flow.
-- Safe Mode and DDU handoff design.
-- The requested WinGet app list, except Warframe remains removed.
-- Visual-effects policy.
-- OneDrive removal policy.
-- Brave Origin remains a manual desktop shortcut.
+## Performance and power
 
-## Build marker
+- Duplicates and activates the native Ultimate Performance template when supported.
+- Falls back to an activatable Balanced-derived `ItsMauridian Ultimate Performance` plan on Modern Standby.
+- Applies maximum AC values and laptop-safe DC values only when settings exist.
+- Detects and reports unsupported settings without failing.
+- Keeps experimental timer and BCD changes disabled by default.
+- Preserves SysMain, memory compression, IPv6 and core network bindings.
+- Removes inherited undocumented multimedia scheduler, network-throttling, service-host and driver-feature overrides.
+- Stops forcing Chrome hardware acceleration off.
 
-```text
-# BUILD MARKER: reliability13 2026-07-10 - persistent DDU resume handoff and recovery
-```
+## Security and reliability audit
 
-## Reliability9 Store verification
+- Preserves UAC, RunAsPPL, HVCI and the vulnerable driver blocklist.
+- Preserves Defender, SmartScreen, Windows Update, Store updates and browser updates.
+- Preserves Defender, Exploit Guard and drive-optimization scheduled tasks.
+- Removes private package-hive modifications and opaque Start-menu binary state.
+- Removes global notification suppression and protected consent-database deletion.
+- Avoids TrustedInstaller service binPath changes.
+- Avoids destructive core network binding changes.
+- Keeps hibernation available and disables only Fast Startup.
+- Keeps WebView2, passkeys, Windows Hello and FIDO2 support.
 
-- Keeps `wsreset.exe -i` as the LTSC Store recovery attempt.
-- Enforces a 180-second timeout so Store recovery cannot block StepTwo forever.
-- Verifies `Microsoft.WindowsStore` and `Microsoft.DesktopAppInstaller` after the recovery attempt.
-- Continues to the dedicated App Installer and WinGet bootstrap when either package is still missing.
+## Verification
+
+- Adds a desktop CWS-Verification-Report.txt.
+- Records saved options, active power plan, Modern Standby, AI and privacy policies, services, security settings, maintenance overrides, network bindings, boot state, BitLocker, GPU drivers and application results.
+- Extends GitHub Actions regression checks.
+- Adds a SHA256 pin for 7-Zip 26.02, alongside the existing DDU and DirectX pins.

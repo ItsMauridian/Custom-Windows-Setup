@@ -1,5 +1,5 @@
 # SCRIPT RUN AS ADMIN
-# BUILD MARKER: reliability13 2026-07-10 - one-command isolated StepTwo recovery
+# BUILD MARKER: reliability14 2026-07-10 - one-command isolated StepTwo recovery
 $ErrorActionPreference = 'Stop'
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
@@ -16,6 +16,7 @@ $rawBase = 'https://raw.githubusercontent.com/ItsMauridian/Custom-Windows-Setup/
 $workRoot = Join-Path $env:ProgramData 'ItsMauridian\Custom-Windows-Setup'
 $stepTwoPath = Join-Path $workRoot 'StepTwo.ps1'
 $resumePath = Join-Path $workRoot 'Resume-StepTwo.ps1'
+$verifyPath = Join-Path $workRoot 'Verify-Setup.ps1'
 $stamp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 
 New-Item -Path $workRoot -ItemType Directory -Force | Out-Null
@@ -31,7 +32,8 @@ try {
 
 $downloads = @(
     @{ Uri = "$rawBase/Scripts/Setup/StepTwo.ps1?nocache=$stamp"; Path = $stepTwoPath },
-    @{ Uri = "$rawBase/Scripts/Setup/Resume-StepTwo.ps1?nocache=$stamp"; Path = $resumePath }
+    @{ Uri = "$rawBase/Scripts/Setup/Resume-StepTwo.ps1?nocache=$stamp"; Path = $resumePath },
+    @{ Uri = "$rawBase/Scripts/Setup/Verify-Setup.ps1?nocache=$stamp"; Path = $verifyPath }
 )
 
 foreach ($download in $downloads) {
@@ -40,7 +42,7 @@ foreach ($download in $downloads) {
     Move-Item -LiteralPath $temporaryPath -Destination $download.Path -Force
 }
 
-foreach ($scriptPath in @($stepTwoPath, $resumePath)) {
+foreach ($scriptPath in @($stepTwoPath, $resumePath, $verifyPath)) {
     $tokens = $null
     $parseErrors = $null
     [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors) | Out-Null
@@ -52,11 +54,14 @@ foreach ($scriptPath in @($stepTwoPath, $resumePath)) {
     }
 }
 
-if (-not (Select-String -Path $stepTwoPath -Pattern 'BUILD MARKER: reliability13' -Quiet)) {
-    throw 'GitHub is not serving the reliability13 StepTwo.ps1 file yet.'
+if (-not (Select-String -Path $stepTwoPath -Pattern 'BUILD MARKER: reliability14' -Quiet)) {
+    throw 'GitHub is not serving the reliability14 StepTwo.ps1 file yet.'
 }
-if (-not (Select-String -Path $resumePath -Pattern 'BUILD MARKER: reliability13' -Quiet)) {
-    throw 'GitHub is not serving the reliability13 Resume-StepTwo.ps1 file yet.'
+if (-not (Select-String -Path $resumePath -Pattern 'BUILD MARKER: reliability14' -Quiet)) {
+    throw 'GitHub is not serving the reliability14 Resume-StepTwo.ps1 file yet.'
+}
+if (-not (Select-String -Path $verifyPath -Pattern 'BUILD MARKER: reliability14' -Quiet)) {
+    throw 'GitHub is not serving the reliability14 Verify-Setup.ps1 file yet.'
 }
 
 Remove-Item -LiteralPath (Join-Path $workRoot 'StepTwo.completed') -Force -ErrorAction SilentlyContinue

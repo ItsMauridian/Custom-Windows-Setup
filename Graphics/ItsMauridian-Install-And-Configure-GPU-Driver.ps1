@@ -1,5 +1,5 @@
 # SCRIPT RUN AS ADMIN
-# BUILD MARKER: reliability13 2026-07-10 - guarded driver downloads and safe display scaling
+# BUILD MARKER: reliability14 2026-07-10 - guarded driver downloads and safe display scaling
 If (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]"Administrator")) {
     Write-Host "Run this from an elevated Administrator PowerShell window." -ForegroundColor Red
     Pause
@@ -117,34 +117,7 @@ function Get-FileFromWeb {
     }
 }
 
-        # FUNCTION RUN AS TRUSTED INSTALLER
-        function Run-Trusted([String]$command) {
-        try {
-    	Stop-Service -Name TrustedInstaller -Force -ErrorAction Stop -WarningAction Stop
-  		}
-  		catch {
-    	taskkill /im trustedinstaller.exe /f >$null
-  		}
-        $service = Get-CimInstance -ClassName Win32_Service -Filter "Name='TrustedInstaller'"
-        $DefaultBinPath = $service.PathName
-  		$trustedInstallerPath = "$env:SystemRoot\servicing\TrustedInstaller.exe"
-  		if ($DefaultBinPath -ne $trustedInstallerPath) {
-    	$DefaultBinPath = $trustedInstallerPath
-  		}
-        $bytes = [System.Text.Encoding]::Unicode.GetBytes($command)
-        $base64Command = [Convert]::ToBase64String($bytes)
-        sc.exe config TrustedInstaller binPath= "cmd.exe /c powershell.exe -encodedcommand $base64Command" | Out-Null
-        sc.exe start TrustedInstaller | Out-Null
-        sc.exe config TrustedInstaller binpath= "`"$DefaultBinPath`"" | Out-Null
-        try {
-    	Stop-Service -Name TrustedInstaller -Force -ErrorAction Stop -WarningAction Stop
-  		}
-  		catch {
-    	taskkill /im trustedinstaller.exe /f >$null
-  		}
-        }
-
-		# FUNCTION MODERN FILE PICKER
+# FUNCTION MODERN FILE PICKER
     	function Show-ModernFilePicker {
     	param(
     	[ValidateSet('Folder', 'File')]
@@ -230,7 +203,7 @@ Start-Process -Wait "$env:SystemRoot\Temp\Chrome.msi" -ArgumentList "/quiet"
 cmd /c "reg add `"HKLM\SOFTWARE\Policies\Google\Chrome\ExtensionInstallForcelist`" /v `"1`" /t REG_SZ /d `"ddkjiahejlhfcafbddmgiahcphecmpfh;https://clients2.google.com/service/update2/crx`" /f >nul 2>&1"
 
 # add chrome policies
-cmd /c "reg add `"HKLM\SOFTWARE\Policies\Google\Chrome`" /v `"HardwareAccelerationModeEnabled`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
+cmd /c "reg delete `"HKLM\SOFTWARE\Policies\Google\Chrome`" /v `"HardwareAccelerationModeEnabled`" /f >nul 2>&1"
 cmd /c "reg add `"HKLM\SOFTWARE\Policies\Google\Chrome`" /v `"BackgroundModeEnabled`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
 cmd /c "reg add `"HKLM\SOFTWARE\Policies\Google\Chrome`" /v `"HighEfficiencyModeEnabled`" /t REG_DWORD /d `"1`" /f >nul 2>&1"
 
@@ -408,7 +381,7 @@ continue
 }
 if ($scalingProperties.PSObject.Properties.Name -contains 'Scaling') {
 $regPath = $key.PSPath.Replace('Microsoft.PowerShell.Core\Registry::', '').Replace('HKEY_LOCAL_MACHINE', 'HKLM')
-Run-Trusted -command "reg add `"$regPath`" /v `"Scaling`" /t REG_DWORD /d `"2`" /f"
+cmd /c "reg add `"$regPath`" /v `"Scaling`" /t REG_DWORD /d `"2`" /f >nul 2>&1"
 }
 }
 
@@ -419,7 +392,7 @@ if (Test-Path $displayDbPath) {
 $displays = Get-ChildItem -Path $displayDbPath -ErrorAction SilentlyContinue
 foreach ($display in $displays) {
 $regPath = $display.PSPath.Replace('Microsoft.PowerShell.Core\Registry::', '').Replace('HKEY_LOCAL_MACHINE', 'HKLM')
-Run-Trusted -command "reg add `"$regPath`" /v `"ScalingConfig`" /t REG_BINARY /d `"DB02000010000000200100000E010000`" /f"
+cmd /c "reg add `"$regPath`" /v `"ScalingConfig`" /t REG_BINARY /d `"DB02000010000000200100000E010000`" /f >nul 2>&1"
 }
 }
 
@@ -1053,7 +1026,7 @@ continue
 }
 if ($scalingProperties.PSObject.Properties.Name -contains 'Scaling') {
 $regPath = $key.PSPath.Replace('Microsoft.PowerShell.Core\Registry::', '').Replace('HKEY_LOCAL_MACHINE', 'HKLM')
-Run-Trusted -command "reg add `"$regPath`" /v `"Scaling`" /t REG_DWORD /d `"2`" /f"
+cmd /c "reg add `"$regPath`" /v `"Scaling`" /t REG_DWORD /d `"2`" /f >nul 2>&1"
 }
 }
 

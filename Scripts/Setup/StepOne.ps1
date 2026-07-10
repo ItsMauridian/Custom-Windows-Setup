@@ -1,5 +1,5 @@
 # SCRIPT RUN AS ADMIN
-# BUILD MARKER: reliability13 2026-07-10 - validated isolated DDU restart handoff
+# BUILD MARKER: reliability14 2026-07-10 - validated isolated DDU restart handoff
 If (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]"Administrator")) {
     Write-Host "Run this from an elevated Administrator PowerShell window." -ForegroundColor Red
     Pause
@@ -42,33 +42,6 @@ public static class CwsConsoleNative {
 }
 Disable-CwsQuickEditMode
 
-        # FUNCTION RUN AS TRUSTED INSTALLER
-        function Run-Trusted([String]$command) {
-        try {
-    	Stop-Service -Name TrustedInstaller -Force -ErrorAction Stop -WarningAction Stop
-  		}
-  		catch {
-    	taskkill /im trustedinstaller.exe /f >$null
-  		}
-        $service = Get-CimInstance -ClassName Win32_Service -Filter "Name='TrustedInstaller'"
-        $DefaultBinPath = $service.PathName
-  		$trustedInstallerPath = "$env:SystemRoot\servicing\TrustedInstaller.exe"
-  		if ($DefaultBinPath -ne $trustedInstallerPath) {
-    	$DefaultBinPath = $trustedInstallerPath
-  		}
-        $bytes = [System.Text.Encoding]::Unicode.GetBytes($command)
-        $base64Command = [Convert]::ToBase64String($bytes)
-        sc.exe config TrustedInstaller binPath= "cmd.exe /c powershell.exe -encodedcommand $base64Command" | Out-Null
-        sc.exe start TrustedInstaller | Out-Null
-        sc.exe config TrustedInstaller binpath= "`"$DefaultBinPath`"" | Out-Null
-        try {
-    	Stop-Service -Name TrustedInstaller -Force -ErrorAction Stop -WarningAction Stop
-  		}
-  		catch {
-    	taskkill /im trustedinstaller.exe /f >$null
-  		}
-        }
-
         # Clean up legacy builds that used Winlogon Userinit for StepOne.
         # New builds use RunOnce with the Safe Mode * prefix instead of replacing Userinit.
         try {
@@ -90,30 +63,22 @@ Disable-CwsQuickEditMode
 		## windowsdefender://coreisolation
 
 $windowssecuritysettings = @(
-# Keep Defender real-time protection enabled. This intentionally replaces the inherited security-downgrade block.
+# Keep Defender real-time protection enabled. Remove notification-suppression values
+# left by older builds so security and firewall alerts return to Windows defaults.
 'cmd /c "reg add `"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Defender\Real-Time Protection`" /v `"DisableRealtimeMonitoring`" /t REG_DWORD /d `"0`" /f >nul 2>&1"',
-
-# Defender and firewall notification noise reduction only. SmartScreen, PUA protection, phishing protection,
-# Tamper Protection, Controlled Folder Access, HVCI, LSA protection, exploit mitigations and the vulnerable
-# driver blocklist are left under Windows defaults/user control.
-'cmd /c "reg add `"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Defender Security Center\Notifications`" /v `"DisableEnhancedNotifications`" /t REG_DWORD /d `"1`" /f >nul 2>&1"',
-'cmd /c "reg add `"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Defender Security Center\Virus and threat protection`" /v `"NoActionNotificationDisabled`" /t REG_DWORD /d `"1`" /f >nul 2>&1"',
-'cmd /c "reg add `"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Defender Security Center\Virus and threat protection`" /v `"SummaryNotificationDisabled`" /t REG_DWORD /d `"1`" /f >nul 2>&1"',
-'cmd /c "reg add `"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Defender Security Center\Virus and threat protection`" /v `"FilesBlockedNotificationDisabled`" /t REG_DWORD /d `"1`" /f >nul 2>&1"',
-'cmd /c "reg add `"HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows Defender Security Center\Account protection`" /v `"DisableNotifications`" /t REG_DWORD /d `"1`" /f >nul 2>&1"',
-'cmd /c "reg add `"HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows Defender Security Center\Account protection`" /v `"DisableDynamiclockNotifications`" /t REG_DWORD /d `"1`" /f >nul 2>&1"',
-'cmd /c "reg add `"HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows Defender Security Center\Account protection`" /v `"DisableWindowsHelloNotifications`" /t REG_DWORD /d `"1`" /f >nul 2>&1"',
-'cmd /c "reg add `"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\DomainProfile`" /v `"DisableNotifications`" /t REG_DWORD /d `"1`" /f >nul 2>&1"',
-'cmd /c "reg add `"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\PublicProfile`" /v `"DisableNotifications`" /t REG_DWORD /d `"1`" /f >nul 2>&1"',
-'cmd /c "reg add `"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\StandardProfile`" /v `"DisableNotifications`" /t REG_DWORD /d `"1`" /f >nul 2>&1"'
+'cmd /c "reg delete `"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Defender Security Center\Notifications`" /v `"DisableEnhancedNotifications`" /f >nul 2>&1"',
+'cmd /c "reg delete `"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Defender Security Center\Virus and threat protection`" /v `"NoActionNotificationDisabled`" /f >nul 2>&1"',
+'cmd /c "reg delete `"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Defender Security Center\Virus and threat protection`" /v `"SummaryNotificationDisabled`" /f >nul 2>&1"',
+'cmd /c "reg delete `"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Defender Security Center\Virus and threat protection`" /v `"FilesBlockedNotificationDisabled`" /f >nul 2>&1"',
+'cmd /c "reg delete `"HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows Defender Security Center\Account protection`" /v `"DisableNotifications`" /f >nul 2>&1"',
+'cmd /c "reg delete `"HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows Defender Security Center\Account protection`" /v `"DisableDynamiclockNotifications`" /f >nul 2>&1"',
+'cmd /c "reg delete `"HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows Defender Security Center\Account protection`" /v `"DisableWindowsHelloNotifications`" /f >nul 2>&1"',
+'cmd /c "reg delete `"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\DomainProfile`" /v `"DisableNotifications`" /f >nul 2>&1"',
+'cmd /c "reg delete `"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\PublicProfile`" /v `"DisableNotifications`" /f >nul 2>&1"',
+'cmd /c "reg delete `"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\StandardProfile`" /v `"DisableNotifications`" /f >nul 2>&1"'
 )
 
-# run $windowssecuritysettings as function with trusted installer
-foreach ($command in $windowssecuritysettings) {
-    Run-Trusted $command
-}
-
-# run $windowssecuritysettings as admin
+# Apply the security defaults as administrator. No TrustedInstaller service changes are needed.
 foreach ($command in $windowssecuritysettings) {
     Invoke-Expression $command
 }

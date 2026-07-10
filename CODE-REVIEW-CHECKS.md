@@ -1,85 +1,97 @@
-# Reliability 12 validation
+# Reliability14 code review checks
 
-Required checks for this build:
+## Parser and archive
 
-- `StepTwo.ps1` has the reliability13 marker and explicitly sets `$ErrorActionPreference = 'Continue'`.
-- `Resume-StepTwo.ps1` starts a separate `powershell.exe` process and does not call `& $stepTwoPath`.
-- `Recover-StepTwo.ps1` does not directly redirect `bcdedit.exe` stderr under a Stop preference.
-- All PowerShell files pass parser validation.
-- The ZIP opens cleanly and contains the repository files at its root.
+- [ ] Every `.ps1` parses with Windows PowerShell 5.1.
+- [ ] Every `.ps1` parses with PowerShell 7.
+- [ ] Here-strings and delimiters are balanced.
+- [ ] The zip opens successfully and contains repository files at its root.
+- [ ] No parent directory is added inside the zip.
 
-# Reliability 12 resume and parser checks
+## DDU and resume
 
-- [x] The `$LiteralPath:` interpolation parser bug is removed.
-- [x] StepOne, StepTwo and Resume-StepTwo are parsed before Safe Mode is enabled.
-- [x] Critical reboot handoff files are stored under ProgramData, not only Windows Temp.
-- [x] Scheduled task registration is verified after creation.
-- [x] HKLM RunOnce is registered as an immediate fallback.
-- [x] HKLM Run is registered as a persistent recovery fallback until completion.
-- [x] Resume wrapper blocks execution while Safe Mode is still active.
-- [x] Resume wrapper prevents duplicate execution with a global mutex.
-- [x] Missing StepTwo can be restored from Temp or downloaded from GitHub.
-- [x] Recover-StepTwo downloads and parses fresh files before executing them.
-- [x] StepTwo removes task, RunOnce and Run entries only after writing its completion marker.
-- [x] StepOne forces a reboot if DDU returns without rebooting Windows.
+- [ ] SetupOptions.json is written before Safe Mode.
+- [ ] StepOne, StepTwo, Resume-StepTwo and Verify-Setup are parsed before Safe Mode.
+- [ ] Handoff scripts are stored under ProgramData.
+- [ ] Scheduled task registration is verified.
+- [ ] HKLM RunOnce and persistent HKLM Run fallbacks are present.
+- [ ] Resume-StepTwo launches StepTwo in an isolated Windows PowerShell process.
+- [ ] The global mutex prevents duplicate StepTwo runs.
+- [ ] Resume entries remain until the completion marker exists.
+- [ ] Recover-StepTwo downloads and parses fresh files.
+- [ ] DDU failure cannot leave the system permanently in Safe Mode.
 
-# Reliability8 code review checks
+## WinGet
 
-## Source-based design checks
+- [ ] The real package-local winget.exe path is resolved and validated.
+- [ ] Repair-WinGetPackageManager is present and bounded by a timeout.
+- [ ] Windows App Runtime 1.8 fallback precedes App Installer fallback.
+- [ ] Normal packages use the winget source.
+- [ ] Selected Store packages use msstore.
+- [ ] Every install has a timeout and heartbeat.
+- [ ] Every install is verified after completion.
+- [ ] WinGet output is not mistaken for an exit code.
+- [ ] No security hash bypass is present.
+- [ ] App Installer frameworks are not ordinary app-list entries.
+- [ ] Perplexity uses Microsoft Store product ID XP8JNQFBQH6PVF and falls back to an official manual shortcut.
+- [ ] Rockstar failures create an official manual shortcut.
 
-- WinGet registration uses the Microsoft-supported `Add-AppxPackage -RegisterByFamilyName` command.
-- App Installer fallback uses signed packages from Microsoft and Microsoft.UI.Xaml from NuGet.
-- The real `winget.exe` is resolved from the registered App Installer package and validated with `--version`.
-- WinGet output is not returned as function data, so exit-code logging remains numeric.
-- AppX removal uses `Main` and `Bundle` package types and an explicit consumer-app list.
-- AppX frameworks and protected system packages are not blanket-removed.
-- Windows capabilities and optional features use explicit target lists and one inventory query per stage.
-- Quick Edit mode is disabled in the main, setup and standalone GPU scripts.
-- Store initialization and the main registry import have timeouts.
-- PowerCfg values are normalized to decimal integers and unsupported settings are counted instead of logged as errors.
-- OEM and built-in power plans are preserved.
+## Applications
 
-## Regression checks
+- [ ] .NET 8 and .NET 10 are default.
+- [ ] .NET 3.1, 5, 6, 7 and developer packs are opt-in.
+- [ ] Warframe is absent.
+- [ ] Brave.Brave is absent.
+- [ ] PuTTY.PuTTY is absent.
+- [ ] Brave Origin is manual-only.
+- [ ] StartAllBack is Windows 11-only.
+- [ ] Known heavy app startup entries are removed only when selected.
 
-- `DigitalExtremes.Warframe`: absent.
-- `Brave.Brave`: absent from the WinGet list.
-- `PuTTY.PuTTY`: absent from the WinGet list.
-- Legacy PowerShellGet WinGet bootstrap: absent.
-- Broad AppX removal: absent.
-- Broad capability removal: absent.
-- Broad optional-feature removal: absent.
-- Destructive Edge and WebView2 uninstall block: absent.
-- Full C drive `desktop.ini` recursion: absent.
-- Full Run and RunOnce key deletion: absent.
-- `Wait-Process -Name chrome`: absent from StepTwo and the standalone GPU installer.
-- WinGet source package removal: absent from the standalone GPU installer.
-- Active transcript deletion during Windows Temp cleanup: prevented.
-- Interactive Microsoft Store settings opening: absent.
-- Deletion of all power plans: absent.
+## Privacy and background activity
 
-## Validation included in the repository
+- [ ] Copilot, Recall, Click to Do, Widgets and selected Paint AI policies are present.
+- [ ] Consumer content, Spotlight, web search and activity history are disabled.
+- [ ] Diagnostic data is edition-aware.
+- [ ] AppPrivacy uses documented policy values.
+- [ ] Camera, microphone and notifications remain user controlled.
+- [ ] Packaged background default-deny has a PFN allowlist.
+- [ ] No private settings.dat hive is loaded.
+- [ ] No opaque start2.bin state is imported.
+- [ ] No CapabilityAccessManager consent database is deleted.
+- [ ] No global toast-notification disable is applied.
 
-`.github/workflows/powershell-parse.yml` runs:
+## Power and performance
 
-- PowerShell parsing with Windows PowerShell 5.1,
-- PowerShell parsing with PowerShell 7,
-- static regression checks for known failures.
+- [ ] The native Ultimate Performance template GUID is duplicated first.
+- [ ] The actual created GUID is parsed and activated.
+- [ ] Modern Standby fallback is derived from Balanced.
+- [ ] Active plan is verified after activation.
+- [ ] Unsupported power settings are skipped before setting.
+- [ ] Experimental timer and BCD changes default to off.
+- [ ] SysMain remains Automatic.
+- [ ] Memory compression remains enabled.
+- [ ] IPv6 and core network bindings remain enabled.
+- [ ] Chrome hardware acceleration is not forced off.
+- [ ] HAGS and VRR remain user or driver controlled.
+- [ ] Automatic Maintenance remains enabled.
 
-## Local validation in the build environment
+## Security preserved
 
-- All PowerShell files passed a lexical delimiter and here-string balance scan.
-- Repository static checks passed.
-- Zip integrity is checked after packaging.
+- [ ] No disabling writes for UAC.
+- [ ] No disabling writes for RunAsPPL.
+- [ ] No disabling writes for HVCI.
+- [ ] No disabling writes for the vulnerable driver blocklist.
+- [ ] Defender real-time protection remains enabled.
+- [ ] SmartScreen remains enabled or unforced.
+- [ ] Windows Update, BITS, Store updates and browser updates remain available.
+- [ ] Defender, Exploit Guard and ScheduledDefrag tasks remain enabled.
+- [ ] No TrustedInstaller service binPath mutation exists.
+- [ ] WebView2, Windows Hello, passkeys and FIDO2 remain available.
 
-A real Windows rerun is still required to validate OS servicing, Store access, hardware drivers and vendor installers end to end.
+## Reports
 
-- Confirmed `wsreset.exe -i` is bounded by a 180-second timeout.
-- Confirmed StepTwo verifies Microsoft Store and Desktop App Installer after Store recovery.
-- Confirmed a missing Store package does not prevent the separate WinGet bootstrap.
+- [ ] WinSux-Setup-Log.txt categorizes failures, notes and warnings.
+- [ ] AppInstallResults.json records selected, verified, failed and manual packages.
+- [ ] CWS-Verification-Report.txt covers options, power, privacy, services, security, boot state, BitLocker, GPU and WinGet.
 
-## Reliability13 checks
-
-- Official WinGet repair command is present and bounded by a timeout.
-- Windows App Runtime 1.8 signed installer fallback precedes App Installer installation.
-- The obsolete fixed VCLibs/UI.Xaml dependency downloads are absent.
-- No active `Get-ItemPropertyValue` lookup is used for display `Scaling`.
+A clean Windows hardware run remains required for final end-to-end validation of servicing commands, Store registration, DDU and third-party installers.

@@ -1,5 +1,5 @@
 # SCRIPT RUN AS ADMIN
-# BUILD MARKER: reliability13 2026-07-10 - official WinGet repair, runtime fallback and safe display scaling
+# BUILD MARKER: reliability14 2026-07-10 - official WinGet repair, runtime fallback and safe display scaling
 If (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]"Administrator")) {
     Write-Host "Run this from an elevated Administrator PowerShell window." -ForegroundColor Red
     Pause
@@ -50,10 +50,47 @@ Disable-CwsQuickEditMode
 
 $CwsStepTwoLog = Join-Path $env:SystemRoot "Temp\CWS-StepTwo.log"
 $failedApps = @()
+$verifiedApps = @()
+$manualApps = @()
+$selectedApps = @()
 $setupNotes = @()
 $setupWarnings = @()
 $fatalErrors = @()
 $script:skippedPowerSettings = 0
+$script:powerSettingCache = @{}
+$CwsWorkRoot = Join-Path $env:ProgramData 'ItsMauridian\Custom-Windows-Setup'
+$CwsSetupOptionsPath = Join-Path $CwsWorkRoot 'SetupOptions.json'
+
+$CwsDefaultOptions = [pscustomobject]@{
+    AggressivePrivacyPerformance = $true
+    RemoveOneDrive = $true
+    InstallUltimatePerformancePlan = $true
+    DisableAppAutoStart = $true
+    InstallRecommendedApps = $true
+    InstallCommunicationApps = $true
+    InstallGamingApps = $true
+    InstallDeveloperTools = $true
+    InstallHardwareUtilities = $true
+    InstallStoreApps = $true
+    InstallLegacyDotNet = $false
+    InstallLegacyDeveloperPacks = $false
+    EnableExperimentalTimerTweaks = $false
+}
+try {
+    if (Test-Path -LiteralPath $CwsSetupOptionsPath) {
+        $CwsSetupOptions = Get-Content -LiteralPath $CwsSetupOptionsPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    } else {
+        $CwsSetupOptions = $CwsDefaultOptions
+    }
+} catch {
+    $CwsSetupOptions = $CwsDefaultOptions
+}
+function Get-CwsOption {
+    param([Parameter(Mandatory)][string]$Name, [bool]$Default = $false)
+    $property = $CwsSetupOptions.PSObject.Properties[$Name]
+    if ($property) { return [bool]$property.Value }
+    return $Default
+}
 
 function Add-CwsNote {
     param([Parameter(Mandatory)][string]$Message)
@@ -100,6 +137,44 @@ function Invoke-CwsRegExe {
     }
 }
 
+function Set-CwsRegistryDword {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][int]$Value)
+    try {
+        New-Item -Path $Path -Force -ErrorAction Stop | Out-Null
+        New-ItemProperty -Path $Path -Name $Name -PropertyType DWord -Value $Value -Force -ErrorAction Stop | Out-Null
+        return $true
+    } catch {
+        Add-CwsWarning ("Registry policy could not be applied: {0}\\{1} ({2})" -f $Path, $Name, $_.Exception.Message)
+        return $false
+    }
+}
+
+function Invoke-CwsNativeCommand {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$ArgumentList = @(),
+        [ValidateRange(1,3600)][int]$TimeoutSeconds = 120
+    )
+    $id = [guid]::NewGuid().ToString('N')
+    $stdoutPath = Join-Path $env:TEMP "cws-$id.out"
+    $stderrPath = Join-Path $env:TEMP "cws-$id.err"
+    try {
+        $process = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -PassThru -NoNewWindow `
+            -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -ErrorAction Stop
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            try { Start-Process -FilePath taskkill.exe -ArgumentList @('/PID', $process.Id, '/T', '/F') -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue | Out-Null } catch { }
+            return [pscustomobject]@{ ExitCode = 1460; Output = ''; Error = "Timed out after $TimeoutSeconds seconds"; TimedOut = $true }
+        }
+        $stdout = if (Test-Path $stdoutPath) { Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue } else { '' }
+        $stderr = if (Test-Path $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue } else { '' }
+        return [pscustomobject]@{ ExitCode = [int]$process.ExitCode; Output = [string]$stdout; Error = [string]$stderr; TimedOut = $false }
+    } catch {
+        return [pscustomobject]@{ ExitCode = 1; Output = ''; Error = $_.Exception.Message; TimedOut = $false }
+    } finally {
+        Remove-Item -LiteralPath $stdoutPath,$stderrPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Set-CwsPowerSetting {
     param(
         [Parameter(Mandatory)][ValidateSet('AC','DC')][string]$Mode,
@@ -109,8 +184,6 @@ function Set-CwsPowerSetting {
         [Parameter(Mandatory)][string]$Value
     )
 
-    # PowerCfg documents the setting value as an integer. Normalize inherited
-    # hexadecimal and zero-padded values before passing them to powercfg.exe.
     try {
         if ($Value -match '^0x[0-9a-fA-F]+$') {
             $normalizedValue = [Convert]::ToUInt32($Value.Substring(2), 16).ToString()
@@ -125,12 +198,23 @@ function Set-CwsPowerSetting {
         return $false
     }
 
-    # Do not pre-query with a third /query argument. Microsoft documents
-    # /query for a scheme and optional subgroup, while setac/setdc accept the
-    # individual setting. The set command itself is the authoritative check.
+    # Query the documented scheme/subgroup pair once. Hardware-specific settings
+    # are skipped before a set command is attempted, avoiding noisy powercfg errors.
+    if ($Subgroup -match '^[0-9a-fA-F-]{36}$' -and $Setting -match '^[0-9a-fA-F-]{36}$') {
+        $cacheKey = "$Scheme|$Subgroup"
+        if (-not $script:powerSettingCache.ContainsKey($cacheKey)) {
+            $queryResult = Invoke-CwsNativeCommand -FilePath powercfg.exe -ArgumentList @('/query',$Scheme,$Subgroup) -TimeoutSeconds 30
+            $script:powerSettingCache[$cacheKey] = ($queryResult.Output + "`n" + $queryResult.Error)
+        }
+        if ($script:powerSettingCache[$cacheKey] -notmatch [regex]::Escape($Setting)) {
+            $script:skippedPowerSettings++
+            return $false
+        }
+    }
+
     $command = if ($Mode -eq 'AC') { '/setacvalueindex' } else { '/setdcvalueindex' }
-    & powercfg.exe $command $Scheme $Subgroup $Setting $normalizedValue *> $null
-    if ($LASTEXITCODE -ne 0) {
+    $result = Invoke-CwsNativeCommand -FilePath powercfg.exe -ArgumentList @($command,$Scheme,$Subgroup,$Setting,$normalizedValue) -TimeoutSeconds 30
+    if ($result.ExitCode -ne 0) {
         $script:skippedPowerSettings++
         return $false
     }
@@ -240,34 +324,7 @@ trap {
         }
         }
 
-        # FUNCTION RUN AS TRUSTED INSTALLER
-        function Run-Trusted([String]$command) {
-        try {
-    	Stop-Service -Name TrustedInstaller -Force -ErrorAction Stop -WarningAction Stop
-  		}
-  		catch {
-    	taskkill /im trustedinstaller.exe /f >$null
-  		}
-        $service = Get-CimInstance -ClassName Win32_Service -Filter "Name='TrustedInstaller'"
-        $DefaultBinPath = $service.PathName
-  		$trustedInstallerPath = "$env:SystemRoot\servicing\TrustedInstaller.exe"
-  		if ($DefaultBinPath -ne $trustedInstallerPath) {
-    	$DefaultBinPath = $trustedInstallerPath
-  		}
-        $bytes = [System.Text.Encoding]::Unicode.GetBytes($command)
-        $base64Command = [Convert]::ToBase64String($bytes)
-        sc.exe config TrustedInstaller binPath= "cmd.exe /c powershell.exe -encodedcommand $base64Command" | Out-Null
-        sc.exe start TrustedInstaller | Out-Null
-        sc.exe config TrustedInstaller binpath= "`"$DefaultBinPath`"" | Out-Null
-        try {
-    	Stop-Service -Name TrustedInstaller -Force -ErrorAction Stop -WarningAction Stop
-  		}
-  		catch {
-    	taskkill /im trustedinstaller.exe /f >$null
-  		}
-        }
-
-		# FUNCTION MODERN FILE PICKER
+# FUNCTION MODERN FILE PICKER
     	function Show-ModernFilePicker {
     	param(
     	[ValidateSet('Folder', 'File')]
@@ -413,12 +470,6 @@ Write-Host "Applying Windows privacy, shell and usability settings. This can tak
         ## ms-settings:privacy
 		## ms-settings:backup
 		
-# fix 1 for turn off privacy & security app permissions
-# stop cam service and remove the database
-Stop-Service -Name 'camsvc' -Force -ErrorAction SilentlyContinue
-$capabilityconsentstoragedb = "Remove-item `"$env:ProgramData\Microsoft\Windows\CapabilityAccessManager\CapabilityConsentStorage.db*`" -Force"
-Run-Trusted -command $capabilityconsentstoragedb
-
 # fix for disable windows backup
 cmd /c "reg add `"HKLM\SYSTEM\CurrentControlSet\Services\CDPUserSvc`" /v `"Start`" /t REG_DWORD /d `"4`" /f >nul 2>&1"
 
@@ -660,30 +711,9 @@ Windows Registry Editor Version 5.00
 [HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Network\SharedAccessConnection]
 "EnableControl"=dword:00000000
 
-; disable network throttling index
-; disable system responsiveness reserved cpu for background tasks
-[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile]
-"NetworkThrottlingIndex"=dword:0000ffff
-"SystemResponsiveness"=dword:00000000
-
-; prefer ipv4 over ipv6 & disable teredo
-[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters]
-"DisabledComponents"=dword:00000021
-
-
-
+; Windows multimedia scheduling defaults are preserved.
 
 ; SYSTEM AND SECURITY
-; disable defragment and optimize your drives
-[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Dfrg\TaskSettings]
-"fAllVolumes"=dword:00000001
-"fDeadlineEnabled"=dword:00000000
-"fExclude"=dword:00000000
-"fTaskEnabled"=dword:00000000
-"fUpgradeRestored"=dword:00000001
-"TaskFrequency"=dword:00000004
-"Volumes"=" "
-
 ; animation-related visual effects are applied below with SystemParametersInfo
 ; on Windows 10/11 to avoid bundled registry writes that also affect shadows,
 ; ClearType behavior, classic context-menu rendering, desktop selection visuals,
@@ -725,9 +755,7 @@ Windows Registry Editor Version 5.00
 [HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced]
 "ListviewShadow"=dword:1
 
-; adjust for best performance of programs
-[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\PriorityControl]
-"Win32PrioritySeparation"=dword:00000026
+; Windows scheduler defaults are preserved.
 
 ; disable remote assistance
 [HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Remote Assistance]
@@ -737,10 +765,7 @@ Windows Registry Editor Version 5.00
 
 
 ; TROUBLESHOOTING
-; disable automatic maintenance
-[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\Maintenance]
-"MaintenanceDisabled"=dword:00000001
-
+; Automatic Maintenance remains enabled so Windows can service, optimize and verify the system.
 
 
 
@@ -781,109 +806,7 @@ Windows Registry Editor Version 5.00
 [HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Privacy]
 "TailoredExperiencesWithDiagnosticDataEnabled"=dword:00000000
 
-; disable location
-[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location]
-"Value"="Deny"
-
-; disable allow location override
-[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\CPSS\Store\UserLocationOverridePrivacySetting]
-"Value"=dword:00000000
-
-; disable notify when apps request location
-[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location]
-"ShowGlobalPrompts"=dword:00000000
-
-; enable camera
-[HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam]
-"Value"="Allow"
-
-; enable microphone 
-[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone]
-"Value"="Allow"
-
-; disable voice activation
-[HKEY_CURRENT_USER\Software\Microsoft\Speech_OneCore\Settings\VoiceActivation\UserPreferenceForAllApps]
-"AgentActivationEnabled"=dword:00000000
-
-[HKEY_CURRENT_USER\SOFTWARE\Microsoft\Speech_OneCore\Settings\VoiceActivation\UserPreferenceForAllApps]
-"AgentActivationLastUsed"=dword:00000000
-
-; disable notifications
-[HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\userNotificationListener]
-"Value"="Deny"
-
-; disable account info
-[HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\userAccountInformation]
-"Value"="Deny"
-
-; disable contacts
-[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\contacts]
-"Value"="Deny"
-
-; disable calendar
-[HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\appointments]
-"Value"="Deny"
-
-; disable phone calls
-[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\phoneCall]
-"Value"="Deny"
-
-; disable call history
-[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\phoneCallHistory]
-"Value"="Deny"
-
-; disable email
-[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\email]
-"Value"="Deny"
-
-; disable tasks
-[HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\userDataTasks]
-"Value"="Deny"
-
-; disable messaging
-[HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\chat]
-"Value"="Deny"
-
-; disable radios
-[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\radios]
-"Value"="Deny"
-
-; disable other devices 
-[HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\bluetoothSync]
-"Value"="Deny"
-
-; disable app diagnostics 
-[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\appDiagnostics]
-"Value"="Deny"
-
-; disable documents
-[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\documentsLibrary]
-"Value"="Deny"
-
-; disable downloads folder 
-[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\downloadsFolder]
-"Value"="Deny"
-
-; disable music library
-[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\musicLibrary]
-"Value"="Deny"
-
-; disable pictures
-[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\picturesLibrary]
-"Value"="Deny"
-
-; disable videos
-[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\videosLibrary]
-"Value"="Deny"
-
-; disable file system
-[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\broadFileSystemAccess]
-"Value"="Deny"
-
-; disable text and image generation
-[HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\systemAIModels]
-"Value"="Deny"
-
+; Windows app privacy access is configured after import using supported AppPrivacy policies.
 
 ; disable let websites show me locally relevant content by accessing my language list 
 [HKEY_CURRENT_USER\Control Panel\International\User Profile]
@@ -1178,9 +1101,6 @@ Windows Registry Editor Version 5.00
 [HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\PolicyManager\current\device\Start]
 "HideRecommendedSection"=dword:00000001
 
-[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\PolicyManager\current\device\Education]
-"IsEducationEnvironment"=dword:00000001
-
 [HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\Explorer]
 "HideRecommendedSection"=dword:00000001
 
@@ -1329,41 +1249,10 @@ Windows Registry Editor Version 5.00
 
 ; SYSTEM
 
-; turn on hardware accelerated gpu scheduling
-[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\GraphicsDrivers]
-"HwSchMode"=dword:00000002
+; Hardware accelerated GPU scheduling, VRR and windowed-game optimizations remain user controlled.
 
-; disable variable refresh rate & enable optimizations for windowed games
-[HKEY_CURRENT_USER\Software\Microsoft\DirectX\UserGpuPreferences]
-"DirectXUserGlobalSettings"="SwapEffectUpgradeEnable=1;VRROptimizeEnable=0;"
-
-; disable notifications
-[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\PushNotifications]
-"ToastEnabled"=dword:00000000
-
-; disable notifications suggested
+; preserve normal application and security notifications
 [HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\Windows.SystemToast.Suggested]
-"Enabled"=dword:00000000
-
-; disable notifications
-[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings]
-"NOC_GLOBAL_SETTING_ALLOW_NOTIFICATION_SOUND"=dword:00000000
-"NOC_GLOBAL_SETTING_ALLOW_CRITICAL_TOASTS_ABOVE_LOCK"=dword:00000000
-"NOC_GLOBAL_SETTING_ALLOW_TOASTS_ABOVE_LOCK"=dword:00000000
-
-[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\Microsoft.SkyDrive.Desktop]
-"Enabled"=dword:00000000
-
-[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\Windows.SystemToast.AutoPlay]
-"Enabled"=dword:00000000
-
-[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\Windows.SystemToast.SecurityAndMaintenance]
-"Enabled"=dword:00000000
-
-[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel]
-"Enabled"=dword:00000000
-
-[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\Windows.SystemToast.CapabilityAccess]
 "Enabled"=dword:00000000
 
 [HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\Windows.SystemToast.StartupApp]
@@ -1376,106 +1265,7 @@ Windows Registry Editor Version 5.00
 [HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\SmartActionPlatform\SmartClipboard]
 "Disabled"=dword:00000001
 
-; disable focus assist
-[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\Cache\DefaultAccount\??windows.data.notifications.quiethourssettings\Current]
-"Data"=hex(3):02,00,00,00,B4,67,2B,68,F0,0B,D8,01,00,00,00,00,43,42,01,00,\
-C2,0A,01,D2,14,28,4D,00,69,00,63,00,72,00,6F,00,73,00,6F,00,66,00,74,00,2E,\
-00,51,00,75,00,69,00,65,00,74,00,48,00,6F,00,75,00,72,00,73,00,50,00,72,00,\
-6F,00,66,00,69,00,6C,00,65,00,2E,00,55,00,6E,00,72,00,65,00,73,00,74,00,72,\
-00,69,00,63,00,74,00,65,00,64,00,CA,28,D0,14,02,00,00
-
-[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\Cache\DefaultAccount\?quietmomentfullscreen?windows.data.notifications.quietmoment\Current]
-"Data"=hex(3):02,00,00,00,97,1D,2D,68,F0,0B,D8,01,00,00,00,00,43,42,01,00,\
-C2,0A,01,D2,1E,26,4D,00,69,00,63,00,72,00,6F,00,73,00,6F,00,66,00,74,00,2E,\
-00,51,00,75,00,69,00,65,00,74,00,48,00,6F,00,75,00,72,00,73,00,50,00,72,00,\
-6F,00,66,00,69,00,6C,00,65,00,2E,00,41,00,6C,00,61,00,72,00,6D,00,73,00,4F,\
-00,6E,00,6C,00,79,00,C2,28,01,CA,50,00,00
-
-[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\Cache\DefaultAccount\?quietmomentgame?windows.data.notifications.quietmoment\Current]
-"Data"=hex(3):02,00,00,00,6C,39,2D,68,F0,0B,D8,01,00,00,00,00,43,42,01,00,\
-C2,0A,01,D2,1E,28,4D,00,69,00,63,00,72,00,6F,00,73,00,6F,00,66,00,74,00,2E,\
-00,51,00,75,00,69,00,65,00,74,00,48,00,6F,00,75,00,72,00,73,00,50,00,72,00,\
-6F,00,66,00,69,00,6C,00,65,00,2E,00,50,00,72,00,69,00,6F,00,72,00,69,00,74,\
-00,79,00,4F,00,6E,00,6C,00,79,00,C2,28,01,CA,50,00,00
-
-[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\Cache\DefaultAccount\?quietmomentpostoobe?windows.data.notifications.quietmoment\Current]
-"Data"=hex(3):02,00,00,00,06,54,2D,68,F0,0B,D8,01,00,00,00,00,43,42,01,00,\
-C2,0A,01,D2,1E,28,4D,00,69,00,63,00,72,00,6F,00,73,00,6F,00,66,00,74,00,2E,\
-00,51,00,75,00,69,00,65,00,74,00,48,00,6F,00,75,00,72,00,73,00,50,00,72,00,\
-6F,00,66,00,69,00,6C,00,65,00,2E,00,50,00,72,00,69,00,6F,00,72,00,69,00,74,\
-00,79,00,4F,00,6E,00,6C,00,79,00,C2,28,01,CA,50,00,00
-
-[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\Cache\DefaultAccount\?quietmomentpresentation?windows.data.notifications.quietmoment\Current]
-"Data"=hex(3):02,00,00,00,83,6E,2D,68,F0,0B,D8,01,00,00,00,00,43,42,01,00,\
-C2,0A,01,D2,1E,26,4D,00,69,00,63,00,72,00,6F,00,73,00,6F,00,66,00,74,00,2E,\
-00,51,00,75,00,69,00,65,00,74,00,48,00,6F,00,75,00,72,00,73,00,50,00,72,00,\
-6F,00,66,00,69,00,6C,00,65,00,2E,00,41,00,6C,00,61,00,72,00,6D,00,73,00,4F,\
-00,6E,00,6C,00,79,00,C2,28,01,CA,50,00,00
-
-[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\Cache\DefaultAccount\?quietmomentscheduled?windows.data.notifications.quietmoment\Current]
-"Data"=hex(3):02,00,00,00,2E,8A,2D,68,F0,0B,D8,01,00,00,00,00,43,42,01,00,\
-C2,0A,01,D2,1E,28,4D,00,69,00,63,00,72,00,6F,00,73,00,6F,00,66,00,74,00,2E,\
-00,51,00,75,00,69,00,65,00,74,00,48,00,6F,00,75,00,72,00,73,00,50,00,72,00,\
-6F,00,66,00,69,00,6C,00,65,00,2E,00,50,00,72,00,69,00,6F,00,72,00,69,00,74,\
-00,79,00,4F,00,6E,00,6C,00,79,00,C2,28,01,D1,32,80,E0,AA,8A,99,30,D1,3C,80,\
-E0,F6,C5,D5,0E,CA,50,00,00
-
-; disable turn on do not disturb automatically
-[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\default?windows.data.donotdisturb.quietmoment?quietmomentlist\windows.data.donotdisturb.quietmoment?quietmomentpresentation]
-"Data"=hex(3):43,42,01,00,0A,02,01,00,2A,06,E2,F3,AA,CC,06,2A,2B,0E,5A,43,\
-42,01,00,C2,0A,01,D2,1E,26,4D,00,69,00,63,00,72,00,6F,00,73,00,6F,00,66,00,\
-74,00,2E,00,51,00,75,00,69,00,65,00,74,00,48,00,6F,00,75,00,72,00,73,00,50,\
-00,72,00,6F,00,66,00,69,00,6C,00,65,00,2E,00,41,00,6C,00,61,00,72,00,6D,00,\
-73,00,4F,00,6E,00,6C,00,79,00,CA,50,00,00,00,00,00
-
-[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\default?windows.data.donotdisturb.quietmoment?quietmomentlist\windows.data.donotdisturb.quietmoment?quietmomentgame]
-"Data"=hex(3):43,42,01,00,0A,02,01,00,2A,06,E1,F3,AA,CC,06,2A,2B,0E,5E,43,\
-42,01,00,C2,0A,01,D2,1E,28,4D,00,69,00,63,00,72,00,6F,00,73,00,6F,00,66,00,\
-74,00,2E,00,51,00,75,00,69,00,65,00,74,00,48,00,6F,00,75,00,72,00,73,00,50,\
-00,72,00,6F,00,66,00,69,00,6C,00,65,00,2E,00,50,00,72,00,69,00,6F,00,72,00,\
-69,00,74,00,79,00,4F,00,6E,00,6C,00,79,00,CA,50,00,00,00,00,00
-
-[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\default?windows.data.donotdisturb.quietmoment?quietmomentlist\windows.data.donotdisturb.quietmoment?quietmomentfullscreen]
-"Data"=hex(3):43,42,01,00,0A,02,01,00,2A,06,E0,F3,AA,CC,06,2A,2B,0E,5A,43,\
-42,01,00,C2,0A,01,D2,1E,26,4D,00,69,00,63,00,72,00,6F,00,73,00,6F,00,66,00,\
-74,00,2E,00,51,00,75,00,69,00,65,00,74,00,48,00,6F,00,75,00,72,00,73,00,50,\
-00,72,00,6F,00,66,00,69,00,6C,00,65,00,2E,00,41,00,6C,00,61,00,72,00,6D,00,\
-73,00,4F,00,6E,00,6C,00,79,00,CA,50,00,00,00,00,00
-
-[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\default?windows.data.donotdisturb.quietmoment?quietmomentlist\windows.data.donotdisturb.quietmoment?quietmomentpostoobe]
-"Data"=hex(3):43,42,01,00,0A,02,01,00,2A,06,DF,F3,AA,CC,06,2A,2B,0E,5E,43,\
-42,01,00,C2,0A,01,D2,1E,28,4D,00,69,00,63,00,72,00,6F,00,73,00,6F,00,66,00,\
-74,00,2E,00,51,00,75,00,69,00,65,00,74,00,48,00,6F,00,75,00,72,00,73,00,50,\
-00,72,00,6F,00,66,00,69,00,6C,00,65,00,2E,00,50,00,72,00,69,00,6F,00,72,00,\
-69,00,74,00,79,00,4F,00,6E,00,6C,00,79,00,CA,50,00,00,00,00,00
-
-; disable set priority notifications
-[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\default?windows.data.donotdisturb.quiethoursprofile?quiethoursprofilelist\windows.data.donotdisturb.quiethoursprofile?microsoft.quiethoursprofile.priorityonly]
-"Data"=hex:43,42,01,00,0a,02,01,00,2a,06,be,89,ab,cc,06,2a,2b,0e,d0,03,43,42,\
-  01,00,c2,0a,01,cd,14,06,02,05,00,00,01,01,02,00,03,01,04,00,cc,32,12,05,28,\
-  4d,00,69,00,63,00,72,00,6f,00,73,00,6f,00,66,00,74,00,2e,00,53,00,63,00,72,\
-  00,65,00,65,00,6e,00,53,00,6b,00,65,00,74,00,63,00,68,00,5f,00,38,00,77,00,\
-  65,00,6b,00,79,00,62,00,33,00,64,00,38,00,62,00,62,00,77,00,65,00,21,00,41,\
-  00,70,00,70,00,29,4d,00,69,00,63,00,72,00,6f,00,73,00,6f,00,66,00,74,00,2e,\
-  00,57,00,69,00,6e,00,64,00,6f,00,77,00,73,00,41,00,6c,00,61,00,72,00,6d,00,\
-  73,00,5f,00,38,00,77,00,65,00,6b,00,79,00,62,00,33,00,64,00,38,00,62,00,62,\
-  00,77,00,65,00,21,00,41,00,70,00,70,00,31,4d,00,69,00,63,00,72,00,6f,00,73,\
-  00,6f,00,66,00,74,00,2e,00,58,00,62,00,6f,00,78,00,41,00,70,00,70,00,5f,00,\
-  38,00,77,00,65,00,6b,00,79,00,62,00,33,00,64,00,38,00,62,00,62,00,77,00,65,\
-  00,21,00,4d,00,69,00,63,00,72,00,6f,00,73,00,6f,00,66,00,74,00,2e,00,58,00,\
-  62,00,6f,00,78,00,41,00,70,00,70,00,2d,4d,00,69,00,63,00,72,00,6f,00,73,00,\
-  6f,00,66,00,74,00,2e,00,58,00,62,00,6f,00,78,00,47,00,61,00,6d,00,69,00,6e,\
-  00,67,00,4f,00,76,00,65,00,72,00,6c,00,61,00,79,00,5f,00,38,00,77,00,65,00,\
-  6b,00,79,00,62,00,33,00,64,00,38,00,62,00,62,00,77,00,65,00,21,00,41,00,70,\
-  00,70,00,29,57,00,69,00,6e,00,64,00,6f,00,77,00,73,00,2e,00,53,00,79,00,73,\
-  00,74,00,65,00,6d,00,2e,00,4e,00,65,00,61,00,72,00,53,00,68,00,61,00,72,00,\
-  65,00,45,00,78,00,70,00,65,00,72,00,69,00,65,00,6e,00,63,00,65,00,52,00,65,\
-  00,63,00,65,00,69,00,76,00,65,00,00,00,00,00
-
-; disable focus settings
-[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\default?windows.data.shell.focussessionactivetheme\windows.data.shell.focussessionactivetheme?{1b019365-25a5-4ff1-b50a-c155229afc8f}]
-"Data"=hex(3):43,42,01,00,0A,00,2A,06,F4,E2,AA,CC,06,2A,2B,0E,08,43,42,01,\
-00,C2,0A,01,00,00,00,00
+; Focus Assist and Do Not Disturb remain user controlled.
 
 ; battery options optimize for video quality
 [HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\VideoSettings]
@@ -1555,28 +1345,11 @@ E0,F6,C5,D5,0E,CA,50,00,00
 
 
 
-; STORE
-; disable update apps automatically
-[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsStore\WindowsUpdate]
-"AutoDownload"=dword:00000002
-
-
-
 
 ; EDGE
 [HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Edge]
 "StartupBoostEnabled"=dword:00000000
-"HardwareAccelerationModeEnabled"=dword:00000000
 "BackgroundModeEnabled"=dword:00000000
-
-[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\MicrosoftEdgeElevationService]
-"Start"=dword:00000004
-
-[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\edgeupdate]
-"Start"=dword:00000004
-
-[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\edgeupdatem]
-"Start"=dword:00000004
 
 
 
@@ -1594,18 +1367,7 @@ E0,F6,C5,D5,0E,CA,50,00,00
 
 
 
-; NEW START MENU
-[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\FeatureManagement\Overrides\14\2792562829]
-"EnabledState"=dword:00000002
-
-[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\FeatureManagement\Overrides\14\3036241548]
-"EnabledState"=dword:00000002
-
-[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\FeatureManagement\Overrides\14\734731404]
-"EnabledState"=dword:00000002
-
-[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\FeatureManagement\Overrides\14\762256525]
-"EnabledState"=dword:00000002
+; Start menu behavior uses supported policy and user settings only.
 
 ; set start menu apps view to list
 [HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Start]
@@ -1619,12 +1381,7 @@ E0,F6,C5,D5,0E,CA,50,00,00
 [HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy]
 "LetAppsRunInBackground"=dword:00000002
 
-[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications]
-"GlobalUserDisabled"=dword:00000001
-
-; disable windows input experience preload
-[HKEY_CURRENT_USER\Software\Microsoft\input]
-"IsInputAppPreloadEnabled"=dword:00000000
+; Windows input, emoji and IME infrastructure remains available.
 
 [HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Dsh]
 "IsPrelaunchEnabled"=dword:00000000
@@ -1651,23 +1408,10 @@ E0,F6,C5,D5,0E,CA,50,00,00
 [HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced]
 "ShowCopilotButton"=dword:00000000
 
-[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\Shell\Copilot]
-"IsCopilotAvailable"=dword:00000000
-"CopilotDisabledReason"="IsEnabledForGeographicRegionFailed"
-
-[HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsCopilot]
-"AllowCopilotRuntime"=dword:00000000
-
-[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Shell Extensions\Blocked]
-"{CB3B0003-8088-4EDE-8769-8B354AB2FF8C}"=""
-
 [HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\WindowsAI]
 "DisableAIDataAnalysis"=dword:00000001
 "AllowRecallEnablement"=dword:00000000
 "DisableClickToDo"=dword:00000001
-
-[HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\Shell\Copilot\BingChat]
-"IsUserEligible"=dword:00000000
 
 [HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Paint]
 "DisableGenerativeFill"=dword:00000001
@@ -1681,37 +1425,10 @@ E0,F6,C5,D5,0E,CA,50,00,00
 [HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\PolicyManager\default\NewsAndInterests\AllowNewsAndInterests]
 "value"=dword:00000000
 
-; disable ms-gamebar notifications with xbox controller plugged in
-[HKEY_CLASSES_ROOT\ms-gamebar]
-"URL Protocol"=""
-"NoOpenWith"=""
-@="URL:ms-gamebar"
-
-[HKEY_CLASSES_ROOT\ms-gamebar\shell\open\command]
-@="\"%SystemRoot%\\System32\\systray.exe\""
-
-[HKEY_CLASSES_ROOT\ms-gamebarservices]
-"URL Protocol"=""
-"NoOpenWith"=""
-@="URL:ms-gamebarservices"
-
-[HKEY_CLASSES_ROOT\ms-gamebarservices\shell\open\command]
-@="\"%SystemRoot%\\System32\\systray.exe\""
-
-[HKEY_CLASSES_ROOT\ms-gamingoverlay]
-"URL Protocol"=""
-"NoOpenWith"=""
-@="URL:ms-gamingoverlay"
-
-[HKEY_CLASSES_ROOT\ms-gamingoverlay\shell\open\command]
-@="\"%SystemRoot%\\System32\\systray.exe\""
-
-[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\WindowsRuntime\ActivatableClassId\Windows.Gaming.GameBar.PresenceServer.Internal.PresenceWriter]
-"ActivationType"=dword:00000000
+; Game DVR and Game Bar capture are disabled with supported policies and user settings.
 
 
-
-
+; NVIDIA
 ; NVIDIA
 ; enable old nvidia legacy sharpening
 ; old location
@@ -1729,39 +1446,9 @@ E0,F6,C5,D5,0E,CA,50,00,00
 
 
 ; POWER
-; enable global timer resolution requests
-[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Session Manager\kernel]
-"GlobalTimerResolutionRequests"=dword:00000001
-
-; disable power throttling
-[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling]
-"PowerThrottlingOff"=dword:00000001
-
-; disable hibernate
-[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Power]
-"HibernateEnabled"=dword:00000000
-"HibernateEnabledDefault"=dword:00000000
-
-[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FlyoutMenuSettings]
-"ShowHibernateOption"=dword:00000000
-
 ; disable fast boot
 [HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Session Manager\Power]
 "HiberbootEnabled"=dword:00000000
-
-; enable allow usb overclock with secure boot regedit
-[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\CI\Policy]
-"WHQLSettings"=dword:00000001
-
-; unlock background polling rate cap
-[HKEY_CURRENT_USER\Control Panel\Mouse]
-"RawMouseThrottleEnabled"=dword:00000000
-
-; enable new nvme driver
-[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Policies\Microsoft\FeatureManagement\Overrides]
-"735209102"=dword:00000001
-"1853569164"=dword:00000001
-"156965516"=dword:00000001
 
 ; enable safe & safe network boot fix for new nvme driver
 [HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\SafeBoot\Network\{75416E63-5912-4DFA-AE8F-3EFACCAFFB14}]
@@ -1902,12 +1589,6 @@ E0,F6,C5,D5,0E,CA,50,00,00
 [HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\PolicyManager\default\Connectivity\DisableCrossDeviceResume]
 "value"=dword:00000001
 
-[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\FeatureManagement\Overrides\8\1387020943]
-"EnabledState"=dword:00000001
-
-[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\FeatureManagement\Overrides\8\1694661260]
-"EnabledState"=dword:00000001
-
 ; hide home in settings
 [HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer]
 "SettingsPageVisibility"="hide:home;hide:aicomponents;"
@@ -1929,6 +1610,58 @@ if ($regImportExitCode -ne 0) {
     Add-CwsWarning "The main Windows settings registry import returned exit code $regImportExitCode."
 } else {
     Write-Host "Main Windows settings import completed.`n" -ForegroundColor Green
+
+
+# Re-apply the highest-value privacy and Windows AI policies with edition-aware
+# diagnostic data handling. Windows Pro supports Required diagnostic data, while
+# Enterprise, Education and IoT editions can honor the Security/Off level.
+$osCaption = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption
+$diagnosticLevel = if ($osCaption -match 'Enterprise|Education|IoT') { 0 } else { 1 }
+Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection' -Name 'AllowTelemetry' -Value $diagnosticLevel | Out-Null
+Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection' -Name 'DoNotShowFeedbackNotifications' -Value 1 | Out-Null
+Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI' -Name 'AllowRecallEnablement' -Value 0 | Out-Null
+Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI' -Name 'DisableAIDataAnalysis' -Value 1 | Out-Null
+Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI' -Name 'DisableClickToDo' -Value 1 | Out-Null
+Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot' -Name 'TurnOffWindowsCopilot' -Value 1 | Out-Null
+Set-CwsRegistryDword -Path 'HKCU:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot' -Name 'TurnOffWindowsCopilot' -Value 1 | Out-Null
+Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' -Name 'DisableWindowsConsumerFeatures' -Value 1 | Out-Null
+Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' -Name 'DisableSoftLanding' -Value 1 | Out-Null
+Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' -Name 'DisableWindowsSpotlightFeatures' -Value 1 | Out-Null
+Set-CwsRegistryDword -Path 'HKCU:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' -Name 'DisableCloudOptimizedContent' -Value 1 | Out-Null
+Set-CwsRegistryDword -Path 'HKCU:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' -Name 'DisableWindowsSpotlightFeatures' -Value 1 | Out-Null
+Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' -Name 'DisableConsumerAccountStateContent' -Value 1 | Out-Null
+Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' -Name 'DisableThirdPartySuggestions' -Value 1 | Out-Null
+Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI' -Name 'RemoveMicrosoftCopilotApp' -Value 1 | Out-Null
+Set-CwsRegistryDword -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\Paint' -Name 'DisableCocreator' -Value 1 | Out-Null
+Set-CwsRegistryDword -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\Paint' -Name 'DisableGenerativeFill' -Value 1 | Out-Null
+Set-CwsRegistryDword -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\Paint' -Name 'DisableImageCreator' -Value 1 | Out-Null
+Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' -Name 'DisableTailoredExperiencesWithDiagnosticData' -Value 1 | Out-Null
+Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Name 'EnableActivityFeed' -Value 0 | Out-Null
+Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Name 'PublishUserActivities' -Value 0 | Out-Null
+Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Name 'UploadUserActivities' -Value 0 | Out-Null
+Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search' -Name 'AllowCloudSearch' -Value 0 | Out-Null
+Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search' -Name 'DisableWebSearch' -Value 1 | Out-Null
+Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' -Name 'AllowNewsAndInterests' -Value 0 | Out-Null
+Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy' -Name 'LetAppsRunInBackground' -Value 2 | Out-Null
+$cwsPrivacyDenyPolicies = @(
+    'LetAppsAccessAccountInfo','LetAppsAccessCalendar','LetAppsAccessCallHistory','LetAppsAccessContacts',
+    'LetAppsAccessEmail','LetAppsAccessLocation','LetAppsAccessMessaging','LetAppsAccessMotion',
+    'LetAppsAccessPhone','LetAppsAccessRadios','LetAppsAccessTasks','LetAppsAccessTrustedDevices',
+    'LetAppsSyncWithDevices','LetAppsGetDiagnosticInfo'
+)
+foreach ($policyName in $cwsPrivacyDenyPolicies) {
+    Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy' -Name $policyName -Value 2 | Out-Null
+}
+# Camera, microphone and notifications remain user controlled so conferencing,
+# security alerts and selected communication apps continue to work.
+foreach ($policyName in @('LetAppsAccessCamera','LetAppsAccessMicrophone','LetAppsAccessNotifications')) {
+    Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy' -Name $policyName -Value 0 | Out-Null
+}
+Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization' -Name 'DODownloadMode' -Value 0 | Out-Null
+Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' -Name 'StartupBoostEnabled' -Value 0 | Out-Null
+Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' -Name 'BackgroundModeEnabled' -Value 0 | Out-Null
+Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR' -Name 'AllowGameDVR' -Value 0 | Out-Null
+Add-CwsNote "Aggressive privacy profile applied. Diagnostic data policy level: $diagnosticLevel."
 }
 
 # keep MPO disable OS-aware: OverlayTestMode=5 can help on some systems, but on
@@ -2044,15 +1777,74 @@ foreach ($ns in $namespaces) {
 cmd /c "reg add `"HKCU\Software\Classes\CLSID\{f874310e-b6b7-47dc-bc84-b9e6b38f5903}`" /v `"System.IsPinnedToNameSpaceTree`" /t REG_DWORD /d 0 /f >nul 2>&1"
 cmd /c "reg add `"HKCU\Software\Classes\CLSID\{e88865ea-0e1c-4e20-9aa6-edcd0212c87c}`" /v `"System.IsPinnedToNameSpaceTree`" /t REG_DWORD /d 0 /f >nul 2>&1"
 
-# fix 2 for turn off privacy & security app permissions
-# stop cam service and remove the database
-Stop-Service -Name 'camsvc' -Force -ErrorAction SilentlyContinue
-$capabilityconsentstoragedb = "Remove-item `"$env:ProgramData\Microsoft\Windows\CapabilityAccessManager\CapabilityConsentStorage.db*`" -Force"
-Run-Trusted -command $capabilityconsentstoragedb
+# Preserve Windows security, networking, memory management and maintenance defaults.
+# Older builds disabled these components, so this block also repairs machines that
+# were previously configured by an earlier release.
+try { Enable-MMAgent -MemoryCompression -ErrorAction SilentlyContinue | Out-Null } catch { }
+Remove-ItemProperty -Path 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppHost' -Name 'EnableWebContentEvaluation' -ErrorAction SilentlyContinue
+try { Invoke-CwsRegExe -Arguments 'delete "HKCU\SOFTWARE\Microsoft\Edge\SmartScreenEnabled" /ve /f' | Out-Null } catch { }
+Remove-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters' -Name 'DisabledComponents' -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsStore\WindowsUpdate' -Name 'AutoDownload' -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsStore' -Name 'AutoDownload' -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling' -Name 'PowerThrottlingOff' -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' -Name 'WHQLSettings' -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Policies\Microsoft\FeatureManagement\Overrides' -Name '735209102' -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control' -Name 'SvcHostSplitThresholdInKB' -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile' -Name 'NetworkThrottlingIndex' -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile' -Name 'SystemResponsiveness' -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl' -Name 'Win32PrioritySeparation' -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\Maintenance' -Name 'MaintenanceDisabled' -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\PushNotifications' -Name 'ToastEnabled' -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications' -Name 'GlobalUserDisabled' -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\input' -Name 'IsInputAppPreloadEnabled' -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\Windows.SystemToast.SecurityAndMaintenance' -Name 'Enabled' -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' -Name 'HwSchMode' -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\DirectX\UserGpuPreferences' -Name 'DirectXUserGlobalSettings' -ErrorAction SilentlyContinue
+if (-not (Get-CwsOption -Name 'EnableExperimentalTimerTweaks' -Default $false)) {
+    Remove-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel' -Name 'GlobalTimerResolutionRequests' -ErrorAction SilentlyContinue
+}
 
-# disable memorycompression
-        ## powershell -noexit -command "get-mmagent"
-Disable-MMAgent -MemoryCompression -ErrorAction SilentlyContinue | Out-Null
+# Keep hibernation available on laptops while leaving Fast Startup disabled below.
+Invoke-CwsNativeCommand -FilePath powercfg.exe -ArgumentList @('/hibernate','on') -TimeoutSeconds 30 | Out-Null
+
+# Restore Microsoft security and drive-maintenance tasks that older builds disabled.
+$tasksToEnable = @(
+    @{ Path='\Microsoft\Windows\ExploitGuard\'; Name='ExploitGuard MDM policy Refresh' },
+    @{ Path='\Microsoft\Windows\Windows Defender\'; Name='Windows Defender Cache Maintenance' },
+    @{ Path='\Microsoft\Windows\Windows Defender\'; Name='Windows Defender Cleanup' },
+    @{ Path='\Microsoft\Windows\Windows Defender\'; Name='Windows Defender Scheduled Scan' },
+    @{ Path='\Microsoft\Windows\Windows Defender\'; Name='Windows Defender Verification' },
+    @{ Path='\Microsoft\Windows\Defrag\'; Name='ScheduledDefrag' }
+)
+foreach ($taskInfo in $tasksToEnable) {
+    $task = Get-ScheduledTask -TaskPath $taskInfo.Path -TaskName $taskInfo.Name -ErrorAction SilentlyContinue
+    if ($task) { $task | Enable-ScheduledTask -ErrorAction SilentlyContinue | Out-Null }
+}
+
+# Restore core Windows network bindings. Do not force optional third-party bindings.
+if ((Get-Command Get-NetAdapterBinding -ErrorAction SilentlyContinue) -and
+    (Get-Command Enable-NetAdapterBinding -ErrorAction SilentlyContinue)) {
+    $coreBindings = @('ms_tcpip6','ms_server','ms_msclient','ms_pacer','ms_lldp','ms_lltdio','ms_rspndr')
+    foreach ($componentId in $coreBindings) {
+        foreach ($binding in @(Get-NetAdapterBinding -ComponentID $componentId -ErrorAction SilentlyContinue)) {
+            if (-not $binding.Enabled) {
+                Enable-NetAdapterBinding -Name $binding.Name -ComponentID $componentId -ErrorAction SilentlyContinue | Out-Null
+            }
+        }
+    }
+} else {
+    Add-Note 'NetAdapter cmdlets are unavailable on this image. Core network binding repair was skipped.'
+}
+Invoke-CwsNativeCommand -FilePath netsh.exe -ArgumentList @('interface','teredo','set','state','default') -TimeoutSeconds 30 | Out-Null
+foreach ($interface in @(Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces' -ErrorAction SilentlyContinue)) {
+    Remove-ItemProperty -Path $interface.PSPath -Name 'TcpAckFrequency' -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path $interface.PSPath -Name 'TCPNoDelay' -ErrorAction SilentlyContinue
+}
+
+# Restore Edge update services while retaining Startup Boost and background mode policies.
+try { & sc.exe config MicrosoftEdgeElevationService start= demand 2>$null | Out-Null } catch { }
+try { & sc.exe config edgeupdate start= delayed-auto 2>$null | Out-Null } catch { }
+try { & sc.exe config edgeupdatem start= demand 2>$null | Out-Null } catch { }
 
 # disable bitlocker
         ## control /name microsoft.bitlockerdriveencryption
@@ -2066,56 +1858,16 @@ Disable-BitLocker -MountPoint $_.MountPoint -ErrorAction SilentlyContinue | Out-
 }
 } catch { }
 
-# smartscreen for microsoft edge - needs normal boot as admin
-cmd /c "reg add `"HKEY_CURRENT_USER\SOFTWARE\Microsoft\Edge\SmartScreenEnabled`" /ve /t REG_DWORD /d `"0`" /f >nul 2>&1"
-
-# smartscreen for microsoft store apps - needs normal boot as admin
-cmd /c "reg add `"HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\AppHost`" /v `"EnableWebContentEvaluation`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
-
-# disable scheduled tasks - needs normal boot as admin
-        ## powershell -noexit -command "get-scheduledtask | where-object {$_.taskname -like '*defender*' -or $_.taskname -like '*exploitguard*'} | format-table taskname, state -autosize"
-schtasks /Change /TN "Microsoft\Windows\ExploitGuard\ExploitGuard MDM policy Refresh" /Disable 2>$null | Out-Null
-schtasks /Change /TN "Microsoft\Windows\Windows Defender\Windows Defender Cache Maintenance" /Disable 2>$null | Out-Null
-schtasks /Change /TN "Microsoft\Windows\Windows Defender\Windows Defender Cleanup" /Disable 2>$null | Out-Null
-schtasks /Change /TN "Microsoft\Windows\Windows Defender\Windows Defender Scheduled Scan" /Disable 2>$null | Out-Null
-schtasks /Change /TN "Microsoft\Windows\Windows Defender\Windows Defender Verification" /Disable 2>$null | Out-Null
-
-# disable defragment and optimize your drives scheduled task
-        ## powershell -noexit -command "get-scheduledtask -taskname "scheduleddefrag" | select-object taskname, state"
-        ## dfrgui
-Get-ScheduledTask | Where-Object {$_.TaskName -match 'ScheduledDefrag'} | Disable-ScheduledTask | Out-Null
-
-# disable all network adapters except ipv4
-        ## powershell -noexit -command "get-netadapterbinding | select-object name, displayname, componentid, enabled | format-table -autosize"
-        ## ncpa.cpl
-$adapterstodisable = @('ms_lldp', 'ms_lltdio', 'ms_implat', 'ms_rspndr', 'ms_tcpip6', 'ms_server', 'ms_msclient', 'ms_pacer')
-foreach ($adapterbinding in $adapterstodisable) {
-Disable-NetAdapterBinding -Name "*" -ComponentID $adapterbinding -ErrorAction SilentlyContinue
-}
-
-# disable teredo tunneling
-netsh interface teredo set state disabled 2>$null | Out-Null
-
-# disable nagle's algorithm on all network adapters
-$interfaces = Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces" -ErrorAction SilentlyContinue
-foreach ($interface in $interfaces) {
-cmd /c "reg add `"HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$($interface.PSChildName)`" /v `"TcpAckFrequency`" /t REG_DWORD /d `"1`" /f >nul 2>&1"
-cmd /c "reg add `"HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$($interface.PSChildName)`" /v `"TCPNoDelay`" /t REG_DWORD /d `"1`" /f >nul 2>&1"
-}
-
-# disable sysmain (superfetch)
-Stop-Service -Name "SysMain" -Force -ErrorAction SilentlyContinue | Out-Null
-Set-Service -Name "SysMain" -StartupType Disabled -ErrorAction SilentlyContinue | Out-Null
+# Preserve SysMain. Windows manages its prefetching behavior and it is not telemetry.
+try { Set-Service -Name 'SysMain' -StartupType Automatic -ErrorAction SilentlyContinue } catch { }
+try { Start-Service -Name 'SysMain' -ErrorAction SilentlyContinue } catch { }
 
 # disable telemetry services
 Stop-Service -Name "DiagTrack" -Force -ErrorAction SilentlyContinue | Out-Null
 Set-Service -Name "DiagTrack" -StartupType Disabled -ErrorAction SilentlyContinue | Out-Null
-Stop-Service -Name "wermgr" -Force -ErrorAction SilentlyContinue | Out-Null
-Set-Service -Name "wermgr" -StartupType Disabled -ErrorAction SilentlyContinue | Out-Null
-
-# set svchost split threshold to installed ram size (reduces background svchost overhead)
-$Memory = (Get-CimInstance Win32_PhysicalMemory | Measure-Object Capacity -Sum).Sum / 1KB
-Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control" -Name "SvcHostSplitThresholdInKB" -Value $Memory -Force
+Stop-Service -Name "dmwappushservice" -Force -ErrorAction SilentlyContinue | Out-Null
+Set-Service -Name "dmwappushservice" -StartupType Disabled -ErrorAction SilentlyContinue | Out-Null
+Set-Service -Name "WerSvc" -StartupType Manual -ErrorAction SilentlyContinue | Out-Null
 
 # disable powershell telemetry
 [System.Environment]::SetEnvironmentVariable('POWERSHELL_TELEMETRY_OPTOUT', '1', [System.EnvironmentVariableTarget]::Machine)
@@ -2123,7 +1875,7 @@ Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control" -Name "SvcHostSp
 
 # set service baseline aligned with current WinUtil, without demoting StorSvc, W32Time or SharedAccess
 $manualServices = @("MapsBroker")
-$disabledServices = @("CscService","DiagTrack","wermgr","SysMain","WSAIFabricSvc")
+$disabledServices = @("CscService","DiagTrack","dmwappushservice","WSAIFabricSvc")
 foreach ($svc in $manualServices) {
 Set-Service -Name $svc -StartupType Manual -ErrorAction SilentlyContinue
 }
@@ -2132,221 +1884,17 @@ Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue | Out-Null
 Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
 }
 
-# disable if you've been away, when should windows require you to sign in again?
-        ## ms-settings:signinoptions
-Set-CwsPowerSetting -Mode DC -Scheme 'scheme_current' -Subgroup 'sub_none' -Setting 'consolelock' -Value '0' | Out-Null
-Set-CwsPowerSetting -Mode AC -Scheme 'scheme_current' -Subgroup 'sub_none' -Setting 'consolelock' -Value '0' | Out-Null
-# disable set priority notifications
-        ## ms-settings:notifications
+# Resume sign-in requirements and Do Not Disturb remain user controlled.
+Add-CwsNote 'Sign-in-on-resume and notification-priority settings were preserved.'
 
-# create reg file
-$disableprioritynotificationsregcontent = @"
-Windows Registry Editor Version 5.00
+# App Actions, Paint and Photos package settings are not modified through private settings.dat hives.
+Add-CwsNote 'Private App Actions package-hive modifications were skipped.'
 
-; disable set priority notifications
-"@
-$disableprioritynotificationsguid = Get-ChildItem "HKCU:\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current" -ErrorAction SilentlyContinue |
-Where-Object { $_.PSChildName -match '^\{[a-f0-9-]+\}\$' } |
-ForEach-Object { ($_.PSChildName -split '\$')[0] } |
-Select-Object -Unique
-foreach ($guid in $disableprioritynotificationsguid) {
-$disableprioritynotificationsregcontent += "`n`n[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\$guid`$windows.data.donotdisturb.quiethoursprofile`$quiethoursprofilelist\windows.data.donotdisturb.quiethoursprofile`$microsoft.quiethoursprofile.priorityonly]`n"
-$disableprioritynotificationsregcontent += '"Data"=hex(3):43,42,01,00,0A,02,01,00,2A,06,DF,B8,B4,CC,06,2A,2B,0E,D0,03,\' + "`n"
-$disableprioritynotificationsregcontent += '  43,42,01,00,C2,0A,01,CD,14,06,02,05,00,00,01,01,02,00,03,01,04,00,CC,32,12,\' + "`n"
-$disableprioritynotificationsregcontent += '  05,28,4D,00,69,00,63,00,72,00,6F,00,73,00,6F,00,66,00,74,00,2E,00,53,00,63,\' + "`n"
-$disableprioritynotificationsregcontent += '  00,72,00,65,00,65,00,6E,00,53,00,6B,00,65,00,74,00,63,00,68,00,5F,00,38,00,\' + "`n"
-$disableprioritynotificationsregcontent += '  77,00,65,00,6B,00,79,00,62,00,33,00,64,00,38,00,62,00,62,00,77,00,65,00,21,\' + "`n"
-$disableprioritynotificationsregcontent += '  00,41,00,70,00,70,00,29,4D,00,69,00,63,00,72,00,6F,00,73,00,6F,00,66,00,74,\' + "`n"
-$disableprioritynotificationsregcontent += '  00,2E,00,57,00,69,00,6E,00,64,00,6F,00,77,00,73,00,41,00,6C,00,61,00,72,00,\' + "`n"
-$disableprioritynotificationsregcontent += '  6D,00,73,00,5F,00,38,00,77,00,65,00,6B,00,79,00,62,00,33,00,64,00,38,00,62,\' + "`n"
-$disableprioritynotificationsregcontent += '  00,62,00,77,00,65,00,21,00,41,00,70,00,70,00,31,4D,00,69,00,63,00,72,00,6F,\' + "`n"
-$disableprioritynotificationsregcontent += '  00,73,00,6F,00,66,00,74,00,2E,00,58,00,62,00,6F,00,78,00,41,00,70,00,70,00,\' + "`n"
-$disableprioritynotificationsregcontent += '  5F,00,38,00,77,00,65,00,6B,00,79,00,62,00,33,00,64,00,38,00,62,00,62,00,77,\' + "`n"
-$disableprioritynotificationsregcontent += '  00,65,00,21,00,4D,00,69,00,63,00,72,00,6F,00,73,00,6F,00,66,00,74,00,2E,00,\' + "`n"
-$disableprioritynotificationsregcontent += '  58,00,62,00,6F,00,78,00,41,00,70,00,70,00,2D,4D,00,69,00,63,00,72,00,6F,00,\' + "`n"
-$disableprioritynotificationsregcontent += '  73,00,6F,00,66,00,74,00,2E,00,58,00,62,00,6F,00,78,00,47,00,61,00,6D,00,69,\' + "`n"
-$disableprioritynotificationsregcontent += '  00,6E,00,67,00,4F,00,76,00,65,00,72,00,6C,00,61,00,79,00,5F,00,38,00,77,00,\' + "`n"
-$disableprioritynotificationsregcontent += '  65,00,6B,00,79,00,62,00,33,00,64,00,38,00,62,00,62,00,77,00,65,00,21,00,41,\' + "`n"
-$disableprioritynotificationsregcontent += '  00,70,00,70,00,29,57,00,69,00,6E,00,64,00,6F,00,77,00,73,00,2E,00,53,00,79,\' + "`n"
-$disableprioritynotificationsregcontent += '  00,73,00,74,00,65,00,6D,00,2E,00,4E,00,65,00,61,00,72,00,53,00,68,00,61,00,\' + "`n"
-$disableprioritynotificationsregcontent += '  72,00,65,00,45,00,78,00,70,00,65,00,72,00,69,00,65,00,6E,00,63,00,65,00,52,\' + "`n"
-$disableprioritynotificationsregcontent += '  00,65,00,63,00,65,00,69,00,76,00,65,00,00,00,00,00'
-}
-$disableprioritynotificationsregfile = "$env:SystemRoot\Temp\DisableSetPriorityNotifications.reg"
-$disableprioritynotificationsregcontent | Out-File -FilePath $disableprioritynotificationsregfile -Encoding ASCII
+# Hardware device power behavior is controlled by the selected power plan.
+Add-CwsNote 'Adapter and device power-saving driver registry defaults were preserved.'
 
-# import reg file
-Start-Process -Wait "regedit.exe" -ArgumentList "/S `"$disableprioritynotificationsregfile`"" -WindowStyle Hidden
-
-# disable app actions
-        ## ms-settings:appactions
-# stop c:\windows\systemapps\microsoftwindows.client.cbs_cw5n1h2txyewy running
-$stop = "AppActions", "CrossDeviceResume", "DesktopStickerEditorWin32Exe", "DiscoveryHubApp", "FESearchHost", "SearchHost", "SoftLandingTask", "TextInputHost", "VisualAssistExe", "WebExperienceHostApp", "WindowsBackupClient", "WindowsMigration"
-$stop | ForEach-Object { Stop-Process -Name $_ -Force -ErrorAction SilentlyContinue }
-Start-Sleep -Seconds 2
-
-# create reg file
-$appactions = @'
-Windows Registry Editor Version 5.00
-
-[HKEY_LOCAL_MACHINE\Settings\LocalState\DisabledApps]
-"Microsoft.Paint_8wekyb3d8bbwe"=hex(5f5e10b):01,61,ed,11,34,f7,9f,dc,01
-"Microsoft.Windows.Photos_8wekyb3d8bbwe"=hex(5f5e10b):01,61,ed,11,34,f7,9f,dc,01
-"MicrosoftWindows.Client.CBS_cw5n1h2txyewy"=hex(5f5e10b):01,61,ed,11,34,f7,9f,dc,01
-'@
-Set-Content -Path "$env:SystemRoot\Temp\AppActions.reg" -Value $appactions -Force
-$settingsdat = "$env:LOCALAPPDATA\Packages\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\Settings\settings.dat"
-$regfileappactions = "$env:SystemRoot\Temp\AppActions.reg"
-
-# load hive
-reg load "HKLM\Settings" $settingsdat >$null 2>&1
-
-# import reg file
-if ($LASTEXITCODE -eq 0) {
-reg import $regfileappactions >$null 2>&1
-
-# unload hive
-[gc]::Collect()
-Start-Sleep -Seconds 2
-reg unload "HKLM\Settings" >$null 2>&1
-}
-
-# disable network adapter powersaving & wake on all connected devices
-$basePath = "HKLM:\System\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}"
-$adapterKeys = Get-ChildItem -Path $basePath -ErrorAction SilentlyContinue
-foreach ($key in $adapterKeys) {
-if ($key.PSChildName -match '^\d{4}$') {
-$regPath = $key.Name
-# disable adapter powersaving & wake
-cmd /c "reg add `"$regPath`" /v `"PnPCapabilities`" /t REG_DWORD /d `"24`" /f >nul 2>&1"
-# disable advanced energy efficient ethernet
-cmd /c "reg add `"$regPath`" /v `"AdvancedEEE`" /t REG_SZ /d `"0`" /f >nul 2>&1"
-# disable energy-efficient ethernet
-cmd /c "reg add `"$regPath`" /v `"*EEE`" /t REG_SZ /d `"0`" /f >nul 2>&1"
-cmd /c "reg add `"$regPath`" /v `"EEELinkAdvertisement`" /t REG_SZ /d `"0`" /f >nul 2>&1"
-# system idle power saver
-cmd /c "reg add `"$regPath`" /v `"SipsEnabled`" /t REG_SZ /d `"0`" /f >nul 2>&1"
-# ultra low power mode
-cmd /c "reg add `"$regPath`" /v `"ULPMode`" /t REG_SZ /d `"0`" /f >nul 2>&1"
-# disable gigabit lite
-cmd /c "reg add `"$regPath`" /v `"GigaLite`" /t REG_SZ /d `"0`" /f >nul 2>&1"
-# disable green ethernet
-cmd /c "reg add `"$regPath`" /v `"EnableGreenEthernet`" /t REG_SZ /d `"0`" /f >nul 2>&1"
-# disable power saving mode
-cmd /c "reg add `"$regPath`" /v `"PowerSavingMode`" /t REG_SZ /d `"0`" /f >nul 2>&1"
-# disable all wake
-cmd /c "reg add `"$regPath`" /v `"S5WakeOnLan`" /t REG_SZ /d `"0`" /f >nul 2>&1"
-cmd /c "reg add `"$regPath`" /v `"*WakeOnMagicPacket`" /t REG_SZ /d `"0`" /f >nul 2>&1"
-cmd /c "reg add `"$regPath`" /v `"*ModernStandbyWoLMagicPacket`" /t REG_SZ /d `"0`" /f >nul 2>&1"
-cmd /c "reg add `"$regPath`" /v `"*WakeOnPattern`" /t REG_SZ /d `"0`" /f >nul 2>&1"
-cmd /c "reg add `"$regPath`" /v `"WakeOnLink`" /t REG_SZ /d `"0`" /f >nul 2>&1"
-cmd /c "reg add `"$regPath`" /v `"*ModernStandbyWoLMagicPacket`" /t REG_SZ /d `"0`" /f >nul 2>&1"
-}
-}
-
-# disable hid power savings on all connected devices
-$usbKeys = Get-ChildItem -Path "HKLM:\SYSTEM\CurrentControlSet\Enum\HID" -Recurse -ErrorAction SilentlyContinue |
-Where-Object { $_.PSChildName -eq "Device Parameters" }
-foreach ($key in $usbKeys) {
-$regPath = $key.Name
-cmd /c "reg add `"$regPath`" /v `"EnhancedPowerManagementEnabled`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
-cmd /c "reg add `"$regPath`" /v `"SelectiveSuspendEnabled`" /t REG_BINARY /d `"00`" /f >nul 2>&1"
-cmd /c "reg add `"$regPath`" /v `"SelectiveSuspendOn`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
-}
-$usbKeys = Get-ChildItem -Path "HKLM:\SYSTEM\CurrentControlSet\Enum\HID" -Recurse -ErrorAction SilentlyContinue |
-Where-Object { $_.PSChildName -eq "WDF" }
-foreach ($key in $usbKeys) {
-$regPath = $key.Name
-cmd /c "reg add `"$regPath`" /v `"IdleInWorkingState`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
-}
-
-# disable pci power savings on all connected devices
-$usbKeys = Get-ChildItem -Path "HKLM:\SYSTEM\CurrentControlSet\Enum\PCI" -Recurse -ErrorAction SilentlyContinue |
-Where-Object { $_.PSChildName -eq "Device Parameters" }
-foreach ($key in $usbKeys) {
-$regPath = $key.Name
-cmd /c "reg add `"$regPath`" /v `"EnhancedPowerManagementEnabled`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
-cmd /c "reg add `"$regPath`" /v `"SelectiveSuspendEnabled`" /t REG_BINARY /d `"00`" /f >nul 2>&1"
-cmd /c "reg add `"$regPath`" /v `"SelectiveSuspendOn`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
-}
-$usbKeys = Get-ChildItem -Path "HKLM:\SYSTEM\CurrentControlSet\Enum\PCI" -Recurse -ErrorAction SilentlyContinue |
-Where-Object { $_.PSChildName -eq "WDF" }
-foreach ($key in $usbKeys) {
-$regPath = $key.Name
-cmd /c "reg add `"$regPath`" /v `"IdleInWorkingState`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
-}
-
-# disable usb power savings on all connected devices
-$usbKeys = Get-ChildItem -Path "HKLM:\SYSTEM\CurrentControlSet\Enum\USB" -Recurse -ErrorAction SilentlyContinue |
-Where-Object { $_.PSChildName -eq "Device Parameters" }
-foreach ($key in $usbKeys) {
-$regPath = $key.Name
-cmd /c "reg add `"$regPath`" /v `"EnhancedPowerManagementEnabled`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
-cmd /c "reg add `"$regPath`" /v `"SelectiveSuspendEnabled`" /t REG_BINARY /d `"00`" /f >nul 2>&1"
-cmd /c "reg add `"$regPath`" /v `"SelectiveSuspendOn`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
-}
-$usbKeys = Get-ChildItem -Path "HKLM:\SYSTEM\CurrentControlSet\Enum\USB" -Recurse -ErrorAction SilentlyContinue |
-Where-Object { $_.PSChildName -eq "WDF" }
-foreach ($key in $usbKeys) {
-$regPath = $key.Name
-cmd /c "reg add `"$regPath`" /v `"IdleInWorkingState`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
-}
-
-# disable hid wake on all connected devices
-$usbKeys = Get-ChildItem -Path "HKLM:\SYSTEM\CurrentControlSet\Enum\HID" -Recurse -ErrorAction SilentlyContinue |
-Where-Object { $_.PSChildName -eq "Device Parameters" }
-foreach ($key in $usbKeys) {
-$regPath = $key.Name
-cmd /c "reg add `"$regPath`" /v `"WaitWakeEnabled`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
-}
-
-# disable pci wake on all connected devices
-$usbKeys = Get-ChildItem -Path "HKLM:\SYSTEM\CurrentControlSet\Enum\PCI" -Recurse -ErrorAction SilentlyContinue |
-Where-Object { $_.PSChildName -eq "Device Parameters" }
-foreach ($key in $usbKeys) {
-$regPath = $key.Name
-cmd /c "reg add `"$regPath`" /v `"WaitWakeEnabled`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
-}
-
-# disable usb wake on all connected devices
-$usbKeys = Get-ChildItem -Path "HKLM:\SYSTEM\CurrentControlSet\Enum\USB" -Recurse -ErrorAction SilentlyContinue |
-Where-Object { $_.PSChildName -eq "Device Parameters" }
-foreach ($key in $usbKeys) {
-$regPath = $key.Name
-cmd /c "reg add `"$regPath`" /v `"WaitWakeEnabled`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
-}
-
-# import notepad settings
-        ## notepad
-# stop notepad running
-Stop-Process -Name "Notepad" -Force -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 2
-
-# create reg file
-$NotepadSettings = @'
-Windows Registry Editor Version 5.00
-
-[HKEY_LOCAL_MACHINE\Settings\LocalState]
-"OpenFile"=hex(5f5e104):01,00,00,00,d1,55,24,57,d1,84,db,01
-"GhostFile"=hex(5f5e10b):00,42,60,f1,5a,d1,84,db,01
-"RewriteEnabled"=hex(5f5e10b):00,12,4a,7f,5f,d1,84,db,01
-'@
-Set-Content -Path "$env:SystemRoot\Temp\NotepadSettings.reg" -Value $NotepadSettings -Force
-$SettingsDat = "$env:LocalAppData\Packages\Microsoft.WindowsNotepad_8wekyb3d8bbwe\Settings\settings.dat"
-$RegFileNotepadSettings = "$env:SystemRoot\Temp\NotepadSettings.reg"
-
-# load hive
-reg load "HKLM\Settings" $SettingsDat >$null 2>&1
-
-# import reg file
-if ($LASTEXITCODE -eq 0) {
-reg import $RegFileNotepadSettings >$null 2>&1
-
-# unload hive
-[gc]::Collect()
-Start-Sleep -Seconds 2
-reg unload "HKLM\Settings" >$null 2>&1
-}
+# Notepad AI is disabled through supported policy. Private Notepad package settings are preserved.
+Add-CwsNote 'Private Notepad package-hive modifications were skipped.'
 
 # unpin all taskbar items
 cmd /c "reg delete HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband /f >nul 2>&1"
@@ -2392,19 +1940,17 @@ cmd /c "reg delete `"HKCR\Folder\ShellEx\ContextMenuHandlers\Library Location`" 
 # remove share
 cmd /c "reg delete `"HKCR\AllFilesystemObjects\shellex\ContextMenuHandlers\ModernSharing`" /f >nul 2>&1"
 
-# remove restore previous versions
-cmd /c "reg add `"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer`" /v `"NoPreviousVersionsPage`" /t REG_DWORD /d `"1`" /f >nul 2>&1"
+# Preserve the Previous Versions page for recovery.
+cmd /c "reg delete `"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer`" /v `"NoPreviousVersionsPage`" /f >nul 2>&1"
 
 # remove send to
 cmd /c "reg delete `"HKCR\AllFilesystemObjects\shellex\ContextMenuHandlers\SendTo`" /f >nul 2>&1"
 cmd /c "reg delete `"HKCR\UserLibraryFolder\shellex\ContextMenuHandlers\SendTo`" /f >nul 2>&1"
 
-# windows 10 import start menu
-# delete startmenulayout.xml
-Remove-Item -Recurse -Force "$env:SystemDrive\Windows\StartMenuLayout.xml" -ErrorAction SilentlyContinue | Out-Null
-
-# create startmenulayout.xml
-$MultilineComment = @'
+# Apply a small Start layout with supported, OS-aware layout files only.
+if ([Environment]::OSVersion.Version.Build -lt 22000) {
+    $layoutFile = Join-Path $env:SystemRoot 'StartMenuLayout.xml'
+    $windows10Layout = @'
 <LayoutModificationTemplate xmlns:defaultlayout="http://schemas.microsoft.com/Start/2014/FullDefaultLayout" xmlns:start="http://schemas.microsoft.com/Start/2014/StartLayout" Version="1" xmlns:taskbar="http://schemas.microsoft.com/Start/2014/TaskbarLayout" xmlns="http://schemas.microsoft.com/Start/2014/LayoutModification">
     <LayoutOptions StartTileGroupCellWidth="6" />
     <DefaultLayoutOverride>
@@ -2419,149 +1965,23 @@ $MultilineComment = @'
     </DefaultLayoutOverride>
 </LayoutModificationTemplate>
 '@
-Set-Content -Path "C:\Windows\StartMenuLayout.xml" -Value $MultilineComment -Force -Encoding ASCII
-
-# assign startmenulayout.xml registry
-$layoutFile="C:\Windows\StartMenuLayout.xml"
-$regAliases = @("HKLM", "HKCU")
-foreach ($regAlias in $regAliases){
-$basePath = $regAlias + ":\SOFTWARE\Policies\Microsoft\Windows"
-$keyPath = $basePath + "\Explorer"
-IF(!(Test-Path -Path $keyPath)) {
-New-Item -Path $basePath -Name "Explorer" | Out-Null
-}
-Set-ItemProperty -Path $keyPath -Name "LockedStartLayout" -Value 1 | Out-Null
-Set-ItemProperty -Path $keyPath -Name "StartLayoutFile" -Value $layoutFile | Out-Null
-}
-
-# restart explorer
-Stop-Process -Force -Name explorer -ErrorAction SilentlyContinue | Out-Null
-Start-Sleep -Seconds 5
-
-# disable lockedstartlayout registry
-foreach ($regAlias in $regAliases){
-$basePath = $regAlias + ":\SOFTWARE\Policies\Microsoft\Windows"
-$keyPath = $basePath + "\Explorer"
-Set-ItemProperty -Path $keyPath -Name "LockedStartLayout" -Value 0
-}
-
-# delete startmenulayout.xml
-Remove-Item -Recurse -Force "$env:SystemDrive\Windows\StartMenuLayout.xml" -ErrorAction SilentlyContinue | Out-Null
-
-# import start menu
-# remove start2bin
-Remove-Item -Recurse -Force "$env:USERPROFILE\AppData\Local\Packages\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\LocalState\start2.bin" -ErrorAction SilentlyContinue | Out-Null
-
-# create start2bin
-$start2 = '-----BEGIN CERTIFICATE-----
-4nrhSwH8TRucAIEL3m5RhU5aX0cAW7FJilySr5CE+V40mv9utV7aAZARAABc9u55
-LN8F4borYyXEGl8Q5+RZ+qERszeqUhhZXDvcjTF6rgdprauITLqPgMVMbSZbRsLN
-/O5uMjSLEr6nWYIwsMJkZMnZyZrhR3PugUhUKOYDqwySCY6/CPkL/Ooz/5j2R2hw
-WRGqc7ZsJxDFM1DWofjUiGjDUny+Y8UjowknQVaPYao0PC4bygKEbeZqCqRvSgPa
-lSc53OFqCh2FHydzl09fChaos385QvF40EDEgSO8U9/dntAeNULwuuZBi7BkWSIO
-mWN1l4e+TZbtSJXwn+EINAJhRHyCSNeku21dsw+cMoLorMKnRmhJMLvE+CCdgNKI
-aPo/Krizva1+bMsI8bSkV/CxaCTLXodb/NuBYCsIHY1sTvbwSBRNMPvccw43RJCU
-KZRkBLkCVfW24ANbLfHXofHDMLxxFNUpBPSgzGHnueHknECcf6J4HCFBqzvSH1Tj
-Q3S6J8tq2yaQ+jFNkxGRMushdXNNiTNjDFYMJNvgRL2lu606PZeypEjvPg7SkGR2
-7a42GDSJ8n6HQJXFkOQPJ1mkU4qpA78U+ZAo9ccw8XQPPqE1eG7wzMGihTWfEMVs
-K1nsKyEZCLYFmKwYqdIF0somFBXaL/qmEHxwlPCjwRKpwLOue0Y8fgA06xk+DMti
-zWahOZNeZ54MN3N14S22D75riYEccVe3CtkDoL+4Oc2MhVdYEVtQcqtKqZ+DmmoI
-5BqkECeSHZ4OCguheFckK5Eq5Yf0CKRN+RY2OJ0ZCPUyxQnWdnOi9oBcZsz2NGzY
-g8ifO5s5UGscSDMQWUxPJQePDh8nPUittzJ+iplQqJYQ/9p5nKoDukzHHkSwfGms
-1GiSYMUZvaze7VSWOHrgZ6dp5qc1SQy0FSacBaEu4ziwx1H7w5NZj+zj2ZbxAZhr
-7Wfvt9K1xp58H66U4YT8Su7oq5JGDxuwOEbkltA7PzbFUtq65m4P4LvS4QUIBUqU
-0+JRyppVN5HPe11cCPaDdWhcr3LsibWXQ7f0mK8xTtPkOUb5pA2OUIkwNlzmwwS1
-Nn69/13u7HmPSyofLck77zGjjqhSV22oHhBSGEr+KagMLZlvt9pnD/3I1R1BqItW
-KF3woyb/QizAqScEBsOKj7fmGA7f0KKQkpSpenF1Q/LNdyyOc77wbu2aywLGLN7H
-BCdwwjjMQ43FHSQPCA3+5mQDcfhmsFtORnRZWqVKwcKWuUJ7zLEIxlANZ7rDcC30
-FKmeUJuKk0Upvhsz7UXzDtNmqYmtg6vY/yPtG5Cc7XXGJxY2QJcbg1uqYI6gKtue
-00Mfpjw7XpUMQbIW9rXMA9PSWX6h2ln2TwlbrRikqdQXACZyhtuzSNLK7ifSqw4O
-JcZ8JrQ/xePmSd0z6O/MCTiUTFwG0E6WS1XBV1owOYi6jVif1zg75DTbXQGTNRvK
-KarodfnpYg3sgTe/8OAI1YSwProuGNNh4hxK+SmljqrYmEj8BNK3MNCyIskCcQ4u
-cyoJJHmsNaGFyiKp1543PktIgcs8kpF/SN86/SoB/oI7KECCCKtHNdFV8p9HO3t8
-5OsgGUYgvh7Z/Z+P7UGgN1iaYn7El9XopQ/XwK9zc9FBr73+xzE5Hh4aehNVIQdM
-Mb+Rfm11R0Jc4WhqBLCC3/uBRzesyKUzPoRJ9IOxCwzeFwGQ202XVlPvklXQwgHx
-BfEAWZY1gaX6femNGDkRldzImxF87Sncnt9Y9uQty8u0IY3lLYNcAFoTobZmFkAQ
-vuNcXxObmHk3rZNAbRLFsXnWUKGjuK5oP2TyTNlm9fMmnf/E8deez3d8KOXW9YMZ
-DkA/iElnxcCKUFpwI+tWqHQ0FT96sgIP/EyhhCq6o/RnNtZvch9zW8sIGD7Lg0cq
-SzPYghZuNVYwr90qt7UDekEei4CHTzgWwlSWGGCrP6Oxjk1Fe+KvH4OYwEiDwyRc
-l7NRJseqpW1ODv8c3VLnTJJ4o3QPlAO6tOvon7vA1STKtXylbjWARNcWuxT41jtC
-CzrAroK2r9bCij4VbwHjmpQnhYbF/hCE1r71Z5eHdWXqpSgIWeS/1avQTStsehwD
-2+NGFRXI8mwLBLQN/qi8rqmKPi+fPVBjFoYDyDc35elpdzvqtN/mEp+xDrnAbwXU
-yfhkZvyo2+LXFMGFLdYtWTK/+T/4n03OJH1gr6j3zkoosewKTiZeClnK/qfc8YLw
-bCdwBm4uHsZ9I14OFCepfHzmXp9nN6a3u0sKi4GZpnAIjSreY4rMK8c+0FNNDLi5
-DKuck7+WuGkcRrB/1G9qSdpXqVe86uNojXk9P6TlpXyL/noudwmUhUNTZyOGcmhJ
-EBiaNbT2Awx5QNssAlZFuEfvPEAixBz476U8/UPb9ObHbsdcZjXNV89WhfYX04DM
-9qcMhCnGq25sJPc5VC6XnNHpFeWhvV/edYESdeEVwxEcExKEAwmEZlGJdxzoAH+K
-Y+xAZdgWjPPL5FaYzpXc5erALUfyT+n0UTLcjaR4AKxLnpbRqlNzrWa6xqJN9NwA
-+xa38I6EXbQ5Q2kLcK6qbJAbkEL76WiFlkc5mXrGouukDvsjYdxG5Rx6OYxb41Ep
-1jEtinaNfXwt/JiDZxuXCMHdKHSH40aZCRlwdAI1C5fqoUkgiDdsxkEq+mGWxMVE
-Zd0Ch9zgQLlA6gYlK3gt8+dr1+OSZ0dQdp3ABqb1+0oP8xpozFc2bK3OsJvucpYB
-OdmS+rfScY+N0PByGJoKbdNUHIeXv2xdhXnVjM5G3G6nxa3x8WFMJsJs2ma1xRT1
-8HKqjX9Ha072PD8Zviu/bWdf5c4RrphVqvzfr9wNRpfmnGOoOcbkRE4QrL5CqrPb
-VRujOBMPGAxNlvwq0w1XDOBDawZgK7660yd4MQFZk7iyZgUSXIo3ikleRSmBs+Mt
-r+3Og54Cg9QLPHbQQPmiMsu21IJUh0rTgxMVBxNUNbUaPJI1lmbkTcc7HeIk0Wtg
-RxwYc8aUn0f/V//c+2ZAlM6xmXmj6jIkOcfkSBd0B5z63N4trypD3m+w34bZkV1I
-cQ8h7SaUUqYO5RkjStZbvk2IDFSPUExvqhCstnJf7PZGilbsFPN8lYqcIvDZdaAU
-MunNh6f/RnhFwKHXoyWtNI6yK6dm1mhwy+DgPlA2nAevO+FC7Vv98Sl9zaVjaPPy
-3BRyQ6kISCL065AKVPEY0ULHqtIyfU5gMvBeUa5+xbU+tUx4ZeP/BdB48/LodyYV
-kkgqTafVxCvz4vgmPbnPjm/dlRbVGbyygN0Noq8vo2Ea8Z5zwO32coY2309AC7wv
-Pp2wJZn6LKRmzoLWJMFm1A1Oa4RUIkEpA3AAL+5TauxfawpdtTjicoWGQ5gGNwum
-+evTnGEpDimE5kUU6uiJ0rotjNpB52I+8qmbgIPkY0Fwwal5Z5yvZJ8eepQjvdZ2
-UcdvlTS8oA5YayGi+ASmnJSbsr/v1OOcLmnpwPI+hRgPP+Hwu5rWkOT+SDomF1TO
-n/k7NkJ967X0kPx6XtxTPgcG1aKJwZBNQDKDP17/dlZ869W3o6JdgCEvt1nIOPty
-lGgvGERC0jCNRJpGml4/py7AtP0WOxrs+YS60sPKMATtiGzp34++dAmHyVEmelhK
-apQBuxFl6LQN33+2NNn6L5twI4IQfnm6Cvly9r3VBO0Bi+rpjdftr60scRQM1qw+
-9dEz4xL9VEL6wrnyAERLY58wmS9Zp73xXQ1mdDB+yKkGOHeIiA7tCwnNZqClQ8Mf
-RnZIAeL1jcqrIsmkQNs4RTuE+ApcnE5DMcvJMgEd1fU3JDRJbaUv+w7kxj4/+G5b
-IU2bfh52jUQ5gOftGEFs1LOLj4Bny2XlCiP0L7XLJTKSf0t1zj2ohQWDT5BLo0EV
-5rye4hckB4QCiNyiZfavwB6ymStjwnuaS8qwjaRLw4JEeNDjSs/JC0G2ewulUyHt
-kEobZO/mQLlhso2lnEaRtK1LyoD1b4IEDbTYmjaWKLR7J64iHKUpiQYPSPxcWyei
-o4kcyGw+QvgmxGaKsqSBVGogOV6YuEyoaM0jlfUmi2UmQkju2iY5tzCObNQ41nsL
-dKwraDrcjrn4CAKPMMfeUSvYWP559EFfDhDSK6Os6Sbo8R6Zoa7C2NdAicA1jPbt
-5ENSrVKf7TOrthvNH9vb1mZC1X2RBmriowa/iT+LEbmQnAkA6Y1tCbpzvrL+cX8K
-pUTOAovaiPbab0xzFP7QXc1uK0XA+M1wQ9OF3XGp8PS5QRgSTwMpQXW2iMqihYPv
-Hu6U1hhkyfzYZzoJCjVsY2xghJmjKiKEfX0w3RaxfrJkF8ePY9SexnVUNXJ1654/
-PQzDKsW58Au9QpIH9VSwKNpv003PksOpobM6G52ouCFOk6HFzSLfnlGZW0yyUQL3
-RRyEE2PP0LwQEuk2gxrW8eVy9elqn43S8CG2h2NUtmQULc/IeX63tmCOmOS0emW9
-66EljNdMk/e5dTo5XplTJRxRydXcQpgy9bQuntFwPPoo0fXfXlirKsav2rPSWayw
-KQK4NxinT+yQh//COeQDYkK01urc2G7SxZ6H0k6uo8xVp9tDCYqHk/lbvukoN0RF
-tUI4aLWuKet1O1s1uUAxjd50ELks5iwoqLJ/1bzSmTRMifehP07sbK/N1f4hLae+
-jykYgzDWNfNvmPEiz0DwO/rCQTP6x69g+NJaFlmPFwGsKfxP8HqiNWQ6D3irZYcQ
-R5Mt2Iwzz2ZWA7B2WLYZWndRCosRVWyPdGhs7gkmLPZ+WWo/Yb7O1kIiWGfVuPNA
-MKmgPPjZy8DhZfq5kX20KF6uA0JOZOciXhc0PPAUEy/iQAtzSDYjmJ8HR7l4mYsT
-O3Mg3QibMK8MGGa4tEM8OPGktAV5B2J2QOe0f1r3vi3QmM+yukBaabwlJ+dUDQGm
-+Ll/1mO5TS+BlWMEAi13cB5bPRsxkzpabxq5kyQwh4vcMuLI0BOIfE2pDKny5jhW
-0C4zzv3avYaJh2ts6kvlvTKiSMeXcnK6onKHT89fWQ7Hzr/W8QbR/GnIWBbJMoTc
-WcgmW4fO3AC+YlnLVK4kBmnBmsLzLh6M2LOabhxKN8+0Oeoouww7g0HgHkDyt+MS
-97po6SETwrdqEFslylLo8+GifFI1bb68H79iEwjXojxQXcD5qqJPxdHsA32eWV0b
-qXAVojyAk7kQJfDIK+Y1q9T6KI4ew4t6iauJ8iVJyClnHt8z/4cXdMX37EvJ+2BS
-YKHv5OAfS7/9ZpKgILT8NxghgvguLB7G9sWNHntExPtuRLL4/asYFYSAJxUPm7U2
-xnp35Zx5jCXesd5OlKNdmhXq519cLl0RGZfH2ZIAEf1hNZqDuKesZ2enykjFlIec
-hZsLvEW/pJQnW0+LFz9N3x3vJwxbC7oDgd7A2u0I69Tkdzlc6FFJcfGabT5C3eF2
-EAC+toIobJY9hpxdkeukSuxVwin9zuBoUM4X9x/FvgfIE0dKLpzsFyMNlO4taCLc
-v1zbgUk2sR91JmbiCbqHglTzQaVMLhPwd8GU55AvYCGMOsSg3p952UkeoxRSeZRp
-jQHr4bLN90cqNcrD3h5knmC61nDKf8e+vRZO8CVYR1eb3LsMz12vhTJGaQ4jd0Kz
-QyosjcB73wnE9b/rxfG1dRactg7zRU2BfBK/CHpIFJH+XztwMJxn27foSvCY6ktd
-uJorJvkGJOgwg0f+oHKDvOTWFO1GSqEZ5BwXKGH0t0udZyXQGgZWvF5s/ojZVcK3
-IXz4tKhwrI1ZKnZwL9R2zrpMJ4w6smQgipP0yzzi0ZvsOXRksQJNCn4UPLBhbu+C
-eFBbpfe9wJFLD+8F9EY6GlY2W9AKD5/zNUCj6ws8lBn3aRfNPE+Cxy+IKC1NdKLw
-eFdOGZr2y1K2IkdefmN9cLZQ/CVXkw8Qw2nOr/ntwuFV/tvJoPW2EOzRmF2XO8mQ
-DQv51k5/v4ZE2VL0dIIvj1M+KPw0nSs271QgJanYwK3CpFluK/1ilEi7JKDikT8X
-TSz1QZdkum5Y3uC7wc7paXh1rm11nwluCC7jiA==
------END CERTIFICATE-----
-'
-New-Item "$env:SystemRoot\Temp\start2.txt" -Value $start2 -Force -ErrorAction SilentlyContinue | Out-Null
-certutil.exe -decode "$env:SystemRoot\Temp\start2.txt" "$env:SystemRoot\Temp\start2.bin" >$null
-
-# install start2bin
-Copy-Item "$env:SystemRoot\Temp\start2.bin" -Destination "$env:USERPROFILE\AppData\Local\Packages\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\LocalState" -Force -ErrorAction SilentlyContinue | Out-Null
-
-# windows 11 start menu - write LayoutModification.json with Explorer + Settings only
-# this is the supported non-MDM method; user can still customize after first login
-$shellFolder = "$env:LOCALAPPDATA\Microsoft\Windows\Shell"
-New-Item -Path $shellFolder -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
-$layoutJson = @'
+    Set-Content -LiteralPath $layoutFile -Value $windows10Layout -Encoding ASCII -Force
+    foreach ($policyRoot in @('HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer','HKCU:\SOFTWARE\Policies\Microsoft\Windows\Explorer')) {
+        New-Item -Path $policyRoot -Force -ErrorAction SilentlyContinue | Out-Null
+        New-ItemProperty -Path $policyRoot -Name 'LockedStartLayout' -PropertyType DWord -Value 1 -Force -ErrorAction SilentlyContinue | Out-Null
+        New-ItemProperty -Path $policyRoot -Name 'StartLayoutFile' -PropertyType String -Value $layoutFile -Force -ErrorAction SilentlyContinue | Out-Null
+    }
+    Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 5
+    foreach ($policyRoot in @('HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer','HKCU:\SOFTWARE\Policies\Microsoft\Windows\Explorer')) {
+        New-ItemProperty -Path $policyRoot -Name 'LockedStartLayout' -PropertyType DWord -Value 0 -Force -ErrorAction SilentlyContinue | Out-Null
+        Remove-ItemProperty -Path $policyRoot -Name 'StartLayoutFile' -ErrorAction SilentlyContinue
+    }
+    Remove-Item -LiteralPath $layoutFile -Force -ErrorAction SilentlyContinue
+} else {
+    $shellFolder = Join-Path $env:LOCALAPPDATA 'Microsoft\Windows\Shell'
+    New-Item -Path $shellFolder -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
+    $layoutJson = @'
 {
   "pinnedList": [
     { "desktopAppId": "Microsoft.Windows.Explorer" },
@@ -2569,45 +1989,15 @@ $layoutJson = @'
   ]
 }
 '@
-Set-Content -Path "$shellFolder\LayoutModification.json" -Value $layoutJson -Encoding UTF8 -Force
-
-# create start menu & startup shortcuts
-$WshShell = New-Object -comObject WScript.Shell
-$Shortcut = $WshShell.CreateShortcut("$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Start Menu Shortcuts 1.lnk")
-$Shortcut.TargetPath = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs"
-$Shortcut.Save()
-$WshShell = New-Object -comObject WScript.Shell
-$Shortcut = $WshShell.CreateShortcut("$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Start Menu Shortcuts 2.lnk")
-$Shortcut.TargetPath = "$env:AppData\Microsoft\Windows\Start Menu\Programs"
-$Shortcut.Save()
-$WshShell = New-Object -comObject WScript.Shell
-$Shortcut = $WshShell.CreateShortcut("$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup Programs 1.lnk")
-$Shortcut.TargetPath = "$env:AppData\Microsoft\Windows\Start Menu\Programs\Startup"
-$Shortcut.Save()
-$WshShell = New-Object -comObject WScript.Shell
-$Shortcut = $WshShell.CreateShortcut("$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup Programs 2.lnk")
-$Shortcut.TargetPath = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp"
-$Shortcut.Save()
-
-# hide accessibility accessories folders and all contents from start menu
-$folders = @(
-"$env:USERPROFILE\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Accessibility",
-"$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Accessibility",
-"$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Accessories"
-)
-foreach ($folder in $folders) {
-if (Test-Path $folder) {
-cmd /c "attrib +h `"$folder`" >nul 2>&1"
-cmd /c "attrib +h `"$folder\*.*`" /s /d >nul 2>&1"
+    Set-Content -LiteralPath (Join-Path $shellFolder 'LayoutModification.json') -Value $layoutJson -Encoding UTF8 -Force
 }
-}
+
+# No helper shortcuts are added to the Start menu or Startup folders.
+
+# Accessibility and Accessories entries are preserved. They do not consume resources when unused.
 
 # set start menu apps view to list
 cmd /c "reg add `"HKCU\Software\Microsoft\Windows\CurrentVersion\Start`" /v `"AllAppsViewMode`" /t REG_DWORD /d `"2`" /f >nul 2>&1"
-
-# restart explorer
-Stop-Process -Force -Name explorer -ErrorAction SilentlyContinue | Out-Null
-Start-Sleep -Seconds 10
 
         Write-Host "EDGE AND WEBVIEW2`n"
 Write-Host "Preserving Microsoft Edge and WebView2 because both are in the desired app set and Windows components can depend on WebView2.`n" -ForegroundColor Cyan
@@ -2739,7 +2129,8 @@ $optionalFeatures = @(
     'MicrosoftWindowsPowerShellV2Root',
     'Printing-XPSServices-Features',
     'SMB1Protocol',
-    'WorkFolders-Client'
+    'WorkFolders-Client',
+    'Recall'
 )
 Write-Host "Reading enabled Windows optional features once..." -ForegroundColor Cyan
 $enabledOptionalFeatures = @(Get-WindowsOptionalFeature -Online -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Enabled' })
@@ -2765,44 +2156,43 @@ Write-Host "Selected legacy feature cleanup finished.`n" -ForegroundColor Green
 # Microsoft GameInput is preserved because games and input devices can depend on it.
 Add-CwsNote 'Microsoft GameInput was preserved.'
 
-# stop and uninstall OneDrive if present
-Stop-CwsProcessIfPresent -Name 'OneDrive'
-$oneDriveInstallers = @(
-    "$env:SystemRoot\System32\OneDriveSetup.exe",
-    "$env:SystemRoot\SysWOW64\OneDriveSetup.exe"
-)
-foreach ($installer in $oneDriveInstallers) {
-    if (Test-Path -LiteralPath $installer) {
-        try { Start-Process -FilePath $installer -ArgumentList '/uninstall' -Wait -WindowStyle Hidden -ErrorAction Stop } catch { }
+if (Get-CwsOption -Name 'RemoveOneDrive' -Default $true) {
+    # stop and uninstall OneDrive if present
+    Stop-CwsProcessIfPresent -Name 'OneDrive'
+    $oneDriveInstallers = @(
+        "$env:SystemRoot\System32\OneDriveSetup.exe",
+        "$env:SystemRoot\SysWOW64\OneDriveSetup.exe"
+    )
+    foreach ($installer in $oneDriveInstallers) {
+        if (Test-Path -LiteralPath $installer) {
+            try { Start-Process -FilePath $installer -ArgumentList '/uninstall' -Wait -WindowStyle Hidden -ErrorAction Stop } catch { }
+        }
     }
-}
 
-Get-ChildItem -Path "C:\Program Files*\Microsoft OneDrive", "$env:LOCALAPPDATA\Microsoft\OneDrive" -Filter 'OneDriveSetup.exe' -Recurse -ErrorAction SilentlyContinue |
-    ForEach-Object { try { Start-Process -FilePath $_.FullName -ArgumentList '/uninstall /allusers' -Wait -WindowStyle Hidden -ErrorAction Stop } catch { } }
+    Get-ChildItem -Path "C:\Program Files*\Microsoft OneDrive", "$env:LOCALAPPDATA\Microsoft\OneDrive" -Filter 'OneDriveSetup.exe' -Recurse -ErrorAction SilentlyContinue |
+        ForEach-Object { try { Start-Process -FilePath $_.FullName -ArgumentList '/uninstall /allusers' -Wait -WindowStyle Hidden -ErrorAction Stop } catch { } }
 
-Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -match 'OneDrive' } |
-    Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
+    Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -match 'OneDrive' } |
+        Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
 
-cmd /c "reg delete `"HKCU\Software\Microsoft\Windows\CurrentVersion\Run`" /v `"OneDrive`" /f >nul 2>&1"
-cmd /c "reg delete `"HKLM\Software\Microsoft\Windows\CurrentVersion\Run`" /v `"OneDrive`" /f >nul 2>&1"
-cmd /c "reg add `"HKLM\SOFTWARE\Policies\Microsoft\Windows\OneDrive`" /v `"DisableFileSyncNGSC`" /t REG_DWORD /d `"1`" /f >nul 2>&1"
-cmd /c "reg add `"HKLM\SOFTWARE\Policies\Microsoft\Windows\OneDrive`" /v `"DisableFileSync`" /t REG_DWORD /d `"1`" /f >nul 2>&1"
+    cmd /c "reg delete `"HKCU\Software\Microsoft\Windows\CurrentVersion\Run`" /v `"OneDrive`" /f >nul 2>&1"
+    cmd /c "reg delete `"HKLM\Software\Microsoft\Windows\CurrentVersion\Run`" /v `"OneDrive`" /f >nul 2>&1"
+    cmd /c "reg add `"HKLM\SOFTWARE\Policies\Microsoft\Windows\OneDrive`" /v `"DisableFileSyncNGSC`" /t REG_DWORD /d `"1`" /f >nul 2>&1"
+    cmd /c "reg add `"HKLM\SOFTWARE\Policies\Microsoft\Windows\OneDrive`" /v `"DisableFileSync`" /t REG_DWORD /d `"1`" /f >nul 2>&1"
 
-foreach ($oneDrivePath in @("$env:USERPROFILE\OneDrive", "$env:LOCALAPPDATA\Microsoft\OneDrive", "$env:PROGRAMDATA\Microsoft OneDrive")) {
-    Remove-CwsPathIfPresent -LiteralPath $oneDrivePath -Recurse
+    foreach ($oneDrivePath in @("$env:USERPROFILE\OneDrive", "$env:LOCALAPPDATA\Microsoft\OneDrive", "$env:PROGRAMDATA\Microsoft OneDrive")) {
+        Remove-CwsPathIfPresent -LiteralPath $oneDrivePath -Recurse
+    }
+
+} else {
+    Add-CwsNote 'OneDrive removal was not selected.'
 }
 
 # Preserve Remote Desktop Connection and Snipping Tool. They are Windows features and should not be uninstalled by a general setup script.
 Add-CwsNote 'Remote Desktop Connection and Snipping Tool were preserved.'
 
-# Remove Microsoft Update Health Tools only when its uninstall entry is present.
-$findUpdateHealthTools = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
-$updateHealthTools = Get-ItemProperty $findUpdateHealthTools -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like '*Microsoft Update Health Tools*' }
-if ($updateHealthTools) {
-    $guid = $updateHealthTools.PSChildName
-    try { Start-Process 'msiexec.exe' -ArgumentList "/x $guid /qn /norestart" -Wait -NoNewWindow -ErrorAction Stop } catch { }
-}
-cmd /c "reg delete `"HKLM\SYSTEM\CurrentControlSet\Services\uhssvc`" /f >nul 2>&1"
+# Microsoft Update Health Tools is preserved because it supports Windows Update remediation.
+Add-CwsNote 'Microsoft Update Health Tools was preserved.'
 
 $plugScheduler = Get-ScheduledTask -TaskName 'PLUGScheduler' -ErrorAction SilentlyContinue
 if ($plugScheduler) {
@@ -2851,9 +2241,9 @@ function Get-WinGetExePath {
 
 function Register-CwsWinGetForCurrentUser {
     try {
-        Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe -ErrorAction Stop
+        Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 3
-        return $true
+        return [bool](Get-WinGetExePath)
     } catch {
         return $false
     }
@@ -2940,10 +2330,12 @@ function Install-CwsAppInstallerBundle {
     try {
         Write-Host 'Downloading the current signed App Installer bundle from Microsoft...'
         Invoke-WebRequest -Uri 'https://aka.ms/getwinget' -UseBasicParsing -OutFile $appInstallerPath -ErrorAction Stop
-        Add-AppxPackage -Path $appInstallerPath -ForceApplicationShutdown -ErrorAction Stop
+        Add-AppxPackage -Path $appInstallerPath -ForceApplicationShutdown -ErrorAction SilentlyContinue
         Register-CwsWinGetForCurrentUser | Out-Null
         Start-Sleep -Seconds 5
-        return [bool](Get-WinGetExePath)
+        $resolved = Get-WinGetExePath
+        if (-not $resolved) { Add-CwsWarning 'App Installer bundle completed but WinGet was still unavailable.' }
+        return [bool]$resolved
     } catch {
         Add-CwsWarning ("App Installer bundle installation failed: {0}" -f $_.Exception.Message)
         return $false
@@ -2971,147 +2363,244 @@ if (-not $script:wingetExe) {
 $wingetWorks = [bool]$script:wingetExe
 if ($wingetWorks) {
     Write-Host "Using WinGet: $script:wingetExe`n" -ForegroundColor Green
-    $sourceOutput = & $script:wingetExe source update --disable-interactivity 2>&1
-    $sourceExit = [int]$LASTEXITCODE
-    $sourceOutput | ForEach-Object { Write-Host $_ }
-    if ($sourceExit -ne 0) { Add-CwsWarning "WinGet source update returned exit code $sourceExit." }
+    $sourceResult = Invoke-CwsNativeCommand -FilePath $script:wingetExe -ArgumentList @('source','update','--disable-interactivity') -TimeoutSeconds 180
+    if ($sourceResult.Output) { $sourceResult.Output -split "`r?`n" | ForEach-Object { if ($_){ Write-Host $_ } } }
+    if ($sourceResult.Error) { $sourceResult.Error -split "`r?`n" | ForEach-Object { if ($_){ Write-Host $_ -ForegroundColor DarkGray } } }
+    if ($sourceResult.ExitCode -ne 0) { Add-CwsWarning "WinGet source update returned exit code $($sourceResult.ExitCode)." }
 } else {
     Add-CwsWarning 'WinGet could not be repaired. App installs were skipped, but the rest of StepTwo will continue.'
+}
+
+function Invoke-CwsWinGetCommand {
+    param(
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [ValidateRange(30,3600)][int]$TimeoutSeconds = 600,
+        [string]$Activity = 'WinGet command'
+    )
+    if (-not $script:wingetExe) {
+        return [pscustomobject]@{ ExitCode = 1; Output = 'WinGet is unavailable.'; TimedOut = $false }
+    }
+
+    $id = [guid]::NewGuid().ToString('N')
+    $stdoutPath = Join-Path $env:TEMP "winget-$id.out"
+    $stderrPath = Join-Path $env:TEMP "winget-$id.err"
+    try {
+        $process = Start-Process -FilePath $script:wingetExe -ArgumentList $Arguments -PassThru -NoNewWindow `
+            -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -ErrorAction Stop
+        $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+        $nextHeartbeat = 30
+        while (-not $process.HasExited) {
+            if ($stopwatch.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+                try { Start-Process -FilePath taskkill.exe -ArgumentList @('/PID',$process.Id,'/T','/F') -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue | Out-Null } catch { }
+                $stdout = if (Test-Path $stdoutPath) { Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue } else { '' }
+                $stderr = if (Test-Path $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue } else { '' }
+                return [pscustomobject]@{ ExitCode = 1460; Output = ($stdout + "`n" + $stderr).Trim(); TimedOut = $true }
+            }
+            if ($stopwatch.Elapsed.TotalSeconds -ge $nextHeartbeat) {
+                Write-Host ("  {0} is still running ({1}s)..." -f $Activity, [int]$stopwatch.Elapsed.TotalSeconds) -ForegroundColor DarkGray
+                $nextHeartbeat += 30
+            }
+            Start-Sleep -Seconds 2
+            $process.Refresh()
+        }
+        $stdout = if (Test-Path $stdoutPath) { Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue } else { '' }
+        $stderr = if (Test-Path $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue } else { '' }
+        return [pscustomobject]@{ ExitCode = [int]$process.ExitCode; Output = ($stdout + "`n" + $stderr).Trim(); TimedOut = $false }
+    } catch {
+        return [pscustomobject]@{ ExitCode = 1; Output = $_.Exception.Message; TimedOut = $false }
+    } finally {
+        Remove-Item -LiteralPath $stdoutPath,$stderrPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-CwsWinGetErrorText {
+    param([int]$ExitCode)
+    $unsigned = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$ExitCode),0)
+    $hex = '0x{0:X8}' -f $unsigned
+    $description = switch ($hex) {
+        '0x00000000' { 'Success' }
+        '0x8A150006' { 'Installer could not be started by ShellExecute' }
+        '0x8A150011' { 'Installer hash mismatch' }
+        '0x80073D06' { 'A newer package version is already installed' }
+        '0x80073CF3' { 'Package dependency or validation failure' }
+        '0x000005B4' { 'Installation timed out' }
+        default { 'WinGet or installer returned an error' }
+    }
+    return "$hex - $description"
+}
+
+function Test-CwsWinGetInstalled {
+    param([Parameter(Mandatory)][string]$Id)
+    $result = Invoke-CwsWinGetCommand -Arguments @('list','--id',$Id,'-e','--accept-source-agreements','--disable-interactivity') -TimeoutSeconds 120 -Activity "Verifying $Id"
+    return ($result.ExitCode -eq 0 -and $result.Output -match [regex]::Escape($Id))
+}
+
+function New-CwsInternetShortcut {
+    param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][string]$Url)
+    try {
+        $path = Join-Path ([Environment]::GetFolderPath('Desktop')) "$Name.url"
+        Set-Content -LiteralPath $path -Value "[InternetShortcut]`r`nURL=$Url`r`n" -Encoding ASCII -Force
+        $script:manualApps += "$Name - $Url"
+        return $true
+    } catch {
+        Add-CwsWarning ("Manual shortcut could not be created for {0}: {1}" -f $Name, $_.Exception.Message)
+        return $false
+    }
 }
 
 function Invoke-CwsWinGetInstall {
     param(
         [Parameter(Mandatory)][string]$Id,
+        [ValidateRange(60,3600)][int]$TimeoutSeconds = 600,
         [string]$Source = ''
     )
 
-    if (-not $script:wingetExe) { return [int]1 }
-
-    $arguments = @(
-        'install', '--id', $Id, '-e', '--silent',
-        '--accept-package-agreements', '--accept-source-agreements',
-        '--disable-interactivity', '--no-upgrade'
-    )
-    if (-not [string]::IsNullOrWhiteSpace($Source)) { $arguments += @('--source', $Source) }
-
-    $output = & $script:wingetExe @arguments 2>&1
-    $exitCode = [int]$LASTEXITCODE
-    $output | ForEach-Object { Write-Host $_ }
-
-    if ($exitCode -ne 0) {
-        $listArguments = @('list', '--id', $Id, '-e', '--accept-source-agreements', '--disable-interactivity')
-        if (-not [string]::IsNullOrWhiteSpace($Source)) { $listArguments += @('--source', $Source) }
-        $listOutput = & $script:wingetExe @listArguments 2>&1
-        $listExitCode = [int]$LASTEXITCODE
-        if ($listExitCode -eq 0 -and (($listOutput | Out-String) -match [regex]::Escape($Id))) {
-            return [int]0
-        }
+    if (Test-CwsWinGetInstalled -Id $Id) {
+        return [pscustomobject]@{ Id = $Id; Success = $true; ExitCode = 0; Detail = 'Already installed' }
     }
-    return [int]$exitCode
+
+    $arguments = @('install','--id',$Id,'-e','--silent','--accept-package-agreements','--accept-source-agreements','--disable-interactivity','--no-upgrade')
+    if (-not [string]::IsNullOrWhiteSpace($Source)) { $arguments += @('--source',$Source) }
+    $result = Invoke-CwsWinGetCommand -Arguments $arguments -TimeoutSeconds $TimeoutSeconds -Activity "Installing $Id"
+    if ($result.Output) { $result.Output -split "`r?`n" | ForEach-Object { if ($_){ Write-Host $_ } } }
+
+    if (Test-CwsWinGetInstalled -Id $Id) {
+        return [pscustomobject]@{ Id = $Id; Success = $true; ExitCode = 0; Detail = 'Verified after install' }
+    }
+    return [pscustomobject]@{ Id = $Id; Success = $false; ExitCode = [int]$result.ExitCode; Detail = (Get-CwsWinGetErrorText -ExitCode $result.ExitCode) }
 }
 
-$apps = @(
-    '7zip.7zip',
-    'Microsoft.AppInstaller',
-    'Balena.Etcher',
-    'Bambulab.Bambustudio',
-    'Apple.Bonjour',
-    'Anthropic.Claude',
-    'Microsoft.DirectX',
-    'Discord.Discord',
-    'Discord.Discord.PTB',
-    'File-New-Project.EarTrumpet',
-    'Element.Element',
-    'Elgato.StreamDeck',
-    'EpicGames.EpicGamesLauncher',
-    'Futuremark.FuturemarkSystemInfo',
-    'Google.Chrome',
-    'REALiX.HWiNFO',
-    'Oracle.JavaRuntimeEnvironment',
-    'Logitech.GHUB',
-    'Microsoft.DotNet.Framework.DeveloperPack.4.5',
-    'Microsoft.DotNet.Framework.DeveloperPack_4',
-    'Microsoft.DotNet.Native.Runtime',
-    'Microsoft.DotNet.Runtime.3_1',
-    'Microsoft.DotNet.Runtime.5',
-    'Microsoft.DotNet.Runtime.6',
-    'Microsoft.DotNet.Runtime.7',
-    'Microsoft.DotNet.Runtime.8',
-    'Microsoft.Edge',
-    'Microsoft.EdgeWebView2Runtime',
-    'Microsoft.VCRedist.2005.x86',
-    'Microsoft.VCRedist.2005.x64',
-    'Microsoft.VCRedist.2008.x64',
-    'Microsoft.VCRedist.2008.x86',
-    'Microsoft.VCRedist.2010.x64',
-    'Microsoft.VCRedist.2010.x86',
-    'Microsoft.VCRedist.2012.x64',
-    'Microsoft.VCRedist.2012.x86',
-    'Microsoft.VCRedist.2013.x64',
-    'Microsoft.VCRedist.2013.x86',
-    'Microsoft.VCLibs.Desktop.14',
-    'Microsoft.VCLibs.14',
-    'Microsoft.VCRedist.2015+.x64',
-    'Microsoft.VCRedist.2015+.x86',
-    'Microsoft.UI.Xaml.2.8',
-    'rcmaehl.MSEdgeRedirect',
-    'Nvidia.PhysX',
-    'Obsidian.Obsidian',
-    'Microsoft.OpenSSH.Preview',
-    'Perplexity.Perplexity',
-    'Microsoft.PowerShell',
-    'Microsoft.PowerToys',
-    'Proton.ProtonDrive',
-    'Proton.ProtonMail',
-    'Proton.ProtonVPN',
-    'RaspberryPiFoundation.RaspberryPiImager',
-    'RevoUninstaller.RevoUninstallerPro',
-    'RockstarGames.Launcher',
-    'ShareX.ShareX',
-    'SlackTechnologies.Slack',
-    'Valve.Steam',
-    'SublimeHQ.SublimeText.4',
-    'SergeySerkov.TagScanner',
-    'Tailscale.Tailscale',
-    'Telegram.TelegramDesktop',
-    'Termius.Termius',
-    'Ubisoft.Connect',
-    'VideoLAN.VLC',
-    'Microsoft.WindowsApp',
-    'Microsoft.WindowsAppRuntime.1.6',
-    'Microsoft.WindowsAppRuntime.1.7',
-    'Microsoft.WindowsAppRuntime.1.8',
-    'Microsoft.WindowsTerminal',
-    'memstechtips.Winhance',
-    'RARLab.WinRAR',
-    'WinSCP.WinSCP',
-    'Zoom.Zoom',
-    'Devolutions.UniGetUI',
-    'Apple.iTunes',
-    'ElectronicArts.EADesktop',
-    'Microsoft.Sysinternals.Autoruns'
+$recommendedApps = @(
+    '7zip.7zip','Microsoft.DirectX','Google.Chrome','REALiX.HWiNFO','Oracle.JavaRuntimeEnvironment',
+    'Microsoft.DotNet.Runtime.8','Microsoft.DotNet.Runtime.10','Microsoft.Edge','Microsoft.EdgeWebView2Runtime',
+    'Microsoft.VCRedist.2005.x86','Microsoft.VCRedist.2005.x64','Microsoft.VCRedist.2008.x64','Microsoft.VCRedist.2008.x86',
+    'Microsoft.VCRedist.2010.x64','Microsoft.VCRedist.2010.x86','Microsoft.VCRedist.2012.x64','Microsoft.VCRedist.2012.x86',
+    'Microsoft.VCRedist.2013.x64','Microsoft.VCRedist.2013.x86','Microsoft.VCRedist.2015+.x64','Microsoft.VCRedist.2015+.x86',
+    'rcmaehl.MSEdgeRedirect','Obsidian.Obsidian','Microsoft.PowerShell','Microsoft.PowerToys','Proton.ProtonDrive',
+    'Proton.ProtonVPN','ShareX.ShareX','Tailscale.Tailscale','VideoLAN.VLC','Microsoft.WindowsTerminal',
+    'memstechtips.Winhance','RARLab.WinRAR','WinSCP.WinSCP','Devolutions.UniGetUI','Microsoft.Sysinternals.Autoruns'
 )
-if ([Environment]::OSVersion.Version.Build -ge 22000) { $apps += 'StartIsBack.StartAllBack' }
+$communicationApps = @(
+    'Anthropic.Claude','Discord.Discord','Discord.Discord.PTB','Element.Element','XP8JNQFBQH6PVF',
+    'Proton.ProtonMail','SlackTechnologies.Slack','Telegram.TelegramDesktop','Termius.Termius','Zoom.Zoom'
+)
+$gamingApps = @(
+    'EpicGames.EpicGamesLauncher','Nvidia.PhysX','RockstarGames.Launcher','Valve.Steam','Ubisoft.Connect','ElectronicArts.EADesktop'
+)
+$developerApps = @(
+    'Balena.Etcher','Microsoft.OpenSSH.Preview','RaspberryPiFoundation.RaspberryPiImager','SublimeHQ.SublimeText.4'
+)
+$hardwareApps = @(
+    'Bambulab.Bambustudio','Apple.Bonjour','File-New-Project.EarTrumpet','Elgato.StreamDeck',
+    'Futuremark.FuturemarkSystemInfo','Logitech.GHUB','RevoUninstaller.RevoUninstallerPro',
+    'SergeySerkov.TagScanner','Apple.iTunes'
+)
+$storeApps = @('Microsoft.WindowsApp')
+$legacyDotNetApps = @(
+    'Microsoft.DotNet.Native.Runtime','Microsoft.DotNet.Runtime.3_1','Microsoft.DotNet.Runtime.5',
+    'Microsoft.DotNet.Runtime.6','Microsoft.DotNet.Runtime.7'
+)
+$legacyDeveloperPacks = @('Microsoft.DotNet.Framework.DeveloperPack.4.5','Microsoft.DotNet.Framework.DeveloperPack_4')
 
-# Brave Origin is intentionally manual because its web installer is not reliable unattended.
+$apps = @()
+if (Get-CwsOption -Name 'InstallRecommendedApps' -Default $true) { $apps += $recommendedApps }
+if (Get-CwsOption -Name 'InstallCommunicationApps' -Default $true) { $apps += $communicationApps }
+if (Get-CwsOption -Name 'InstallGamingApps' -Default $true) { $apps += $gamingApps }
+if (Get-CwsOption -Name 'InstallDeveloperTools' -Default $true) { $apps += $developerApps }
+if (Get-CwsOption -Name 'InstallHardwareUtilities' -Default $true) { $apps += $hardwareApps }
+if (Get-CwsOption -Name 'InstallStoreApps' -Default $true) { $apps += $storeApps }
+if (Get-CwsOption -Name 'InstallLegacyDotNet' -Default $false) { $apps += $legacyDotNetApps }
+if (Get-CwsOption -Name 'InstallLegacyDeveloperPacks' -Default $false) { $apps += $legacyDeveloperPacks }
+if ([Environment]::OSVersion.Version.Build -ge 22000 -and (Get-CwsOption -Name 'InstallRecommendedApps' -Default $true)) { $apps += 'StartIsBack.StartAllBack' }
+$apps = @($apps | Select-Object -Unique)
+$selectedApps = @($apps)
+
+# Brave Origin remains manual because its vendor installer is unreliable unattended.
 Write-Host "BRAVE ORIGIN`n"
-$braveOriginUrl = 'https://laptop-updates.brave.com/latest/origin'
-$braveOriginManualPath = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Install Brave Origin.url'
-try {
-    Set-Content -Path $braveOriginManualPath -Value "[InternetShortcut]`r`nURL=$braveOriginUrl`r`n" -Encoding ASCII -Force
-    Add-CwsNote 'Brave Origin was left as a manual desktop shortcut.'
-} catch {
-    Add-CwsWarning "Brave Origin shortcut could not be created: $($_.Exception.Message)"
-}
+New-CwsInternetShortcut -Name 'Install Brave Origin' -Url 'https://laptop-updates.brave.com/latest/origin' | Out-Null
+Add-CwsNote 'Brave Origin was left as a manual desktop shortcut.'
 
 if ($wingetWorks) {
     $appNumber = 0
     foreach ($app in $apps) {
         $appNumber++
+        $timeout = if ($app -match 'Launcher|Steam|Bambustudio|StreamDeck|GHUB|iTunes|EADesktop') { 1200 } else { 600 }
+        $source = if ($app -in @('Microsoft.WindowsApp','XP8JNQFBQH6PVF')) { 'msstore' } else { 'winget' }
         Write-Host "[$appNumber/$($apps.Count)] Installing $app" -ForegroundColor Cyan
-        $installExitCode = Invoke-CwsWinGetInstall -Id $app
-        if ($installExitCode -ne 0) { $failedApps += "$app (exit $installExitCode)" }
+        $installResult = Invoke-CwsWinGetInstall -Id $app -TimeoutSeconds $timeout -Source $source
+        if ($installResult.Success) {
+            $verifiedApps += $app
+        } else {
+            $failedApps += "$app ($($installResult.Detail))"
+            if ($app -eq 'XP8JNQFBQH6PVF') {
+                New-CwsInternetShortcut -Name 'Install Perplexity' -Url 'https://www.perplexity.ai/download' | Out-Null
+            }
+            if ($app -eq 'RockstarGames.Launcher') {
+                New-CwsInternetShortcut -Name 'Install Rockstar Games Launcher' -Url 'https://www.rockstargames.com/downloads' | Out-Null
+            }
+        }
     }
+}
+
+# Default-deny packaged background activity, but preserve selected Store-based apps
+# that rely on background notifications or servicing. Per-app entries override the
+# documented default policy.
+try {
+    $backgroundAllowPackages = @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -in @('Microsoft.WindowsStore','Microsoft.DesktopAppInstaller','MicrosoftCorporationII.WindowsApp') -or
+        $_.Name -like '*EarTrumpet*'
+    })
+    $backgroundAllowPfns = @($backgroundAllowPackages.PackageFamilyName | Where-Object { $_ } | Sort-Object -Unique)
+    $appPrivacyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy'
+    New-Item -Path $appPrivacyPath -Force -ErrorAction Stop | Out-Null
+    if ($backgroundAllowPfns.Count -gt 0) {
+        New-ItemProperty -Path $appPrivacyPath -Name 'LetAppsRunInBackground_ForceAllowTheseApps' -PropertyType MultiString -Value $backgroundAllowPfns -Force -ErrorAction Stop | Out-Null
+        Add-CwsNote ("Packaged background allowlist applied for {0} package family names." -f $backgroundAllowPfns.Count)
+    } else {
+        Remove-ItemProperty -Path $appPrivacyPath -Name 'LetAppsRunInBackground_ForceAllowTheseApps' -ErrorAction SilentlyContinue
+    }
+} catch {
+    Add-CwsWarning ("Packaged background allowlist could not be applied: {0}" -f $_.Exception.Message)
+}
+
+try {
+    [pscustomobject]@{
+        GeneratedAt = (Get-Date -Format o)
+        Selected = $selectedApps
+        Verified = $verifiedApps
+        Failed = $failedApps
+        Manual = $manualApps
+    } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $CwsWorkRoot 'AppInstallResults.json') -Encoding UTF8 -Force
+} catch { }
+
+# Remove only known heavy application auto-start entries. Update services and
+# scheduled update tasks are deliberately preserved.
+if (Get-CwsOption -Name 'DisableAppAutoStart' -Default $true) {
+    $startupPattern = 'Discord|Slack|Teams|Epic|Steam|EA|Ubisoft|Rockstar|Claude|Perplexity|Logi|GHUB|iTunesHelper|Telegram|Termius|Zoom|OneDrive'
+    $removedStartupEntries = 0
+    foreach ($runPath in @(
+        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run',
+        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run',
+        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'
+    )) {
+        $item = Get-ItemProperty -Path $runPath -ErrorAction SilentlyContinue
+        if (-not $item) { continue }
+        foreach ($property in $item.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' }) {
+            if ($property.Name -match $startupPattern -or [string]$property.Value -match $startupPattern) {
+                Remove-ItemProperty -Path $runPath -Name $property.Name -ErrorAction SilentlyContinue
+                $removedStartupEntries++
+            }
+        }
+    }
+    foreach ($startupFolder in @(
+        [Environment]::GetFolderPath('Startup'),
+        [Environment]::GetFolderPath('CommonStartup')
+    )) {
+        if (-not (Test-Path -LiteralPath $startupFolder)) { continue }
+        Get-ChildItem -LiteralPath $startupFolder -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $startupPattern } |
+            ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue; $removedStartupEntries++ }
+    }
+    Add-CwsNote "$removedStartupEntries known application auto-start entries were removed."
 }
 
 # clean up taskbar - remove all pins, clear stale layout XMLs, remove duplicate shortcuts
@@ -3342,7 +2831,6 @@ cmd /c "reg add `"HKCU\Software\NVIDIA Corporation\NvTray`" /v `"StartOnLogin`" 
 # enable nvidia legacy sharpen
 cmd /c "reg add `"HKLM\SYSTEM\CurrentControlSet\Services\nvlddmkm\FTS`" /v `"EnableGR535`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
 cmd /c "reg add `"HKLM\SYSTEM\CurrentControlSet\Services\nvlddmkm\Parameters\FTS`" /v `"EnableGR535`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
-cmd /c "reg add `"HKLM\SYSTEM\CurrentControlSet\Services\nvlddmkm\Parameters\FTS`" /v `"EnableGR535`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
 
 # turn on no scaling for all displays
 $configKeys = Get-ChildItem -Path "HKLM:\System\CurrentControlSet\Control\GraphicsDrivers\Configuration" -Recurse -ErrorAction SilentlyContinue
@@ -3354,7 +2842,7 @@ continue
 }
 if ($scalingProperties.PSObject.Properties.Name -contains 'Scaling') {
 $regPath = $key.PSPath.Replace('Microsoft.PowerShell.Core\Registry::', '').Replace('HKEY_LOCAL_MACHINE', 'HKLM')
-Run-Trusted -command "reg add `"$regPath`" /v `"Scaling`" /t REG_DWORD /d `"2`" /f"
+Invoke-CwsRegExe -Arguments ("add `"{0}`" /v Scaling /t REG_DWORD /d 2 /f" -f $regPath) | Out-Null
 }
 }
 
@@ -3365,7 +2853,7 @@ if (Test-Path $displayDbPath) {
 $displays = Get-ChildItem -Path $displayDbPath -ErrorAction SilentlyContinue
 foreach ($display in $displays) {
 $regPath = $display.PSPath.Replace('Microsoft.PowerShell.Core\Registry::', '').Replace('HKEY_LOCAL_MACHINE', 'HKLM')
-Run-Trusted -command "reg add `"$regPath`" /v `"ScalingConfig`" /t REG_BINARY /d `"DB02000010000000200100000E010000`" /f"
+Invoke-CwsRegExe -Arguments ("add `"{0}`" /v ScalingConfig /t REG_BINARY /d DB02000010000000200100000E010000 /f" -f $regPath) | Out-Null
 }
 }
 
@@ -4014,7 +3502,7 @@ continue
 }
 if ($scalingProperties.PSObject.Properties.Name -contains 'Scaling') {
 $regPath = $key.PSPath.Replace('Microsoft.PowerShell.Core\Registry::', '').Replace('HKEY_LOCAL_MACHINE', 'HKLM')
-Run-Trusted -command "reg add `"$regPath`" /v `"Scaling`" /t REG_DWORD /d `"2`" /f"
+Invoke-CwsRegExe -Arguments ("add `"{0}`" /v Scaling /t REG_DWORD /d 2 /f" -f $regPath) | Out-Null
 }
 }
 
@@ -4028,172 +3516,103 @@ cmd /c "reg add `"HKLM\SYSTEM\CurrentControlSet\Enum\$instanceID\Device Paramete
         Write-Host "POWER PLAN`n"
         ## powercfg.cpl
 
-# Create or reuse a dedicated Ultimate Performance plan without deleting OEM or built-in plans.
-$cwsPowerScheme = '99999999-9999-9999-9999-999999999999'
-$availablePowerPlans = (& powercfg.exe /list 2>&1 | Out-String)
-if ($availablePowerPlans -notmatch [regex]::Escape($cwsPowerScheme)) {
-    & powercfg.exe /duplicatescheme 'e9a42b02-d5df-448d-aa00-03f14749eb61' $cwsPowerScheme *> $null
+function Get-CwsGuidFromText {
+    param([string]$Text)
+    $match = [regex]::Match([string]$Text, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
+    if ($match.Success) { return $match.Value }
+    return $null
 }
-$availablePowerPlans = (& powercfg.exe /list 2>&1 | Out-String)
-if ($availablePowerPlans -match [regex]::Escape($cwsPowerScheme)) {
-    & powercfg.exe /setactive $cwsPowerScheme *> $null
-    if ($LASTEXITCODE -ne 0) {
-        Add-CwsWarning 'The custom Ultimate Performance plan exists but could not be activated. Current plan settings will be used.'
-        $cwsPowerScheme = 'SCHEME_CURRENT'
+
+function New-CwsUltimatePerformancePlan {
+    $planName = 'ItsMauridian Ultimate Performance'
+    $listResult = Invoke-CwsNativeCommand -FilePath powercfg.exe -ArgumentList @('/list') -TimeoutSeconds 30
+    foreach ($line in ($listResult.Output -split "`r?`n")) {
+        if ($line -like "*$planName*") {
+            $existingGuid = Get-CwsGuidFromText -Text $line
+            if ($existingGuid) {
+                $activate = Invoke-CwsNativeCommand -FilePath powercfg.exe -ArgumentList @('/setactive',$existingGuid) -TimeoutSeconds 30
+                if ($activate.ExitCode -eq 0) { return $existingGuid }
+            }
+        }
+    }
+
+    $createdGuid = $null
+    $nativeUltimate = Invoke-CwsNativeCommand -FilePath powercfg.exe -ArgumentList @('/duplicatescheme','e9a42b02-d5df-448d-aa00-03f14749eb61') -TimeoutSeconds 30
+    if ($nativeUltimate.ExitCode -eq 0) {
+        $createdGuid = Get-CwsGuidFromText -Text ($nativeUltimate.Output + "`n" + $nativeUltimate.Error)
+        if ($createdGuid) {
+            Invoke-CwsNativeCommand -FilePath powercfg.exe -ArgumentList @('/changename',$createdGuid,"`"$planName`"",'"Maximum AC performance with laptop-safe DC settings"') -TimeoutSeconds 30 | Out-Null
+            $activate = Invoke-CwsNativeCommand -FilePath powercfg.exe -ArgumentList @('/setactive',$createdGuid) -TimeoutSeconds 30
+            if ($activate.ExitCode -eq 0) { return $createdGuid }
+            Invoke-CwsNativeCommand -FilePath powercfg.exe -ArgumentList @('/delete',$createdGuid) -TimeoutSeconds 30 | Out-Null
+            $createdGuid = $null
+        }
+    }
+
+    # Modern Standby systems can reject the native Ultimate template. A duplicate
+    # of Balanced remains activatable and can still receive the performance values.
+    $fallback = Invoke-CwsNativeCommand -FilePath powercfg.exe -ArgumentList @('/duplicatescheme','381b4222-f694-41f0-9685-ff5bb260df2e') -TimeoutSeconds 30
+    if ($fallback.ExitCode -eq 0) {
+        $createdGuid = Get-CwsGuidFromText -Text ($fallback.Output + "`n" + $fallback.Error)
+        if ($createdGuid) {
+            Invoke-CwsNativeCommand -FilePath powercfg.exe -ArgumentList @('/changename',$createdGuid,"`"$planName`"",'"Modern Standby compatible performance plan"') -TimeoutSeconds 30 | Out-Null
+            $activate = Invoke-CwsNativeCommand -FilePath powercfg.exe -ArgumentList @('/setactive',$createdGuid) -TimeoutSeconds 30
+            if ($activate.ExitCode -eq 0) {
+                Add-CwsNote 'The performance plan uses a Balanced-derived fallback for Modern Standby compatibility.'
+                return $createdGuid
+            }
+        }
+    }
+    return $null
+}
+
+$cwsPowerScheme = 'SCHEME_CURRENT'
+if (Get-CwsOption -Name 'InstallUltimatePerformancePlan' -Default $true) {
+    $createdPowerPlan = New-CwsUltimatePerformancePlan
+    if ($createdPowerPlan) {
+        $cwsPowerScheme = $createdPowerPlan
+        Add-CwsNote "Active performance plan GUID: $cwsPowerScheme."
+    } else {
+        Add-CwsWarning 'A dedicated performance plan could not be activated. The current plan was preserved.'
     }
 } else {
-    Add-CwsWarning 'Ultimate Performance is unavailable on this hardware. Current plan settings will be used.'
-    $cwsPowerScheme = 'SCHEME_CURRENT'
+    Add-CwsNote 'Custom performance plan creation was not selected.'
 }
 
-# disable hibernate
-powercfg /hibernate off
-cmd /c "reg add `"HKLM\SYSTEM\CurrentControlSet\Control\Power`" /v `"HibernateEnabled`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
-cmd /c "reg add `"HKLM\SYSTEM\CurrentControlSet\Control\Power`" /v `"HibernateEnabledDefault`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
+# AC power: maximum performance. DC power: responsive but battery-safe.
+$powerSettings = @(
+    @{ Mode='AC'; Sub='54533251-82be-4824-96c1-47b60b740d00'; Setting='893dee8e-2bef-41e0-89c6-b55d0929964c'; Value='100' },
+    @{ Mode='AC'; Sub='54533251-82be-4824-96c1-47b60b740d00'; Setting='bc5038f7-23e0-4960-96da-33abaf5935ec'; Value='100' },
+    @{ Mode='AC'; Sub='54533251-82be-4824-96c1-47b60b740d00'; Setting='36687f9e-e3a5-4dbf-b1dc-15eb381c6863'; Value='0' },
+    @{ Mode='AC'; Sub='54533251-82be-4824-96c1-47b60b740d00'; Setting='0cc5b647-c1df-4637-891a-dec35c318583'; Value='100' },
+    @{ Mode='DC'; Sub='54533251-82be-4824-96c1-47b60b740d00'; Setting='893dee8e-2bef-41e0-89c6-b55d0929964c'; Value='5' },
+    @{ Mode='DC'; Sub='54533251-82be-4824-96c1-47b60b740d00'; Setting='bc5038f7-23e0-4960-96da-33abaf5935ec'; Value='100' },
+    @{ Mode='DC'; Sub='54533251-82be-4824-96c1-47b60b740d00'; Setting='36687f9e-e3a5-4dbf-b1dc-15eb381c6863'; Value='50' },
+    @{ Mode='DC'; Sub='54533251-82be-4824-96c1-47b60b740d00'; Setting='0cc5b647-c1df-4637-891a-dec35c318583'; Value='10' },
+    @{ Mode='AC'; Sub='501a4d13-42af-4429-9fd1-a8218c268e20'; Setting='ee12f906-d277-404b-b6da-e5fa1a576df5'; Value='0' },
+    @{ Mode='DC'; Sub='501a4d13-42af-4429-9fd1-a8218c268e20'; Setting='ee12f906-d277-404b-b6da-e5fa1a576df5'; Value='1' },
+    @{ Mode='AC'; Sub='2a737441-1930-4402-8d77-b2bebba308a3'; Setting='48e6b7a6-50f5-4782-a5d4-53bb8f07e226'; Value='0' },
+    @{ Mode='DC'; Sub='2a737441-1930-4402-8d77-b2bebba308a3'; Setting='48e6b7a6-50f5-4782-a5d4-53bb8f07e226'; Value='1' },
+    @{ Mode='AC'; Sub='19cbb8fa-5279-450e-9fac-8a3d5fedd0c1'; Setting='12bbebe6-58d6-4636-95bb-3217ef867c1a'; Value='0' },
+    @{ Mode='DC'; Sub='19cbb8fa-5279-450e-9fac-8a3d5fedd0c1'; Setting='12bbebe6-58d6-4636-95bb-3217ef867c1a'; Value='2' },
+    @{ Mode='AC'; Sub='0012ee47-9041-4b5d-9b77-535fba8b1442'; Setting='6738e2c4-e8a5-4a42-b16a-e040e769756e'; Value='0' },
+    @{ Mode='DC'; Sub='0012ee47-9041-4b5d-9b77-535fba8b1442'; Setting='6738e2c4-e8a5-4a42-b16a-e040e769756e'; Value='1200' },
+    @{ Mode='AC'; Sub='238c9fa8-0aad-41ed-83f4-97be242c8f20'; Setting='29f6c1db-86da-48c5-9fdb-f2b67b1f44da'; Value='0' },
+    @{ Mode='DC'; Sub='238c9fa8-0aad-41ed-83f4-97be242c8f20'; Setting='29f6c1db-86da-48c5-9fdb-f2b67b1f44da'; Value='1800' },
+    @{ Mode='AC'; Sub='7516b95f-f776-4464-8c53-06167f40cc99'; Setting='3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e'; Value='600' },
+    @{ Mode='DC'; Sub='7516b95f-f776-4464-8c53-06167f40cc99'; Setting='3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e'; Value='300' },
+    @{ Mode='AC'; Sub='7516b95f-f776-4464-8c53-06167f40cc99'; Setting='fbd9aa66-9553-4097-ba44-ed6e9d65eab8'; Value='0' },
+    @{ Mode='DC'; Sub='7516b95f-f776-4464-8c53-06167f40cc99'; Setting='fbd9aa66-9553-4097-ba44-ed6e9d65eab8'; Value='1' }
+)
+foreach ($powerSetting in $powerSettings) {
+    Set-CwsPowerSetting -Mode $powerSetting.Mode -Scheme $cwsPowerScheme -Subgroup $powerSetting.Sub -Setting $powerSetting.Setting -Value $powerSetting.Value | Out-Null
+}
+if ($cwsPowerScheme -ne 'SCHEME_CURRENT') {
+    Invoke-CwsNativeCommand -FilePath powercfg.exe -ArgumentList @('/setactive',$cwsPowerScheme) -TimeoutSeconds 30 | Out-Null
+}
+Set-CwsRegistryDword -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' -Name 'HiberbootEnabled' -Value 0 | Out-Null
 
-# disable lock
-cmd /c "reg add `"HKLM\Software\Microsoft\Windows\CurrentVersion\Explorer\FlyoutMenuSettings`" /v `"ShowLockOption`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
-
-# disable sleep
-cmd /c "reg add `"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FlyoutMenuSettings`" /v `"ShowSleepOption`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
-
-# disable fast boot
-cmd /c "reg add `"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Power`" /v `"HiberbootEnabled`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
-
-# disable power throttling
-cmd /c "reg add `"HKLM\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling`" /v `"PowerThrottlingOff`" /t REG_DWORD /d `"1`" /f >nul 2>&1"
-
-# modify desktop & laptop settings
-# hard disk turn off hard disk after 0%
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '0012ee47-9041-4b5d-9b77-535fba8b1442' -Setting '6738e2c4-e8a5-4a42-b16a-e040e769756e' -Value '0x00000000' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '0012ee47-9041-4b5d-9b77-535fba8b1442' -Setting '6738e2c4-e8a5-4a42-b16a-e040e769756e' -Value '0x00000000' | Out-Null
-# desktop background settings slide show paused
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '0d7dbae2-4294-402a-ba8e-26777e8488cd' -Setting '309dce9b-bef4-4119-9921-a851fb12f0f4' -Value '001' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '0d7dbae2-4294-402a-ba8e-26777e8488cd' -Setting '309dce9b-bef4-4119-9921-a851fb12f0f4' -Value '001' | Out-Null
-# wireless adapter settings power saving mode maximum performance
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '19cbb8fa-5279-450e-9fac-8a3d5fedd0c1' -Setting '12bbebe6-58d6-4636-95bb-3217ef867c1a' -Value '000' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '19cbb8fa-5279-450e-9fac-8a3d5fedd0c1' -Setting '12bbebe6-58d6-4636-95bb-3217ef867c1a' -Value '000' | Out-Null
-# sleep
-# sleep after 0%
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '238c9fa8-0aad-41ed-83f4-97be242c8f20' -Setting '29f6c1db-86da-48c5-9fdb-f2b67b1f44da' -Value '0x00000000' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '238c9fa8-0aad-41ed-83f4-97be242c8f20' -Setting '29f6c1db-86da-48c5-9fdb-f2b67b1f44da' -Value '0x00000000' | Out-Null
-# allow hybrid sleep off
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '238c9fa8-0aad-41ed-83f4-97be242c8f20' -Setting '94ac6d29-73ce-41a6-809f-6363ba21b47e' -Value '000' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '238c9fa8-0aad-41ed-83f4-97be242c8f20' -Setting '94ac6d29-73ce-41a6-809f-6363ba21b47e' -Value '000' | Out-Null
-# hibernate after
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '238c9fa8-0aad-41ed-83f4-97be242c8f20' -Setting '9d7815a6-7ee4-497e-8888-515a05f02364' -Value '0x00000000' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '238c9fa8-0aad-41ed-83f4-97be242c8f20' -Setting '9d7815a6-7ee4-497e-8888-515a05f02364' -Value '0x00000000' | Out-Null
-# allow wake timers disable
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '238c9fa8-0aad-41ed-83f4-97be242c8f20' -Setting 'bd3b718a-0680-4d9d-8ab2-e1d2b4ac806d' -Value '000' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '238c9fa8-0aad-41ed-83f4-97be242c8f20' -Setting 'bd3b718a-0680-4d9d-8ab2-e1d2b4ac806d' -Value '000' | Out-Null
-# usb settings
-# unhide hub selective suspend timeout
-cmd /c "reg add `"HKLM\System\CurrentControlSet\Control\Power\PowerSettings\2a737441-1930-4402-8d77-b2bebba308a3\0853a681-27c8-4100-a2fd-82013e970683`" /v `"Attributes`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
-
-# hub selective suspend timeout 0
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '2a737441-1930-4402-8d77-b2bebba308a3' -Setting '0853a681-27c8-4100-a2fd-82013e970683' -Value '0x00000000' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '2a737441-1930-4402-8d77-b2bebba308a3' -Setting '0853a681-27c8-4100-a2fd-82013e970683' -Value '0x00000000' | Out-Null
-# usb selective suspend setting disabled
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '2a737441-1930-4402-8d77-b2bebba308a3' -Setting '48e6b7a6-50f5-4782-a5d4-53bb8f07e226' -Value '000' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '2a737441-1930-4402-8d77-b2bebba308a3' -Setting '48e6b7a6-50f5-4782-a5d4-53bb8f07e226' -Value '000' | Out-Null
-# unhide usb 3 link power management
-cmd /c "reg add `"HKLM\System\CurrentControlSet\Control\Power\PowerSettings\2a737441-1930-4402-8d77-b2bebba308a3\d4e98f31-5ffe-4ce1-be31-1b38b384c009`" /v `"Attributes`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
-
-# usb 3 link power management - off
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '2a737441-1930-4402-8d77-b2bebba308a3' -Setting 'd4e98f31-5ffe-4ce1-be31-1b38b384c009' -Value '000' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '2a737441-1930-4402-8d77-b2bebba308a3' -Setting 'd4e98f31-5ffe-4ce1-be31-1b38b384c009' -Value '000' | Out-Null
-# power buttons and lid start menu power button shut down
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '4f971e89-eebd-4455-a8de-9e59040e7347' -Setting 'a7066653-8d6c-40a8-910e-a1f54b84c7e5' -Value '002' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '4f971e89-eebd-4455-a8de-9e59040e7347' -Setting 'a7066653-8d6c-40a8-910e-a1f54b84c7e5' -Value '002' | Out-Null
-# pci express link state power management off
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '501a4d13-42af-4429-9fd1-a8218c268e20' -Setting 'ee12f906-d277-404b-b6da-e5fa1a576df5' -Value '000' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '501a4d13-42af-4429-9fd1-a8218c268e20' -Setting 'ee12f906-d277-404b-b6da-e5fa1a576df5' -Value '000' | Out-Null
-# processor power management
-# minimum processor state 100%
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '54533251-82be-4824-96c1-47b60b740d00' -Setting '893dee8e-2bef-41e0-89c6-b55d0929964c' -Value '0x00000064' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '54533251-82be-4824-96c1-47b60b740d00' -Setting '893dee8e-2bef-41e0-89c6-b55d0929964c' -Value '0x00000064' | Out-Null
-# system cooling policy active
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '54533251-82be-4824-96c1-47b60b740d00' -Setting '94d3a615-a899-4ac5-ae2b-e4d8f634367f' -Value '001' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '54533251-82be-4824-96c1-47b60b740d00' -Setting '94d3a615-a899-4ac5-ae2b-e4d8f634367f' -Value '001' | Out-Null
-# maximum processor state 100%
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '54533251-82be-4824-96c1-47b60b740d00' -Setting 'bc5038f7-23e0-4960-96da-33abaf5935ec' -Value '0x00000064' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '54533251-82be-4824-96c1-47b60b740d00' -Setting 'bc5038f7-23e0-4960-96da-33abaf5935ec' -Value '0x00000064' | Out-Null
-# unhide processor performance core parking min cores
-cmd /c "reg add `"HKLM\System\CurrentControlSet\Control\Power\PowerSettings\54533251-82be-4824-96c1-47b60b740d00\0cc5b647-c1df-4637-891a-dec35c318583`" /v `"Attributes`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
-
-# unpark cpu cores
-# processor performance core parking min cores 100%
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '54533251-82be-4824-96c1-47b60b740d00' -Setting '0cc5b647-c1df-4637-891a-dec35c318583' -Value '0x00000064' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '54533251-82be-4824-96c1-47b60b740d00' -Setting '0cc5b647-c1df-4637-891a-dec35c318583' -Value '0x00000064' | Out-Null
-# unhide processor performance core parking max cores
-cmd /c "reg add `"HKLM\System\CurrentControlSet\Control\Power\PowerSettings\54533251-82be-4824-96c1-47b60b740d00\ea062031-0e34-4ff1-9b6d-eb1059334028`" /v `"Attributes`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
-
-# unpark cpu cores
-# processor performance core parking max cores 100%
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '54533251-82be-4824-96c1-47b60b740d00' -Setting 'ea062031-0e34-4ff1-9b6d-eb1059334028' -Value '0x00000064' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '54533251-82be-4824-96c1-47b60b740d00' -Setting 'ea062031-0e34-4ff1-9b6d-eb1059334028' -Value '0x00000064' | Out-Null
-# display
-# turn off display after 10 min - oled protection
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '7516b95f-f776-4464-8c53-06167f40cc99' -Setting '3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e' -Value '600' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '7516b95f-f776-4464-8c53-06167f40cc99' -Setting '3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e' -Value '600' | Out-Null
-# display brightness 100%
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '7516b95f-f776-4464-8c53-06167f40cc99' -Setting 'aded5e82-b909-4619-9949-f5d71dac0bcb' -Value '0x00000064' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '7516b95f-f776-4464-8c53-06167f40cc99' -Setting 'aded5e82-b909-4619-9949-f5d71dac0bcb' -Value '0x00000064' | Out-Null
-# dimmed display brightness 100%
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '7516b95f-f776-4464-8c53-06167f40cc99' -Setting 'f1fbfde2-a960-4165-9f88-50667911ce96' -Value '0x00000064' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '7516b95f-f776-4464-8c53-06167f40cc99' -Setting 'f1fbfde2-a960-4165-9f88-50667911ce96' -Value '0x00000064' | Out-Null
-# enable adaptive brightness off
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '7516b95f-f776-4464-8c53-06167f40cc99' -Setting 'fbd9aa66-9553-4097-ba44-ed6e9d65eab8' -Value '000' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '7516b95f-f776-4464-8c53-06167f40cc99' -Setting 'fbd9aa66-9553-4097-ba44-ed6e9d65eab8' -Value '000' | Out-Null
-# video playback quality bias video playback performance bias
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '9596fb26-9850-41fd-ac3e-f7c3c00afd4b' -Setting '10778347-1370-4ee0-8bbd-33bdacaade49' -Value '001' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '9596fb26-9850-41fd-ac3e-f7c3c00afd4b' -Setting '10778347-1370-4ee0-8bbd-33bdacaade49' -Value '001' | Out-Null
-# when playing video optimize video quality
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '9596fb26-9850-41fd-ac3e-f7c3c00afd4b' -Setting '34c7b99f-9a6d-4b3c-8dc7-b6693b78cef4' -Value '000' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '9596fb26-9850-41fd-ac3e-f7c3c00afd4b' -Setting '34c7b99f-9a6d-4b3c-8dc7-b6693b78cef4' -Value '000' | Out-Null
-# modify laptop settings
-# intel(r) graphics settings intel(r) graphics power plan maximum performance
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup '44f3beca-a7c0-460e-9df2-bb8b99e0cba6' -Setting '3619c3f2-afb2-4afc-b0e9-e7fef372de36' -Value '002' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup '44f3beca-a7c0-460e-9df2-bb8b99e0cba6' -Setting '3619c3f2-afb2-4afc-b0e9-e7fef372de36' -Value '002' | Out-Null
-# amd power slider overlay best performance
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup 'c763b4ec-0e50-4b6b-9bed-2b92a6ee884e' -Setting '7ec1751b-60ed-4588-afb5-9819d3d77d90' -Value '003' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup 'c763b4ec-0e50-4b6b-9bed-2b92a6ee884e' -Setting '7ec1751b-60ed-4588-afb5-9819d3d77d90' -Value '003' | Out-Null
-# ati graphics power settings ati powerplay settings maximize performance
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup 'f693fb01-e858-4f00-b20f-f30e12ac06d6' -Setting '191f65b5-d45c-4a4f-8aae-1ab8bfd980e6' -Value '001' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup 'f693fb01-e858-4f00-b20f-f30e12ac06d6' -Setting '191f65b5-d45c-4a4f-8aae-1ab8bfd980e6' -Value '001' | Out-Null
-# switchable dynamic graphics global settings maximize performance
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup 'e276e160-7cb0-43c6-b20b-73f5dce39954' -Setting 'a1662ab2-9d34-4e53-ba8b-2639b9e20857' -Value '003' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup 'e276e160-7cb0-43c6-b20b-73f5dce39954' -Setting 'a1662ab2-9d34-4e53-ba8b-2639b9e20857' -Value '003' | Out-Null
-# battery
-# critical battery notification off
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting '5dbb7c9f-38e9-40d2-9749-4f8a0e9f640f' -Value '000' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting '5dbb7c9f-38e9-40d2-9749-4f8a0e9f640f' -Value '000' | Out-Null
-# critical battery action do nothing
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting '637ea02f-bbcb-4015-8e2c-a1c7b9c0b546' -Value '000' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting '637ea02f-bbcb-4015-8e2c-a1c7b9c0b546' -Value '000' | Out-Null
-# low battery level 0%
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting '8183ba9a-e910-48da-8769-14ae6dc1170a' -Value '0x00000000' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting '8183ba9a-e910-48da-8769-14ae6dc1170a' -Value '0x00000000' | Out-Null
-# critical battery level 0%
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting '9a66d8d7-4ff7-4ef9-b5a2-5a326ca2a469' -Value '0x00000000' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting '9a66d8d7-4ff7-4ef9-b5a2-5a326ca2a469' -Value '0x00000000' | Out-Null
-# low battery notification off
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting 'bcded951-187b-4d05-bccc-f7e51960c258' -Value '000' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting 'bcded951-187b-4d05-bccc-f7e51960c258' -Value '000' | Out-Null
-# low battery action do nothing
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting 'd8742dcb-3e6a-4b3c-b3fe-374623cdcf06' -Value '000' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting 'd8742dcb-3e6a-4b3c-b3fe-374623cdcf06' -Value '000' | Out-Null
-# reserve battery level 0%
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting 'f3c5027d-cd16-4930-aa6b-90db844a8f00' -Value '0x00000000' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup 'e73a048d-bf27-4f12-9731-8b2076e8891f' -Setting 'f3c5027d-cd16-4930-aa6b-90db844a8f00' -Value '0x00000000' | Out-Null
-# immersive control panel
-# low screen brightness when using battery saver disable
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup 'de830923-a562-41af-a086-e3a2c6bad2da' -Setting '13d09884-f74e-474a-a852-b6bde8ad03a8' -Value '0x00000064' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup 'de830923-a562-41af-a086-e3a2c6bad2da' -Setting '13d09884-f74e-474a-a852-b6bde8ad03a8' -Value '0x00000064' | Out-Null
-# turn battery saver on automatically at never
-Set-CwsPowerSetting -Mode AC -Scheme $cwsPowerScheme -Subgroup 'de830923-a562-41af-a086-e3a2c6bad2da' -Setting 'e69653ca-cf7f-4f05-aa73-cb833fa90ad4' -Value '0x00000000' | Out-Null
-Set-CwsPowerSetting -Mode DC -Scheme $cwsPowerScheme -Subgroup 'de830923-a562-41af-a086-e3a2c6bad2da' -Setting 'e69653ca-cf7f-4f05-aa73-cb833fa90ad4' -Value '0x00000000' | Out-Null
-if ($cwsPowerScheme -ne 'SCHEME_CURRENT') { & powercfg.exe /setactive $cwsPowerScheme *> $null }
+if (Get-CwsOption -Name 'EnableExperimentalTimerTweaks' -Default $false) {
         Write-Host "TIMER RESOLUTION`n"
         ## services.msc
 
@@ -4431,6 +3850,10 @@ cmd /c "bcdedit /deletevalue useplatformclock >nul 2>&1"
 cmd /c "bcdedit /set useplatformtick yes >nul 2>&1"
 cmd /c "bcdedit /set disabledynamictick yes >nul 2>&1"
 
+} else {
+    Add-CwsNote 'Experimental timer service and BCD timer changes were skipped.'
+}
+
 # rebuild performance counters
         ## perfmon.msc
 cmd /c "cd /d %systemroot%\system32 && lodctr /R >nul 2>&1"
@@ -4445,14 +3868,14 @@ cmd /c "cd /d %systemroot%\sysWOW64 && lodctr /R >nul 2>&1"
 
 # clear user temp while preserving files currently locked by running applications
 Get-ChildItem -LiteralPath "$env:LOCALAPPDATA\Temp" -Force -ErrorAction SilentlyContinue | ForEach-Object {
-    try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop } catch { }
+    Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 # clear Windows temp selectively. Preserve this script, transcript and handoff files while StepTwo is running.
 $protectedTempNames = @('CWS-StepTwo.log', 'StepOne.ps1', 'StepTwo.ps1', 'DDU.ps1', 'DDU.path')
 Get-ChildItem -LiteralPath "$env:SystemRoot\Temp" -Force -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -notin $protectedTempNames } |
-    ForEach-Object { try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop } catch { } }
+    ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
 
 try { Start-Process -FilePath 'cleanmgr.exe' -ArgumentList '/autoclean /d C:' -Wait -WindowStyle Hidden -ErrorAction Stop } catch { }
 
@@ -4475,6 +3898,20 @@ try {
 } catch { Add-CwsWarning "Final restore point was not created: $($_.Exception.Message)" }
 
         Write-Host "RESTARTING`n" -ForegroundColor Red
+
+# Mark the main flow complete before generating the read-only verification report.
+$cwsWorkRoot = Join-Path $env:ProgramData 'ItsMauridian\Custom-Windows-Setup'
+try { Set-Content -Path (Join-Path $cwsWorkRoot 'StepTwo.completed') -Value (Get-Date -Format o) -Encoding ASCII -Force } catch { }
+$verifyScriptPath = Join-Path $cwsWorkRoot 'Verify-Setup.ps1'
+if (Test-Path -LiteralPath $verifyScriptPath) {
+    try {
+        $verifyProcess = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+            -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$verifyScriptPath) -Wait -PassThru -NoNewWindow -ErrorAction Stop
+        if ($verifyProcess.ExitCode -ne 0) { Add-CwsWarning "Verification report returned exit code $($verifyProcess.ExitCode)." }
+    } catch {
+        Add-CwsWarning ("Verification report could not be generated: {0}" -f $_.Exception.Message)
+    }
+}
 
 # Write a concise, categorized log. The detailed transcript remains in C:\Windows\Temp.
 $logPath = "$env:USERPROFILE\Desktop\WinSux-Setup-Log.txt"
@@ -4519,8 +3956,6 @@ if ($fatalErrors.Count -gt 0) {
 
 $logContent | Out-File -FilePath $logPath -Encoding UTF8 -Force
 
-$cwsWorkRoot = Join-Path $env:ProgramData 'ItsMauridian\Custom-Windows-Setup'
-try { Set-Content -Path (Join-Path $cwsWorkRoot 'StepTwo.completed') -Value (Get-Date -Format o) -Encoding ASCII -Force } catch { }
 try { Unregister-ScheduledTask -TaskName 'ItsMauridian-Custom-Windows-Setup-StepTwo' -TaskPath '\ItsMauridian\' -Confirm:$false -ErrorAction SilentlyContinue } catch { }
 try { Unregister-ScheduledTask -TaskName 'ItsMauridian-Custom-Windows-Setup-StepTwo' -Confirm:$false -ErrorAction SilentlyContinue } catch { }
 try { Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' -Name '!ItsMauridian-StepTwo' -ErrorAction SilentlyContinue } catch { }

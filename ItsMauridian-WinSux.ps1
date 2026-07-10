@@ -1,71 +1,35 @@
 # ==============================================================================
-# WinSux - Forked & Modified by Mauridian (ItsMauridian)
-# BUILD MARKER: reliability13 2026-07-10 - persistent DDU resume handoff
+# WinSux - Forked and modified by Mauridian (ItsMauridian)
+# BUILD MARKER: reliability14 2026-07-10 - fresh-install reliability and audit build
 # Repo: https://github.com/ItsMauridian/Custom-Windows-Setup
 # Run: iwr https://winsetup.tsql.gg -useb | iex
 #
-# Original script by FR33THY: https://github.com/FR33THYFR33THY/WinSux-Windows-Optimization-Guide
+# Original script by FR33THY:
+# https://github.com/FR33THYFR33THY/WinSux-Windows-Optimization-Guide
 #
-# Modifications in this fork:
-#   - Windows activation via MAS (get.activated.win) added at start
-#   - Removed: black lockscreen/wallpaper enforcement
-#   - Removed: force left taskbar alignment (set to centered/default)
-#   - Removed: hide recycle bin from desktop & start menu shortcut
-#   - Removed: show all taskbar icons (restores pop-out arrow)
-#   - Removed: 100% DPI scaling override (allows per-monitor scaling e.g. 125%)
-#   - Removed: pause Windows Updates for 365 days
-#   - Removed: disable automatic Microsoft Store app updates
-#   - Removed: prevent driver downloads via Windows Update
-#   - Removed: remove Scan with Defender from context menu
-#   - Removed: disable YubiKey/FIDO2 passkey access
-#   - Removed: force Windows Hello only sign-in (PasswordLess)
-#   - Removed: remove security taskbar icon
-#   - Removed: wipe Program Files (x86)\Microsoft folder (preserves WebView2)
-#   - Changed: Microsoft Edge and WebView2 are preserved; only stale shortcuts are removed
-#   - Changed: taskbar alignment set to centered (Windows 11 default)
-#   - Changed: ColorPrevalence set to 0 (fixes unreadable text on Windows 10)
-#   - Added: confirm file delete dialog
-#   - Added: enable text suggestions on physical keyboard + multilingual suggestions
-#   - Added: wsreset -i to reinstall Microsoft Store if missing
-#   - Changed: Store initialization is non-interactive and protected by a timeout
-#   - Added: NetworkThrottlingIndex + SystemResponsiveness tweaks
-#   - Added: Nagle's algorithm disabled on all network adapters
-#   - Added: SysMain (Superfetch) disabled
-#   - Added: HPET disabled via bcdedit
-#   - Added: Prefer IPv4 over IPv6 + Disable Teredo (DisabledComponents=0x21)
-#   - Added: netsh teredo set state disabled
-#   - Added: OneDrive leftover folder removal, startup removal, reinstall prevention
-#   - Added: comprehensive telemetry block (DiagTrack, wermgr, AdvertisingInfo, TIPC,
-#            OnlineSpeechPrivacy, SvcHostSplitThresholdInKB, PowerShell/dotnet telemetry)
-#   - Added: Activity History disabled (EnableActivityFeed, UploadUserActivities)
-#   - Added: Copilot deep removal (appx, IsCopilotAvailable, AllowCopilotRuntime, CoreAI)
-#   - Changed: AppX removal uses an explicit consumer-app list and preserves frameworks
-#   - Added: Widgets appx removal
-#   - Changed: service baseline aligned to current WinUtil safe subset
-#   - Added: Explorer Automatic Folder Discovery disabled
-#   - Added: Background apps GlobalUserDisabled
-#   - Added: Show hidden files (without system files)
-#   - Added: Num Lock on startup
-#   - Changed: MPO handling is OS-aware and only forced on Windows 10
-#   - Added: Modern Standby fix (EnforceDisconnectedStandby)
-#   - Added: Verbose logon/logoff messages
-#   - Added: ShowHibernateOption=0
-#   - Added: winget app installs refreshed from the selected package list
-#            (Brave.Brave and PuTTY.PuTTY removed; Brave Origin is a manual vendor shortcut)
-#   - Added: Brave debloat registry keys refreshed from current WinUtil
-#   - Added: winget no longer uninstalled after use
-#   - Added: New Outlook no longer removed
+# Reliability14 highlights:
+#   - Creates a restore point before setup changes.
+#   - Saves setup choices before DDU and reuses them after reboot.
+#   - Stores reboot handoff files under ProgramData and validates every script.
+#   - Uses scheduled task, RunOnce and persistent Run recovery paths for StepTwo.
+#   - Keeps UAC, RunAsPPL, HVCI, the vulnerable-driver blocklist, Defender,
+#     SmartScreen, Windows Update, Store updates and browser updates intact.
+#   - Applies aggressive supported privacy policies for telemetry, Copilot, Recall,
+#     Widgets, web search, consumer content and packaged background activity.
+#   - Preserves SysMain and core Windows networking instead of applying folklore tweaks.
+#   - Repairs WinGet through App Installer and the Microsoft.WinGet.Client path.
+#   - Creates native Ultimate Performance when supported, otherwise an activatable
+#     Balanced-derived ItsMauridian Ultimate Performance plan for Modern Standby.
+#   - Keeps legacy .NET runtimes and developer packs opt-in.
+#   - Verifies applications and writes a post-install verification report.
+#   - Disables Quick Edit so accidental text selection cannot pause setup.
+#   - Keeps BitLocker removal as the explicit requested setup behavior.
 # ==============================================================================
-#   - Changed: StepOne and StepTwo are now separate files under Scripts/Setup
-#   - Changed: UAC, LSA protection, HVCI and Microsoft vulnerable driver blocklist are preserved by default
-#   - Changed: 7-Zip, DDU and NVIDIA Profile Inspector URLs updated
-# ==============================================================================
-
 
 # CONFIG
 $CwsRepoRawBase = "https://raw.githubusercontent.com/ItsMauridian/Custom-Windows-Setup/refs/heads/main"
 $CwsDependencies = @{
-    SevenZip = @{ Url = "https://www.7-zip.org/a/7z2602-x64.exe"; File = "$env:SystemRoot\Temp\7 Zip.exe"; Sha256 = "" }
+    SevenZip = @{ Url = "https://github.com/ip7z/7zip/releases/download/26.02/7z2602-x64.exe"; File = "$env:SystemRoot\Temp\7 Zip.exe"; Sha256 = "6745FA76DC2EA031596D8678F6F6B99C3C1B435B4164A63485ADBBC7B8D82EF0" }
     DDU = @{ Url = "https://download.wagnardsoft.com/DDU/DDU%20v18.1.5.5.exe"; File = "$env:SystemRoot\Temp\DDU.exe"; Sha256 = "F5A5095018EA5641B68DC622570770C5815FA73ECBF053018925FBB126CBC3B9" }
     DirectX = @{ Url = "https://download.microsoft.com/download/8/4/A/84A35BF1-DAFE-4AE8-82AF-AD2AE20B6B14/directx_Jun2010_redist.exe"; File = "$env:SystemRoot\Temp\DirectX.exe"; Sha256 = "053F76DCBB28802E23341B6A787E3B0791C0FA5C8D4D011B1044172DBF89C73B" }
 }
@@ -415,7 +379,7 @@ Start-Process -Wait "$env:SystemRoot\Temp\Chrome.msi" -ArgumentList "/quiet"
 cmd /c "reg add `"HKLM\SOFTWARE\Policies\Google\Chrome\ExtensionInstallForcelist`" /v `"1`" /t REG_SZ /d `"ddkjiahejlhfcafbddmgiahcphecmpfh;https://clients2.google.com/service/update2/crx`" /f >nul 2>&1"
 
 # add chrome policies
-cmd /c "reg add `"HKLM\SOFTWARE\Policies\Google\Chrome`" /v `"HardwareAccelerationModeEnabled`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
+cmd /c "reg delete `"HKLM\SOFTWARE\Policies\Google\Chrome`" /v `"HardwareAccelerationModeEnabled`" /f >nul 2>&1"
 cmd /c "reg add `"HKLM\SOFTWARE\Policies\Google\Chrome`" /v `"BackgroundModeEnabled`" /t REG_DWORD /d `"0`" /f >nul 2>&1"
 cmd /c "reg add `"HKLM\SOFTWARE\Policies\Google\Chrome`" /v `"HighEfficiencyModeEnabled`" /t REG_DWORD /d `"1`" /f >nul 2>&1"
 
@@ -498,25 +462,82 @@ $CwsWorkRoot = Join-Path $env:ProgramData "ItsMauridian\Custom-Windows-Setup"
 $CwsStepOnePath = Join-Path $CwsWorkRoot "StepOne.ps1"
 $CwsStepTwoPath = Join-Path $CwsWorkRoot "StepTwo.ps1"
 $CwsResumePath = Join-Path $CwsWorkRoot "Resume-StepTwo.ps1"
+$CwsVerifyPath = Join-Path $CwsWorkRoot "Verify-Setup.ps1"
 $CwsResumeLogPath = Join-Path $CwsWorkRoot "Resume-StepTwo.log"
 New-Item -Path $CwsWorkRoot -ItemType Directory -Force | Out-Null
+
+$CwsSetupOptionsPath = Join-Path $CwsWorkRoot 'SetupOptions.json'
+
+function Read-CwsYesNo {
+    param(
+        [Parameter(Mandatory)][string]$Prompt,
+        [bool]$Default = $true
+    )
+    $suffix = if ($Default) { '[Y/n]' } else { '[y/N]' }
+    while ($true) {
+        $answer = Read-Host "$Prompt $suffix"
+        if ([string]::IsNullOrWhiteSpace($answer)) { return $Default }
+        switch ($answer.Trim().ToLowerInvariant()) {
+            'y' { return $true }
+            'yes' { return $true }
+            'j' { return $true }
+            'ja' { return $true }
+            'n' { return $false }
+            'no' { return $false }
+            'nee' { return $false }
+            default { Write-Host 'Enter Y or N.' -ForegroundColor Yellow }
+        }
+    }
+}
+
+Write-Host 'SETUP OPTIONS' -ForegroundColor Cyan
+Write-Host 'The recommended privacy and performance profile remains enabled by default.'
+Write-Host 'Legacy runtimes and experimental boot timer changes remain disabled by default.'
+Write-Host ''
+
+$cwsOptions = [ordered]@{
+    SchemaVersion = 1
+    AggressivePrivacyPerformance = $true
+    RemoveOneDrive = Read-CwsYesNo -Prompt 'Remove and block OneDrive?' -Default $true
+    InstallUltimatePerformancePlan = Read-CwsYesNo -Prompt 'Create and activate the ItsMauridian Ultimate Performance plan?' -Default $true
+    DisableAppAutoStart = Read-CwsYesNo -Prompt 'Remove known heavy application auto-start entries?' -Default $true
+    InstallRecommendedApps = Read-CwsYesNo -Prompt 'Install recommended utilities and supported runtimes?' -Default $true
+    InstallCommunicationApps = Read-CwsYesNo -Prompt 'Install communication and productivity apps?' -Default $true
+    InstallGamingApps = Read-CwsYesNo -Prompt 'Install game launchers and gaming components?' -Default $true
+    InstallDeveloperTools = Read-CwsYesNo -Prompt 'Install developer and remote administration tools?' -Default $true
+    InstallHardwareUtilities = Read-CwsYesNo -Prompt 'Install hardware, media and device utilities?' -Default $true
+    InstallStoreApps = Read-CwsYesNo -Prompt 'Install selected Microsoft Store apps?' -Default $true
+    InstallLegacyDotNet = Read-CwsYesNo -Prompt 'Install unsupported legacy .NET 3.1, 5, 6 and 7 runtimes?' -Default $false
+    InstallLegacyDeveloperPacks = Read-CwsYesNo -Prompt 'Install legacy .NET Framework developer packs?' -Default $false
+    EnableExperimentalTimerTweaks = Read-CwsYesNo -Prompt 'Enable experimental timer service and BCD timer tweaks?' -Default $false
+    CreatedAt = (Get-Date -Format o)
+}
+$cwsOptions | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $CwsSetupOptionsPath -Encoding UTF8 -Force
+Write-Host "Options saved to $CwsSetupOptionsPath`n" -ForegroundColor Green
 
 # Keep the critical handoff scripts outside Windows Temp. Temp files are not a
 # reliable reboot boundary and can be removed by cleanup tools or maintenance.
 Save-CwsRepoFile -RelativePath "Scripts/Setup/StepOne.ps1" -Destination $CwsStepOnePath
 Save-CwsRepoFile -RelativePath "Scripts/Setup/StepTwo.ps1" -Destination $CwsStepTwoPath
 Save-CwsRepoFile -RelativePath "Scripts/Setup/Resume-StepTwo.ps1" -Destination $CwsResumePath
+Save-CwsRepoFile -RelativePath "Scripts/Setup/Verify-Setup.ps1" -Destination $CwsVerifyPath
 
 # Do not enter Safe Mode until every reboot-boundary script has passed the real
 # Windows PowerShell parser. This prevents a half-completed machine after DDU.
-foreach ($scriptPath in @($CwsStepOnePath, $CwsStepTwoPath, $CwsResumePath)) {
+foreach ($scriptPath in @($CwsStepOnePath, $CwsStepTwoPath, $CwsResumePath, $CwsVerifyPath)) {
     Assert-CwsPowerShellSyntax -Path $scriptPath
 }
-if (-not (Select-String -Path $CwsStepTwoPath -Pattern 'BUILD MARKER: reliability13' -Quiet)) {
-    throw 'The downloaded StepTwo.ps1 is not the reliability13 build.'
+if (-not (Select-String -Path $CwsStepTwoPath -Pattern 'BUILD MARKER: reliability14' -Quiet)) {
+    throw 'The downloaded StepTwo.ps1 is not the reliability14 build.'
 }
-if (-not (Select-String -Path $CwsResumePath -Pattern 'BUILD MARKER: reliability13' -Quiet)) {
-    throw 'The downloaded Resume-StepTwo.ps1 is not the reliability13 build.'
+if (-not (Select-String -Path $CwsResumePath -Pattern 'BUILD MARKER: reliability14' -Quiet)) {
+    throw 'The downloaded Resume-StepTwo.ps1 is not the reliability14 build.'
+}
+if (-not (Select-String -Path $CwsStepOnePath -Pattern 'BUILD MARKER: reliability14' -Quiet)) {
+    throw 'The downloaded StepOne.ps1 is not the reliability14 build.'
+}
+if (-not (Select-String -Path $CwsVerifyPath -Pattern 'BUILD MARKER: reliability14' -Quiet)) {
+    throw 'The downloaded Verify-Setup.ps1 is not the reliability14 build.'
 }
 Write-Host "DDU continuation scripts validated successfully.`n" -ForegroundColor Green
 
