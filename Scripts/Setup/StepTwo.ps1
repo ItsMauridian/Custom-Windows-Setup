@@ -412,55 +412,9 @@ if ($appInstallerPackage) {
     Add-CwsNote 'Desktop App Installer is still missing after wsreset -i. The dedicated WinGet bootstrap later in StepTwo will attempt to install it.'
 }
 
-# Do not open the interactive Store settings page. The script applies the
-# settings.dat changes directly when that hive exists.
-$stop = 'WinStore.App', 'backgroundTaskHost', 'StoreDesktopExtension'
-$stop | ForEach-Object { Stop-CwsProcessIfPresent -Name $_ }
-Start-Sleep -Seconds 2
-
-# create reg file
-$storesettings = @'
-Windows Registry Editor Version 5.00
-
-[HKEY_LOCAL_MACHINE\Settings\LocalState]
-; disable video autoplay
-"VideoAutoplay"=hex(5f5e10b):00,96,9d,69,8d,cd,93,dc,01
-; disable notifications for app installations
-"EnableAppInstallNotifications"=hex(5f5e10b):00,36,d0,88,8e,cd,93,dc,01
-
-[HKEY_LOCAL_MACHINE\Settings\LocalState\PersistentSettings]
-; disable personalized experiences
-"PersonalizationEnabled"=hex(5f5e10b):00,0d,56,a1,8a,cd,93,dc,01
-'@
-Set-Content -Path "$env:SystemRoot\Temp\WindowsStore.reg" -Value $storesettings -Force
-$settingsdat = "$env:LocalAppData\Packages\Microsoft.WindowsStore_8wekyb3d8bbwe\Settings\settings.dat"
-$regfilewindowsstore = "$env:SystemRoot\Temp\WindowsStore.reg"
-
-# Load and edit the Store settings hive only when it already exists. Use
-# Start-Process instead of native stream redirection so Windows PowerShell 5.1
-# cannot turn harmless reg.exe stderr text into a terminating ErrorRecord.
-if (Test-Path -LiteralPath $settingsdat) {
-    $loadExitCode = Invoke-CwsRegExe -Arguments ("load `"HKLM\Settings`" `"{0}`"" -f $settingsdat)
-    if ($loadExitCode -eq 0) {
-        try {
-            $importExitCode = Invoke-CwsRegExe -Arguments ("import `"{0}`"" -f $regfilewindowsstore)
-            if ($importExitCode -ne 0) {
-                Add-CwsNote "Microsoft Store preference import was skipped because reg.exe returned exit code $importExitCode."
-            }
-        } finally {
-            [gc]::Collect()
-            Start-Sleep -Seconds 2
-            $unloadExitCode = Invoke-CwsRegExe -Arguments 'unload "HKLM\Settings"'
-            if ($unloadExitCode -ne 0) {
-                Add-CwsWarning "The temporary Microsoft Store registry hive could not be unloaded cleanly. reg.exe exit code: $unloadExitCode."
-            }
-        }
-    } else {
-        Add-CwsNote 'The Microsoft Store settings hive was busy or unavailable, so Store preference edits were skipped.'
-    }
-} else {
-    Add-CwsNote 'The Microsoft Store settings hive was not present yet, so Store preference edits were skipped.'
-}
+# Leave Microsoft Store application preferences user-controlled. Private package
+# settings.dat hives are intentionally not loaded or modified.
+Add-CwsNote 'Microsoft Store private package settings were preserved.'
 
 		Write-Host "WINDOWS SETTINGS`n"
 Write-Host "Applying Windows privacy, shell and usability settings. This can take several minutes...`n" -ForegroundColor Cyan
@@ -1833,7 +1787,7 @@ if ((Get-Command Get-NetAdapterBinding -ErrorAction SilentlyContinue) -and
         }
     }
 } else {
-    Add-Note 'NetAdapter cmdlets are unavailable on this image. Core network binding repair was skipped.'
+    Add-CwsNote 'NetAdapter cmdlets are unavailable on this image. Core network binding repair was skipped.'
 }
 Invoke-CwsNativeCommand -FilePath netsh.exe -ArgumentList @('interface','teredo','set','state','default') -TimeoutSeconds 30 | Out-Null
 foreach ($interface in @(Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces' -ErrorAction SilentlyContinue)) {

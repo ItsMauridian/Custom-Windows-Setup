@@ -95,3 +95,7 @@
 - [ ] CWS-Verification-Report.txt covers options, power, privacy, services, security, boot state, BitLocker, GPU and WinGet.
 
 A clean Windows hardware run remains required for final end-to-end validation of servicing commands, Store registration, DDU and third-party installers.
+- [ ] No Microsoft Store private `settings.dat` hive is loaded or modified.
+- [ ] No undefined `Add-Note` helper call remains.
+- [ ] Verification report helper methods do not emit internal list indexes.
+

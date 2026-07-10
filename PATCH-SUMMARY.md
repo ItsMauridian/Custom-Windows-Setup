@@ -88,3 +88,11 @@ Reliability14 addresses these without reintroducing the destructive behavior rem
 - Records saved options, active power plan, Modern Standby, AI and privacy policies, services, security settings, maintenance overrides, network bindings, boot state, BitLocker, GPU drivers and application results.
 - Extends GitHub Actions regression checks.
 - Adds a SHA256 pin for 7-Zip 26.02, alongside the existing DDU and DirectX pins.
+
+## Final archive corrections
+
+- Removed the remaining direct Microsoft Store `settings.dat` hive mutation so private package state is no longer loaded or edited.
+- Corrected the undefined `Add-Note` call to `Add-CwsNote`.
+- Suppressed internal list indexes from the verification report writer.
+- Restored the repository PowerShell validation workflow in the archive.
+

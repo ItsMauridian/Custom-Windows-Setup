@@ -5,7 +5,7 @@ $workRoot = Join-Path $env:ProgramData 'ItsMauridian\Custom-Windows-Setup'
 $desktop = [Environment]::GetFolderPath('Desktop')
 $reportPath = Join-Path $desktop 'CWS-Verification-Report.txt'
 $lines = New-Object System.Collections.Generic.List[string]
-function Add-Line { param([string]$Text = '') $lines.Add($Text) }
+function Add-Line { param([string]$Text = '') [void]$lines.Add($Text) }
 function Read-RegValue {
     param([string]$Path,[string]$Name)
     try { return (Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop).$Name } catch { return '<missing>' }
