@@ -1,3 +1,14 @@
+# Reliability 10 resume checks
+
+- [x] Critical reboot handoff files are stored under ProgramData, not only Windows Temp.
+- [x] Scheduled task registration is verified after creation.
+- [x] HKLM RunOnce is always registered as an independent fallback.
+- [x] Resume wrapper blocks Safe Mode execution.
+- [x] Resume wrapper prevents duplicate execution with a global mutex.
+- [x] Missing StepTwo can be restored from Temp or downloaded from GitHub.
+- [x] StepTwo syntax is parsed before execution.
+- [x] Resume mechanisms are removed only after StepTwo completes.
+
 # Reliability8 code review checks
 
 ## Source-based design checks

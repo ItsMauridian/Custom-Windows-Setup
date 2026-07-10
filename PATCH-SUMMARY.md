@@ -1,3 +1,12 @@
+# Reliability 10
+
+- Critical DDU resume files moved from Windows Temp to ProgramData.
+- Added `Scripts/Setup/Resume-StepTwo.ps1`.
+- Added both a highest-privilege logon task and an HKLM RunOnce fallback.
+- Added a global mutex to prevent duplicate StepTwo instances.
+- Added local-file recovery, GitHub redownload, parser validation and a dedicated resume log.
+- StepTwo now removes both resume mechanisms only after it completes.
+
 # Reliability8 patch summary
 
 This build is based on the completed Windows 11 VM and laptop test logs from 10 July 2026. It focuses on observed failures, misleading logs, long silent stages and hardware-specific assumptions.
@@ -36,7 +45,7 @@ This build is based on the completed Windows 11 VM and laptop test logs from 10 
 ## Build marker
 
 ```text
-# BUILD MARKER: reliability9 2026-07-10 - guarded Store, AppX, WinGet, GPU, power and logging
+# BUILD MARKER: reliability10 2026-07-10 - persistent DDU resume handoff and recovery
 ```
 
 ## Reliability9 Store verification
