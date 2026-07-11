@@ -1,5 +1,5 @@
 # SCRIPT RUN AS ADMIN
-# BUILD MARKER: reliability14 2026-07-10 - one-command isolated StepTwo recovery
+# BUILD MARKER: reliability16 2026-07-10 - one-command isolated StepTwo recovery
 $ErrorActionPreference = 'Stop'
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
@@ -54,14 +54,14 @@ foreach ($scriptPath in @($stepTwoPath, $resumePath, $verifyPath)) {
     }
 }
 
-if (-not (Select-String -Path $stepTwoPath -Pattern 'BUILD MARKER: reliability14' -Quiet)) {
-    throw 'GitHub is not serving the reliability14 StepTwo.ps1 file yet.'
+if (-not (Select-String -Path $stepTwoPath -Pattern 'BUILD MARKER: reliability16' -Quiet)) {
+    throw 'GitHub is not serving the reliability16 StepTwo.ps1 file yet.'
 }
-if (-not (Select-String -Path $resumePath -Pattern 'BUILD MARKER: reliability14' -Quiet)) {
-    throw 'GitHub is not serving the reliability14 Resume-StepTwo.ps1 file yet.'
+if (-not (Select-String -Path $resumePath -Pattern 'BUILD MARKER: reliability16' -Quiet)) {
+    throw 'GitHub is not serving the reliability16 Resume-StepTwo.ps1 file yet.'
 }
-if (-not (Select-String -Path $verifyPath -Pattern 'BUILD MARKER: reliability14' -Quiet)) {
-    throw 'GitHub is not serving the reliability14 Verify-Setup.ps1 file yet.'
+if (-not (Select-String -Path $verifyPath -Pattern 'BUILD MARKER: reliability16' -Quiet)) {
+    throw 'GitHub is not serving the reliability16 Verify-Setup.ps1 file yet.'
 }
 
 Remove-Item -LiteralPath (Join-Path $workRoot 'StepTwo.completed') -Force -ErrorAction SilentlyContinue

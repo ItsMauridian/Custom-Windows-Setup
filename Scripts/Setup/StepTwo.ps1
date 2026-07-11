@@ -1,5 +1,5 @@
 # SCRIPT RUN AS ADMIN
-# BUILD MARKER: reliability14 2026-07-10 - official WinGet repair, runtime fallback and safe display scaling
+# BUILD MARKER: reliability16 2026-07-10 - official WinGet repair, runtime fallback and safe display scaling
 If (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]"Administrator")) {
     Write-Host "Run this from an elevated Administrator PowerShell window." -ForegroundColor Red
     Pause
@@ -51,6 +51,7 @@ Disable-CwsQuickEditMode
 $CwsStepTwoLog = Join-Path $env:SystemRoot "Temp\CWS-StepTwo.log"
 $failedApps = @()
 $verifiedApps = @()
+$unverifiedApps = @()
 $manualApps = @()
 $selectedApps = @()
 $setupNotes = @()
@@ -137,15 +138,187 @@ function Invoke-CwsRegExe {
     }
 }
 
+function Resolve-CwsRegistryPath {
+    param([Parameter(Mandatory)][string]$Path)
+    if ($Path -match '(?i)^HKLM:\\(.+)$') {
+        return [pscustomobject]@{ Hive = [Microsoft.Win32.RegistryHive]::LocalMachine; SubKey = $matches[1] }
+    }
+    if ($Path -match '(?i)^HKCU:\\(.+)$') {
+        return [pscustomobject]@{ Hive = [Microsoft.Win32.RegistryHive]::CurrentUser; SubKey = $matches[1] }
+    }
+    throw "Unsupported registry path: $Path"
+}
+
+function Get-CwsRegistryView {
+    if ([Environment]::Is64BitOperatingSystem) { return [Microsoft.Win32.RegistryView]::Registry64 }
+    return [Microsoft.Win32.RegistryView]::Default
+}
+
+function Get-CwsRegistryValue {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Name)
+    $baseKey = $null
+    $key = $null
+    try {
+        $resolved = Resolve-CwsRegistryPath -Path $Path
+        $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey($resolved.Hive, (Get-CwsRegistryView))
+        $key = $baseKey.OpenSubKey($resolved.SubKey, $false)
+        if (-not $key) { return $null }
+        return $key.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    } finally {
+        if ($key) { $key.Dispose() }
+        if ($baseKey) { $baseKey.Dispose() }
+    }
+}
+
 function Set-CwsRegistryDword {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][int]$Value)
+    $baseKey = $null
+    $key = $null
     try {
-        New-Item -Path $Path -Force -ErrorAction Stop | Out-Null
-        New-ItemProperty -Path $Path -Name $Name -PropertyType DWord -Value $Value -Force -ErrorAction Stop | Out-Null
+        $resolved = Resolve-CwsRegistryPath -Path $Path
+        $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey($resolved.Hive, (Get-CwsRegistryView))
+        $key = $baseKey.CreateSubKey($resolved.SubKey)
+        if (-not $key) { throw 'The registry key could not be opened for writing.' }
+        $key.SetValue($Name, [int]$Value, [Microsoft.Win32.RegistryValueKind]::DWord)
+        $key.Flush()
+        $actual = $key.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        if ($null -eq $actual -or [int]$actual -ne [int]$Value) {
+            throw "Readback mismatch. Expected $Value, found $actual."
+        }
         return $true
     } catch {
-        Add-CwsWarning ("Registry policy could not be applied: {0}\\{1} ({2})" -f $Path, $Name, $_.Exception.Message)
+        Add-CwsWarning ("64-bit registry policy could not be applied: {0}\{1} ({2})" -f $Path, $Name, $_.Exception.Message)
         return $false
+    } finally {
+        if ($key) { $key.Dispose() }
+        if ($baseKey) { $baseKey.Dispose() }
+    }
+}
+
+function Set-CwsRegistryMultiString {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][string[]]$Value)
+    $baseKey = $null
+    $key = $null
+    try {
+        $resolved = Resolve-CwsRegistryPath -Path $Path
+        $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey($resolved.Hive, (Get-CwsRegistryView))
+        $key = $baseKey.CreateSubKey($resolved.SubKey)
+        if (-not $key) { throw 'The registry key could not be opened for writing.' }
+        $key.SetValue($Name, [string[]]$Value, [Microsoft.Win32.RegistryValueKind]::MultiString)
+        $key.Flush()
+        return $true
+    } catch {
+        Add-CwsWarning ("64-bit registry multi-string could not be applied: {0}\{1} ({2})" -f $Path, $Name, $_.Exception.Message)
+        return $false
+    } finally {
+        if ($key) { $key.Dispose() }
+        if ($baseKey) { $baseKey.Dispose() }
+    }
+}
+
+function Remove-CwsRegistryValue {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Name)
+    $baseKey = $null
+    $key = $null
+    try {
+        $resolved = Resolve-CwsRegistryPath -Path $Path
+        $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey($resolved.Hive, (Get-CwsRegistryView))
+        $key = $baseKey.OpenSubKey($resolved.SubKey, $true)
+        if ($key) { $key.DeleteValue($Name, $false); $key.Flush() }
+    } catch { }
+    finally {
+        if ($key) { $key.Dispose() }
+        if ($baseKey) { $baseKey.Dispose() }
+    }
+}
+
+function Apply-CwsPrivacyProfile {
+    param([switch]$FinalPass)
+
+    if (-not (Get-CwsOption -Name 'AggressivePrivacyPerformance' -Default $true)) {
+        return
+    }
+
+    $osCaption = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption
+    $diagnosticLevel = if ($osCaption -match 'Enterprise|Education|IoT') { 0 } else { 1 }
+
+    $settings = @(
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection'; Name='AllowTelemetry'; Value=$diagnosticLevel },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection'; Name='DoNotShowFeedbackNotifications'; Value=1 },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI'; Name='AllowRecallEnablement'; Value=0 },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI'; Name='DisableAIDataAnalysis'; Value=1 },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI'; Name='DisableClickToDo'; Value=1 },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI'; Name='RemoveMicrosoftCopilotApp'; Value=1 },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot'; Name='TurnOffWindowsCopilot'; Value=1 },
+        @{ Path='HKCU:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot'; Name='TurnOffWindowsCopilot'; Value=1 },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent'; Name='DisableWindowsConsumerFeatures'; Value=1 },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent'; Name='DisableSoftLanding'; Value=1 },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent'; Name='DisableWindowsSpotlightFeatures'; Value=1 },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent'; Name='DisableConsumerAccountStateContent'; Value=1 },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent'; Name='DisableThirdPartySuggestions'; Value=1 },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent'; Name='DisableTailoredExperiencesWithDiagnosticData'; Value=1 },
+        @{ Path='HKCU:\SOFTWARE\Policies\Microsoft\Windows\CloudContent'; Name='DisableCloudOptimizedContent'; Value=1 },
+        @{ Path='HKCU:\SOFTWARE\Policies\Microsoft\Windows\CloudContent'; Name='DisableWindowsSpotlightFeatures'; Value=1 },
+        @{ Path='HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\Paint'; Name='DisableCocreator'; Value=1 },
+        @{ Path='HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\Paint'; Name='DisableGenerativeFill'; Value=1 },
+        @{ Path='HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\Paint'; Name='DisableImageCreator'; Value=1 },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'; Name='EnableActivityFeed'; Value=0 },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'; Name='PublishUserActivities'; Value=0 },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'; Name='UploadUserActivities'; Value=0 },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search'; Name='AllowCloudSearch'; Value=0 },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search'; Name='DisableWebSearch'; Value=1 },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Dsh'; Name='AllowNewsAndInterests'; Value=0 },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy'; Name='LetAppsRunInBackground'; Value=2 },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization'; Name='DODownloadMode'; Value=0 },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Edge'; Name='StartupBoostEnabled'; Value=0 },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Edge'; Name='BackgroundModeEnabled'; Value=0 },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR'; Name='AllowGameDVR'; Value=0 }
+    )
+
+    foreach ($policyName in @(
+        'LetAppsAccessAccountInfo','LetAppsAccessCalendar','LetAppsAccessCallHistory','LetAppsAccessContacts',
+        'LetAppsAccessEmail','LetAppsAccessLocation','LetAppsAccessMessaging','LetAppsAccessMotion',
+        'LetAppsAccessPhone','LetAppsAccessRadios','LetAppsAccessTasks','LetAppsAccessTrustedDevices',
+        'LetAppsSyncWithDevices','LetAppsGetDiagnosticInfo'
+    )) {
+        $settings += @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy'; Name=$policyName; Value=2 }
+    }
+    foreach ($policyName in @('LetAppsAccessCamera','LetAppsAccessMicrophone','LetAppsAccessNotifications')) {
+        $settings += @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy'; Name=$policyName; Value=0 }
+    }
+
+    $failedWrites = 0
+    foreach ($setting in $settings) {
+        if (-not (Set-CwsRegistryDword -Path $setting.Path -Name $setting.Name -Value $setting.Value)) {
+            $failedWrites++
+        }
+    }
+
+    $criticalChecks = @(
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection'; Name='AllowTelemetry'; Value=$diagnosticLevel },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI'; Name='DisableAIDataAnalysis'; Value=1 },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI'; Name='DisableClickToDo'; Value=1 },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy'; Name='LetAppsRunInBackground'; Value=2 },
+        @{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization'; Name='DODownloadMode'; Value=0 }
+    )
+    $failedReadback = @()
+    foreach ($check in $criticalChecks) {
+        try {
+            $actual = Get-CwsRegistryValue -Path $check.Path -Name $check.Name
+            if ($null -eq $actual -or [int]$actual -ne [int]$check.Value) {
+                $failedReadback += "$($check.Path)\$($check.Name)"
+            }
+        } catch {
+            $failedReadback += "$($check.Path)\$($check.Name)"
+        }
+    }
+
+    if ($failedWrites -gt 0 -or $failedReadback.Count -gt 0) {
+        Add-CwsWarning ("Privacy policy verification failed for {0} critical entries. They will be retried at the final stage." -f $failedReadback.Count)
+    } elseif ($FinalPass) {
+        Add-CwsNote "Final privacy policy pass verified. Diagnostic data policy level: $diagnosticLevel."
+    } else {
+        Add-CwsNote "Aggressive privacy profile applied and verified. Diagnostic data policy level: $diagnosticLevel."
     }
 }
 
@@ -1566,56 +1739,7 @@ if ($regImportExitCode -ne 0) {
     Write-Host "Main Windows settings import completed.`n" -ForegroundColor Green
 
 
-# Re-apply the highest-value privacy and Windows AI policies with edition-aware
-# diagnostic data handling. Windows Pro supports Required diagnostic data, while
-# Enterprise, Education and IoT editions can honor the Security/Off level.
-$osCaption = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption
-$diagnosticLevel = if ($osCaption -match 'Enterprise|Education|IoT') { 0 } else { 1 }
-Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection' -Name 'AllowTelemetry' -Value $diagnosticLevel | Out-Null
-Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection' -Name 'DoNotShowFeedbackNotifications' -Value 1 | Out-Null
-Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI' -Name 'AllowRecallEnablement' -Value 0 | Out-Null
-Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI' -Name 'DisableAIDataAnalysis' -Value 1 | Out-Null
-Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI' -Name 'DisableClickToDo' -Value 1 | Out-Null
-Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot' -Name 'TurnOffWindowsCopilot' -Value 1 | Out-Null
-Set-CwsRegistryDword -Path 'HKCU:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot' -Name 'TurnOffWindowsCopilot' -Value 1 | Out-Null
-Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' -Name 'DisableWindowsConsumerFeatures' -Value 1 | Out-Null
-Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' -Name 'DisableSoftLanding' -Value 1 | Out-Null
-Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' -Name 'DisableWindowsSpotlightFeatures' -Value 1 | Out-Null
-Set-CwsRegistryDword -Path 'HKCU:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' -Name 'DisableCloudOptimizedContent' -Value 1 | Out-Null
-Set-CwsRegistryDword -Path 'HKCU:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' -Name 'DisableWindowsSpotlightFeatures' -Value 1 | Out-Null
-Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' -Name 'DisableConsumerAccountStateContent' -Value 1 | Out-Null
-Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' -Name 'DisableThirdPartySuggestions' -Value 1 | Out-Null
-Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI' -Name 'RemoveMicrosoftCopilotApp' -Value 1 | Out-Null
-Set-CwsRegistryDword -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\Paint' -Name 'DisableCocreator' -Value 1 | Out-Null
-Set-CwsRegistryDword -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\Paint' -Name 'DisableGenerativeFill' -Value 1 | Out-Null
-Set-CwsRegistryDword -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\Paint' -Name 'DisableImageCreator' -Value 1 | Out-Null
-Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' -Name 'DisableTailoredExperiencesWithDiagnosticData' -Value 1 | Out-Null
-Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Name 'EnableActivityFeed' -Value 0 | Out-Null
-Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Name 'PublishUserActivities' -Value 0 | Out-Null
-Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Name 'UploadUserActivities' -Value 0 | Out-Null
-Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search' -Name 'AllowCloudSearch' -Value 0 | Out-Null
-Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search' -Name 'DisableWebSearch' -Value 1 | Out-Null
-Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' -Name 'AllowNewsAndInterests' -Value 0 | Out-Null
-Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy' -Name 'LetAppsRunInBackground' -Value 2 | Out-Null
-$cwsPrivacyDenyPolicies = @(
-    'LetAppsAccessAccountInfo','LetAppsAccessCalendar','LetAppsAccessCallHistory','LetAppsAccessContacts',
-    'LetAppsAccessEmail','LetAppsAccessLocation','LetAppsAccessMessaging','LetAppsAccessMotion',
-    'LetAppsAccessPhone','LetAppsAccessRadios','LetAppsAccessTasks','LetAppsAccessTrustedDevices',
-    'LetAppsSyncWithDevices','LetAppsGetDiagnosticInfo'
-)
-foreach ($policyName in $cwsPrivacyDenyPolicies) {
-    Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy' -Name $policyName -Value 2 | Out-Null
-}
-# Camera, microphone and notifications remain user controlled so conferencing,
-# security alerts and selected communication apps continue to work.
-foreach ($policyName in @('LetAppsAccessCamera','LetAppsAccessMicrophone','LetAppsAccessNotifications')) {
-    Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy' -Name $policyName -Value 0 | Out-Null
-}
-Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization' -Name 'DODownloadMode' -Value 0 | Out-Null
-Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' -Name 'StartupBoostEnabled' -Value 0 | Out-Null
-Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' -Name 'BackgroundModeEnabled' -Value 0 | Out-Null
-Set-CwsRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR' -Name 'AllowGameDVR' -Value 0 | Out-Null
-Add-CwsNote "Aggressive privacy profile applied. Diagnostic data policy level: $diagnosticLevel."
+Apply-CwsPrivacyProfile
 }
 
 # keep MPO disable OS-aware: OverlayTestMode=5 can help on some systems, but on
@@ -2410,7 +2534,7 @@ function Invoke-CwsWinGetInstall {
     )
 
     if (Test-CwsWinGetInstalled -Id $Id) {
-        return [pscustomobject]@{ Id = $Id; Success = $true; ExitCode = 0; Detail = 'Already installed' }
+        return [pscustomobject]@{ Id = $Id; Success = $true; Verified = $true; ExitCode = 0; Detail = 'Already installed' }
     }
 
     $arguments = @('install','--id',$Id,'-e','--silent','--accept-package-agreements','--accept-source-agreements','--disable-interactivity','--no-upgrade')
@@ -2418,10 +2542,30 @@ function Invoke-CwsWinGetInstall {
     $result = Invoke-CwsWinGetCommand -Arguments $arguments -TimeoutSeconds $TimeoutSeconds -Activity "Installing $Id"
     if ($result.Output) { $result.Output -split "`r?`n" | ForEach-Object { if ($_){ Write-Host $_ } } }
 
-    if (Test-CwsWinGetInstalled -Id $Id) {
-        return [pscustomobject]@{ Id = $Id; Success = $true; ExitCode = 0; Detail = 'Verified after install' }
+    for ($verifyAttempt = 1; $verifyAttempt -le 4; $verifyAttempt++) {
+        if (Test-CwsWinGetInstalled -Id $Id) {
+            return [pscustomobject]@{ Id = $Id; Success = $true; Verified = $true; ExitCode = 0; Detail = 'Verified after install' }
+        }
+        if ($verifyAttempt -lt 4) { Start-Sleep -Seconds 5 }
     }
-    return [pscustomobject]@{ Id = $Id; Success = $false; ExitCode = [int]$result.ExitCode; Detail = (Get-CwsWinGetErrorText -ExitCode $result.ExitCode) }
+
+    if ([int]$result.ExitCode -eq 0) {
+        return [pscustomobject]@{
+            Id = $Id
+            Success = $true
+            Verified = $false
+            ExitCode = 0
+            Detail = 'Installer completed successfully, but the package was not yet visible to winget list'
+        }
+    }
+
+    return [pscustomobject]@{
+        Id = $Id
+        Success = $false
+        Verified = $false
+        ExitCode = [int]$result.ExitCode
+        Detail = (Get-CwsWinGetErrorText -ExitCode $result.ExitCode)
+    }
 }
 
 $recommendedApps = @(
@@ -2483,7 +2627,17 @@ if ($wingetWorks) {
         Write-Host "[$appNumber/$($apps.Count)] Installing $app" -ForegroundColor Cyan
         $installResult = Invoke-CwsWinGetInstall -Id $app -TimeoutSeconds $timeout -Source $source
         if ($installResult.Success) {
-            $verifiedApps += $app
+            if ($installResult.Verified) {
+                $verifiedApps += $app
+            } else {
+                $unverifiedApps += "$app ($($installResult.Detail))"
+                if ($app -eq 'XP8JNQFBQH6PVF') {
+                    New-CwsInternetShortcut -Name 'Install Perplexity' -Url 'https://www.perplexity.ai/download' | Out-Null
+                }
+                if ($app -eq 'RockstarGames.Launcher') {
+                    New-CwsInternetShortcut -Name 'Install Rockstar Games Launcher' -Url 'https://www.rockstargames.com/downloads' | Out-Null
+                }
+            }
         } else {
             $failedApps += "$app ($($installResult.Detail))"
             if ($app -eq 'XP8JNQFBQH6PVF') {
@@ -2506,12 +2660,12 @@ try {
     })
     $backgroundAllowPfns = @($backgroundAllowPackages.PackageFamilyName | Where-Object { $_ } | Sort-Object -Unique)
     $appPrivacyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy'
-    New-Item -Path $appPrivacyPath -Force -ErrorAction Stop | Out-Null
     if ($backgroundAllowPfns.Count -gt 0) {
-        New-ItemProperty -Path $appPrivacyPath -Name 'LetAppsRunInBackground_ForceAllowTheseApps' -PropertyType MultiString -Value $backgroundAllowPfns -Force -ErrorAction Stop | Out-Null
-        Add-CwsNote ("Packaged background allowlist applied for {0} package family names." -f $backgroundAllowPfns.Count)
+        if (Set-CwsRegistryMultiString -Path $appPrivacyPath -Name 'LetAppsRunInBackground_ForceAllowTheseApps' -Value $backgroundAllowPfns) {
+            Add-CwsNote ("Packaged background allowlist applied for {0} package family names." -f $backgroundAllowPfns.Count)
+        }
     } else {
-        Remove-ItemProperty -Path $appPrivacyPath -Name 'LetAppsRunInBackground_ForceAllowTheseApps' -ErrorAction SilentlyContinue
+        Remove-CwsRegistryValue -Path $appPrivacyPath -Name 'LetAppsRunInBackground_ForceAllowTheseApps'
     }
 } catch {
     Add-CwsWarning ("Packaged background allowlist could not be applied: {0}" -f $_.Exception.Message)
@@ -2522,6 +2676,7 @@ try {
         GeneratedAt = (Get-Date -Format o)
         Selected = $selectedApps
         Verified = $verifiedApps
+        Unverified = $unverifiedApps
         Failed = $failedApps
         Manual = $manualApps
     } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $CwsWorkRoot 'AppInstallResults.json') -Encoding UTF8 -Force
@@ -2727,8 +2882,16 @@ Start-Process (Join-Path $driverExtractPath 'setup.exe') -ArgumentList '-s -nore
 # install nvidia control panel
 try {
 if ($wingetWorks) {
-    $nvcplExitCode = Invoke-CwsWinGetInstall -Id "9NF8H0H7WMLT" -Source "msstore"
-    if ($nvcplExitCode -ne 0) { $failedApps += "NVIDIA Control Panel 9NF8H0H7WMLT (exit $nvcplExitCode)" }
+    $nvcplResult = Invoke-CwsWinGetInstall -Id '9NF8H0H7WMLT' -Source 'msstore'
+    if ($nvcplResult.Success) {
+        if ($nvcplResult.Verified) {
+            $verifiedApps += 'NVIDIA Control Panel 9NF8H0H7WMLT'
+        } else {
+            $unverifiedApps += "NVIDIA Control Panel 9NF8H0H7WMLT ($($nvcplResult.Detail))"
+        }
+    } else {
+        $failedApps += "NVIDIA Control Panel 9NF8H0H7WMLT ($($nvcplResult.Detail))"
+    }
 }
 } catch { }
 
@@ -3853,9 +4016,43 @@ try {
 
         Write-Host "RESTARTING`n" -ForegroundColor Red
 
-# Mark the main flow complete before generating the read-only verification report.
+# Mark the main flow complete before removing resume handoff entries.
 $cwsWorkRoot = Join-Path $env:ProgramData 'ItsMauridian\Custom-Windows-Setup'
 try { Set-Content -Path (Join-Path $cwsWorkRoot 'StepTwo.completed') -Value (Get-Date -Format o) -Encoding ASCII -Force } catch { }
+
+# Remove the resume handoff before verification so the report reflects the final state.
+try { Unregister-ScheduledTask -TaskName 'ItsMauridian-Custom-Windows-Setup-StepTwo' -TaskPath '\ItsMauridian\' -Confirm:$false -ErrorAction SilentlyContinue } catch { }
+try { Unregister-ScheduledTask -TaskName 'ItsMauridian-Custom-Windows-Setup-StepTwo' -Confirm:$false -ErrorAction SilentlyContinue } catch { }
+try { Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' -Name '!ItsMauridian-StepTwo' -ErrorAction SilentlyContinue } catch { }
+try { Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -Name 'ItsMauridian-StepTwoResume' -ErrorAction SilentlyContinue } catch { }
+try { Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' -Name '!StepTwo' -ErrorAction SilentlyContinue } catch { }
+try { Remove-ItemProperty -Path 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' -Name '!StepTwo' -ErrorAction SilentlyContinue } catch { }
+
+# Restore the supported Windows performance and security baseline one final time after
+# all installers have completed. Some vendor installers can alter these settings.
+try { Enable-MMAgent -MemoryCompression -ErrorAction Stop | Out-Null } catch { Add-CwsWarning "Memory compression could not be enabled: $($_.Exception.Message)" }
+try {
+    Set-Service -Name 'SysMain' -StartupType Automatic -ErrorAction Stop
+    Start-Service -Name 'SysMain' -ErrorAction SilentlyContinue
+} catch { Add-CwsWarning "SysMain could not be restored: $($_.Exception.Message)" }
+$hibernateResult = Invoke-CwsNativeCommand -FilePath powercfg.exe -ArgumentList @('/hibernate','on') -TimeoutSeconds 30
+if ($hibernateResult.ExitCode -ne 0) { Add-CwsWarning 'Hibernation could not be enabled.' }
+Set-CwsRegistryDword -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' -Name 'HiberbootEnabled' -Value 0 | Out-Null
+
+# Reapply and read back critical policies after all installers and Windows components
+# have finished, then persist the final app result arrays.
+Apply-CwsPrivacyProfile -FinalPass
+try {
+    [pscustomobject]@{
+        GeneratedAt = (Get-Date -Format o)
+        Selected = $selectedApps
+        Verified = @($verifiedApps | Select-Object -Unique)
+        Unverified = @($unverifiedApps | Select-Object -Unique)
+        Failed = @($failedApps | Select-Object -Unique)
+        Manual = @($manualApps | Select-Object -Unique)
+    } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $cwsWorkRoot 'AppInstallResults.json') -Encoding UTF8 -Force
+} catch { }
+
 $verifyScriptPath = Join-Path $cwsWorkRoot 'Verify-Setup.ps1'
 if (Test-Path -LiteralPath $verifyScriptPath) {
     try {
@@ -3881,7 +4078,16 @@ if ($failedApps.Count -gt 0) {
     foreach ($failed in $failedApps) { $logContent += "[WINGET] $failed" }
     $logContent += ''
 } else {
-    $logContent += 'All requested WinGet installs completed or were already installed.'
+    $logContent += 'No WinGet installer returned a failure exit code.'
+    $logContent += ''
+}
+
+if ($unverifiedApps.Count -gt 0) {
+    $logContent += 'Completed but not yet verified by winget list:'
+    foreach ($unverified in $unverifiedApps) { $logContent += "[UNVERIFIED] $unverified" }
+    $logContent += ''
+} else {
+    $logContent += 'All successful WinGet installs were verified.'
     $logContent += ''
 }
 
@@ -3910,12 +4116,6 @@ if ($fatalErrors.Count -gt 0) {
 
 $logContent | Out-File -FilePath $logPath -Encoding UTF8 -Force
 
-try { Unregister-ScheduledTask -TaskName 'ItsMauridian-Custom-Windows-Setup-StepTwo' -TaskPath '\ItsMauridian\' -Confirm:$false -ErrorAction SilentlyContinue } catch { }
-try { Unregister-ScheduledTask -TaskName 'ItsMauridian-Custom-Windows-Setup-StepTwo' -Confirm:$false -ErrorAction SilentlyContinue } catch { }
-try { Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' -Name '!ItsMauridian-StepTwo' -ErrorAction SilentlyContinue } catch { }
-try { Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -Name 'ItsMauridian-StepTwoResume' -ErrorAction SilentlyContinue } catch { }
-try { Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' -Name '!StepTwo' -ErrorAction SilentlyContinue } catch { }
-try { Remove-ItemProperty -Path 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' -Name '!StepTwo' -ErrorAction SilentlyContinue } catch { }
 try { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null } catch { }
 
 # restart

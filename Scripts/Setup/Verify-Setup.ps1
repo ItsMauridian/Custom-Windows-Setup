@@ -1,14 +1,35 @@
 # SCRIPT RUN AS ADMIN
-# BUILD MARKER: reliability14 2026-07-10 - read-only post-install verification
+# BUILD MARKER: reliability16 2026-07-10 - read-only post-install verification
 $ErrorActionPreference = 'Continue'
 $workRoot = Join-Path $env:ProgramData 'ItsMauridian\Custom-Windows-Setup'
 $desktop = [Environment]::GetFolderPath('Desktop')
 $reportPath = Join-Path $desktop 'CWS-Verification-Report.txt'
 $lines = New-Object System.Collections.Generic.List[string]
 function Add-Line { param([string]$Text = '') [void]$lines.Add($Text) }
+function Resolve-RegistryPath {
+    param([Parameter(Mandatory)][string]$Path)
+    if ($Path -match '(?i)^HKLM:\\(.+)$') { return [pscustomobject]@{ Hive=[Microsoft.Win32.RegistryHive]::LocalMachine; SubKey=$matches[1] } }
+    if ($Path -match '(?i)^HKCU:\\(.+)$') { return [pscustomobject]@{ Hive=[Microsoft.Win32.RegistryHive]::CurrentUser; SubKey=$matches[1] } }
+    throw "Unsupported registry path: $Path"
+}
+function Read-RegValueView {
+    param([string]$Path,[string]$Name,[Microsoft.Win32.RegistryView]$View)
+    $baseKey=$null; $key=$null
+    try {
+        $resolved=Resolve-RegistryPath -Path $Path
+        $baseKey=[Microsoft.Win32.RegistryKey]::OpenBaseKey($resolved.Hive,$View)
+        $key=$baseKey.OpenSubKey($resolved.SubKey,$false)
+        if (-not $key) { return '<missing>' }
+        $value=$key.GetValue($Name,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        if ($null -eq $value) { return '<missing>' }
+        return $value
+    } catch { return '<missing>' }
+    finally { if ($key) {$key.Dispose()}; if ($baseKey) {$baseKey.Dispose()} }
+}
 function Read-RegValue {
     param([string]$Path,[string]$Name)
-    try { return (Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop).$Name } catch { return '<missing>' }
+    $view=if ([Environment]::Is64BitOperatingSystem) {[Microsoft.Win32.RegistryView]::Registry64} else {[Microsoft.Win32.RegistryView]::Default}
+    return Read-RegValueView -Path $Path -Name $Name -View $view
 }
 function Add-Section { param([string]$Name) Add-Line ''; Add-Line ("=== {0} ===" -f $Name) }
 
@@ -16,6 +37,9 @@ Add-Line 'CWS Verification Report'
 Add-Line ('Generated: {0}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
 Add-Line ('Computer: {0}' -f $env:COMPUTERNAME)
 Add-Line ('Windows: {0}' -f ((Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption))
+$processBits = if ([Environment]::Is64BitProcess) { 64 } else { 32 }
+$osBits = if ([Environment]::Is64BitOperatingSystem) { 64 } else { 32 }
+Add-Line ('Process architecture: {0}-bit, OS architecture: {1}-bit' -f $processBits,$osBits)
 
 Add-Section 'Setup state'
 $marker = Join-Path $workRoot 'StepTwo.completed'
@@ -66,6 +90,19 @@ $widgetPackages = @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue | Wh
 Add-Line ("Copilot packages remaining: {0}" -f $copilotPackages.Count)
 Add-Line ("Widget packages remaining: {0}" -f $widgetPackages.Count)
 
+if ([Environment]::Is64BitOperatingSystem) {
+    Add-Line 'Critical policy 32-bit view comparison:'
+    foreach ($viewCheck in @(
+        @{Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection';Name='AllowTelemetry'},
+        @{Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI';Name='DisableAIDataAnalysis'},
+        @{Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI';Name='DisableClickToDo'},
+        @{Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy';Name='LetAppsRunInBackground'}
+    )) {
+        $value32=Read-RegValueView -Path $viewCheck.Path -Name $viewCheck.Name -View ([Microsoft.Win32.RegistryView]::Registry32)
+        Add-Line ("32-bit {0}\{1}: {2}" -f $viewCheck.Path,$viewCheck.Name,$value32)
+    }
+}
+
 Add-Section 'Service baseline'
 foreach ($name in @('DiagTrack','dmwappushservice','WerSvc','SysMain','CscService','MapsBroker','StorSvc','W32Time','BITS','wuauserv','AppXSvc','ClipSVC')) {
     $service = Get-CimInstance Win32_Service -Filter "Name='$name'" -ErrorAction SilentlyContinue
@@ -77,6 +114,15 @@ Add-Section 'Security defaults preserved'
 Add-Line ("UAC EnableLUA: {0}" -f (Read-RegValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'EnableLUA'))
 Add-Line ("LSA RunAsPPL: {0}" -f (Read-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'RunAsPPL'))
 Add-Line ("HVCI Enabled: {0}" -f (Read-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity' 'Enabled'))
+Add-Line ("HVCI WasEnabledBy: {0}" -f (Read-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity' 'WasEnabledBy'))
+Add-Line ("HVCI EnabledBootId: {0}" -f (Read-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity' 'EnabledBootId'))
+try {
+    $deviceGuard = Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName Win32_DeviceGuard -ErrorAction Stop
+    Add-Line ("VBS status: {0}" -f $deviceGuard.VirtualizationBasedSecurityStatus)
+    Add-Line ("Security services configured: {0}" -f (@($deviceGuard.SecurityServicesConfigured) -join ','))
+    Add-Line ("Security services running: {0}" -f (@($deviceGuard.SecurityServicesRunning) -join ','))
+} catch { Add-Line ("Device Guard runtime status unavailable: {0}" -f $_.Exception.Message) }
+
 Add-Line ("Vulnerable driver blocklist: {0}" -f (Read-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Config' 'VulnerableDriverBlocklistEnable'))
 try {
     $edgeSmartScreenDefault = (Get-Item -Path 'HKCU:\SOFTWARE\Microsoft\Edge\SmartScreenEnabled' -ErrorAction Stop).GetValue('')
@@ -106,10 +152,9 @@ Add-Line ("Store AutoDownload override: {0}" -f (Read-RegValue 'HKLM:\SOFTWARE\M
 Add-Line ("Store policy AutoDownload override: {0}" -f (Read-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsStore' 'AutoDownload'))
 Add-Line ("Edge Startup Boost policy: {0}" -f (Read-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' 'StartupBoostEnabled'))
 Add-Line ("Edge background mode policy: {0}" -f (Read-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' 'BackgroundModeEnabled'))
-try {
-    $allowList = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy' -Name 'LetAppsRunInBackground_ForceAllowTheseApps' -ErrorAction Stop).LetAppsRunInBackground_ForceAllowTheseApps
-    Add-Line ("Packaged background allowlist: {0}" -f (@($allowList) -join '; '))
-} catch { Add-Line 'Packaged background allowlist: <missing>' }
+$allowList = Read-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy' 'LetAppsRunInBackground_ForceAllowTheseApps'
+if ($allowList -eq '<missing>') { Add-Line 'Packaged background allowlist: <missing>' }
+else { Add-Line ("Packaged background allowlist: {0}" -f (@($allowList) -join '; ')) }
 
 Add-Section 'Core network bindings'
 if (Get-Command Get-NetAdapterBinding -ErrorAction SilentlyContinue) {
@@ -161,7 +206,9 @@ if (Test-Path -LiteralPath $appResultsPath) {
         $results = Get-Content -LiteralPath $appResultsPath -Raw | ConvertFrom-Json
         Add-Line ("Selected apps: {0}" -f @($results.Selected).Count)
         Add-Line ("Verified apps: {0}" -f @($results.Verified).Count)
+        Add-Line ("Completed but unverified apps: {0}" -f @($results.Unverified).Count)
         Add-Line ("Failed apps: {0}" -f @($results.Failed).Count)
+        foreach ($unverified in @($results.Unverified)) { Add-Line ("UNVERIFIED: {0}" -f $unverified) }
         foreach ($failure in @($results.Failed)) { Add-Line ("FAILED: {0}" -f $failure) }
         foreach ($manual in @($results.Manual)) { Add-Line ("MANUAL: {0}" -f $manual) }
     } catch { Add-Line ("App results could not be read: {0}" -f $_.Exception.Message) }

@@ -1,6 +1,6 @@
 # ==============================================================================
 # WinSux - Forked and modified by Mauridian (ItsMauridian)
-# BUILD MARKER: reliability14 2026-07-10 - fresh-install reliability and audit build
+# BUILD MARKER: reliability16 2026-07-10 - fresh-install reliability and audit build
 # Repo: https://github.com/ItsMauridian/Custom-Windows-Setup
 # Run: iwr https://winsetup.tsql.gg -useb | iex
 #
@@ -527,17 +527,17 @@ Save-CwsRepoFile -RelativePath "Scripts/Setup/Verify-Setup.ps1" -Destination $Cw
 foreach ($scriptPath in @($CwsStepOnePath, $CwsStepTwoPath, $CwsResumePath, $CwsVerifyPath)) {
     Assert-CwsPowerShellSyntax -Path $scriptPath
 }
-if (-not (Select-String -Path $CwsStepTwoPath -Pattern 'BUILD MARKER: reliability14' -Quiet)) {
-    throw 'The downloaded StepTwo.ps1 is not the reliability14 build.'
+if (-not (Select-String -Path $CwsStepTwoPath -Pattern 'BUILD MARKER: reliability16' -Quiet)) {
+    throw 'The downloaded StepTwo.ps1 is not the reliability16 build.'
 }
-if (-not (Select-String -Path $CwsResumePath -Pattern 'BUILD MARKER: reliability14' -Quiet)) {
-    throw 'The downloaded Resume-StepTwo.ps1 is not the reliability14 build.'
+if (-not (Select-String -Path $CwsResumePath -Pattern 'BUILD MARKER: reliability16' -Quiet)) {
+    throw 'The downloaded Resume-StepTwo.ps1 is not the reliability16 build.'
 }
-if (-not (Select-String -Path $CwsStepOnePath -Pattern 'BUILD MARKER: reliability14' -Quiet)) {
-    throw 'The downloaded StepOne.ps1 is not the reliability14 build.'
+if (-not (Select-String -Path $CwsStepOnePath -Pattern 'BUILD MARKER: reliability16' -Quiet)) {
+    throw 'The downloaded StepOne.ps1 is not the reliability16 build.'
 }
-if (-not (Select-String -Path $CwsVerifyPath -Pattern 'BUILD MARKER: reliability14' -Quiet)) {
-    throw 'The downloaded Verify-Setup.ps1 is not the reliability14 build.'
+if (-not (Select-String -Path $CwsVerifyPath -Pattern 'BUILD MARKER: reliability16' -Quiet)) {
+    throw 'The downloaded Verify-Setup.ps1 is not the reliability16 build.'
 }
 Write-Host "DDU continuation scripts validated successfully.`n" -ForegroundColor Green
 

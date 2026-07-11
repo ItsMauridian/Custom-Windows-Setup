@@ -1,5 +1,5 @@
 # SCRIPT RUN AS ADMIN
-# BUILD MARKER: reliability14 2026-07-10 - isolated StepTwo child process
+# BUILD MARKER: reliability16 2026-07-10 - isolated StepTwo child process
 $ErrorActionPreference = 'Stop'
 $workRoot = Join-Path $env:ProgramData 'ItsMauridian\Custom-Windows-Setup'
 $logPath = Join-Path $workRoot 'Resume-StepTwo.log'

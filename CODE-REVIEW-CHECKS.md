@@ -99,3 +99,21 @@ A clean Windows hardware run remains required for final end-to-end validation of
 - [ ] No undefined `Add-Note` helper call remains.
 - [ ] Verification report helper methods do not emit internal list indexes.
 
+
+
+## Reliability 15 review additions
+
+- Verify no exit code 0 package is added to the failed list.
+- Verify successful but not inventory-visible packages use the unverified list.
+- Verify NVIDIA Control Panel uses the returned object properties.
+- Verify the resume handoff is removed before `Verify-Setup.ps1` runs.
+- Verify the final privacy pass performs critical registry readback checks.
+- Verify `AppInstallResults.json` is rewritten after GPU installation.
+
+
+## Reliability 16
+
+- Verify critical HKLM policies are written and read through RegistryView.Registry64.
+- Verify the repair launcher selects Sysnative from a 32-bit host.
+- Verify HVCI is diagnosed but not forced.
+- Verify SysMain, memory compression and hibernation are repaired after installers.

@@ -246,3 +246,22 @@ A clean Windows hardware installation is still the final end-to-end test for dri
 - FR33THY WinSux
 - Chris Titus Tech WinUtil policy and service-baseline ideas
 - Microsoft Windows and WinGet documentation
+
+
+## Reliability 15
+
+Reliability 15 incorporates the first clean-install verification from 2026-07-11.
+
+- Critical privacy policies are applied through one function, read back immediately and applied again at the final stage.
+- Resume scheduled tasks and registry handoff entries are removed before the verification report is generated.
+- WinGet exit code 0 is no longer reported as a failure solely because `winget list` has not refreshed yet.
+- Successful but not yet visible packages are reported separately as unverified.
+- WinGet verification retries for up to 15 seconds after each successful installer.
+- NVIDIA Control Panel result objects are handled correctly instead of being compared with an integer.
+- Final application results are written after GPU installation, so the verification report sees the complete result set.
+- `Repair-Current-Install.ps1` repairs an existing reliability14 installation without reinstalling Windows.
+
+
+## Reliability 16
+
+Reliability 16 uses explicit 64-bit registry access for machine policies, verifies every critical policy immediately, restores SysMain, memory compression and hibernation after vendor installers, and reports detailed HVCI/VBS runtime state without forcing HVCI on incompatible hardware.

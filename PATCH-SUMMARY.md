@@ -96,3 +96,23 @@ Reliability14 addresses these without reintroducing the destructive behavior rem
 - Suppressed internal list indexes from the verification report writer.
 - Restored the repository PowerShell validation workflow in the archive.
 
+
+
+## Reliability 15
+
+- Fixed false WinGet failures with exit code `0x00000000`.
+- Added a separate completed-but-unverified result category.
+- Fixed NVIDIA Control Panel object-to-integer comparison.
+- Added delayed WinGet inventory verification.
+- Reapplied and verified privacy policies at the final setup stage.
+- Moved resume cleanup before report generation.
+- Added a post-install repair script for reliability14 systems.
+
+
+## Reliability 16
+
+- Replaced PowerShell provider policy writes with explicit Registry64 access and immediate readback.
+- Added 32-bit versus 64-bit policy-view diagnostics.
+- Added a final repair pass for SysMain, memory compression and hibernation.
+- Added detailed HVCI and VBS diagnostics without forcibly changing the security state.
+- Added AppX fallback verification for Microsoft Windows App.
